@@ -1,0 +1,12 @@
+frontend/node_modules/
+runtime/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+.venv/
+venv/
+.env
+.env.*
+credentials.key
+ssh_credentials.json
+.DS_Store
