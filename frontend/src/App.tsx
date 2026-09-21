@@ -1,13 +1,146 @@
-import { useEffect, useMemo, useState } from 'react'
-import { choosePaths, createGroup, deleteFunction, deleteGroup, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, updateFunction } from './api'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, stopActiveTask, updateFunction } from './api'
 import { FunctionEditor } from './components/FunctionEditor'
 import { GroupDialog } from './components/GroupDialog'
+import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { FunctionSidebar } from './components/FunctionSidebar'
 import { FunctionWorkspace } from './components/FunctionWorkspace'
 import { icons } from './icons'
-import type { FunctionDefinition, GroupDefinition, WorkingValues, WorkspaceData } from './types'
+import type { FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
 
 const storageKey = (id: string) => `processing-view:values:${id}`
+const sidebarStorageKey = 'yolo-data-platform:sidebar-collapsed:v1'
+const remoteDefaultsMigrationKey = 'yolo-data-platform:remote-defaults:v2'
+const remotePreviewMigrationKey = 'yolo-data-platform:remote-preview:v3'
+const yoloConnectionMigrationKey = 'yolo-data-platform:yolo-connection:v1'
+const videoClipCopyMigrationKey = 'yolo-data-platform:video-clip-copy:v1'
+const yoloTrainingRecommendationKey = 'yolo-data-platform:training-recommendation:v1'
+
+function yoloRunName(date: Date): string {
+  const twoDigits = (value: number) => String(value).padStart(2, '0')
+  return `yolo26_${twoDigits(date.getMonth() + 1)}${twoDigits(date.getDate())}_${twoDigits(date.getHours())}${twoDigits(date.getMinutes())}`
+}
+
+function loadYoloTrainingRecommendation(): YoloTrainingRecommendation | null {
+  try {
+    const stored = localStorage.getItem(yoloTrainingRecommendationKey)
+    if (!stored) return null
+    const parsed = JSON.parse(stored) as Partial<YoloTrainingRecommendation>
+    if (typeof parsed.data !== 'string' || typeof parsed.project !== 'string' || typeof parsed.updatedAt !== 'string') return null
+    return {
+      data: parsed.data,
+      project: parsed.project,
+      runName: typeof parsed.runName === 'string' ? parsed.runName : undefined,
+      updatedAt: parsed.updatedAt,
+    }
+  } catch {
+    return null
+  }
+}
+
+function loadSidebarCollapsed(): boolean {
+  try {
+    return localStorage.getItem(sidebarStorageKey) === 'true'
+  } catch {
+    return false
+  }
+}
+
+function migrateRemoteDefaults(items: FunctionDefinition[]) {
+  try {
+    if (localStorage.getItem(remoteDefaultsMigrationKey) === 'done') return
+    const remoteItem = items.find((item) => item.handlerId === 'remote.star_inference')
+    if (remoteItem) {
+      const key = storageKey(remoteItem.id)
+      const stored = localStorage.getItem(key)
+      if (stored) {
+        const values = JSON.parse(stored) as WorkingValues
+        values.parameters = {
+          ...values.parameters,
+          remember_password: true,
+          labels: values.parameters.labels === 'class0' ? '' : values.parameters.labels,
+          password: '',
+        }
+        localStorage.setItem(key, JSON.stringify(values))
+      }
+    }
+    localStorage.setItem(remoteDefaultsMigrationKey, 'done')
+  } catch {
+    // Defaults still work when browser storage is unavailable.
+  }
+}
+
+function migrateRemotePreviewDefaults(items: FunctionDefinition[]) {
+  try {
+    if (localStorage.getItem(remotePreviewMigrationKey) === 'done') return
+    const remoteItem = items.find((item) => item.handlerId === 'remote.star_inference')
+    if (remoteItem) {
+      const key = storageKey(remoteItem.id)
+      const stored = localStorage.getItem(key)
+      if (stored) {
+        const values = JSON.parse(stored) as WorkingValues
+        const settings = values.parameters
+        if (Number(settings.preview_fps) === 12 && Number(settings.stream_width) === 1280 && Number(settings.jpeg_quality) === 80) {
+          localStorage.setItem(key, JSON.stringify({ ...values, parameters: { ...settings, preview_fps: 20, stream_width: 960, jpeg_quality: 70 } }))
+        }
+      }
+    }
+    localStorage.setItem(remotePreviewMigrationKey, 'done')
+  } catch {
+    // A stored custom setting still takes precedence if migration is unavailable.
+  }
+}
+
+function migrateYoloConnectionDefaults(items: FunctionDefinition[]) {
+  try {
+    if (localStorage.getItem(yoloConnectionMigrationKey) === 'done') return
+    const yoloItem = items.find((item) => item.handlerId === 'yolo.split_dataset')
+    if (yoloItem) {
+      const key = storageKey(yoloItem.id)
+      const stored = localStorage.getItem(key)
+      if (stored) {
+        const values = JSON.parse(stored) as WorkingValues
+        const usedLegacyRemoteMode = values.parameters.execution_location === 'SSH 远程服务器'
+        const parameters = { ...values.parameters }
+        delete parameters.execution_location
+        parameters.remote_password = ''
+        parameters.remember_password = parameters.remember_password ?? true
+        if (!usedLegacyRemoteMode) {
+          parameters.remote_host = ''
+          parameters.remote_username = ''
+        }
+        localStorage.setItem(key, JSON.stringify({ ...values, parameters }))
+      }
+    }
+    localStorage.setItem(yoloConnectionMigrationKey, 'done')
+  } catch {
+    // New catalog defaults remain available when browser storage cannot be migrated.
+  }
+}
+
+function migrateVideoClipDefault(items: FunctionDefinition[]) {
+  try {
+    if (localStorage.getItem(videoClipCopyMigrationKey) === 'done') return
+    const clipItem = items.find((item) => item.handlerId === 'video.clip')
+    if (clipItem) {
+      const key = storageKey(clipItem.id)
+      const stored = localStorage.getItem(key)
+      if (stored) {
+        const values = JSON.parse(stored) as WorkingValues
+        const currentMode = values.parameters.encoding_mode
+        if (currentMode === '精确裁剪（推荐）' || currentMode === '快速裁剪（不重新编码）') {
+          localStorage.setItem(key, JSON.stringify({
+            ...values,
+            parameters: { ...values.parameters, encoding_mode: '原画质裁剪（推荐，不重新编码）' },
+          }))
+        }
+      }
+    }
+    localStorage.setItem(videoClipCopyMigrationKey, 'done')
+  } catch {
+    // The new catalog default remains available when browser storage cannot be migrated.
+  }
+}
 
 function withoutSecrets(item: FunctionDefinition, values: WorkingValues): WorkingValues {
   const secretIds = new Set(item.parameters.filter((field) => field.type === 'password').map((field) => field.id))
@@ -37,18 +170,62 @@ export default function App() {
   const [groupDraft, setGroupDraft] = useState<GroupDefinition | null | undefined>(undefined)
   const [working, setWorking] = useState<Record<string, WorkingValues>>({})
   const [outputs, setOutputs] = useState<Record<string, string>>({})
-  const [running, setRunning] = useState(false)
+  const [runningIds, setRunningIds] = useState<string[]>([])
+  const [activeTasks, setActiveTasks] = useState<PlatformTaskStatus[]>([])
   const [notice, setNotice] = useState('')
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed)
+  const [yoloTrainingRecommendation, setYoloTrainingRecommendation] = useState<YoloTrainingRecommendation | null>(loadYoloTrainingRecommendation)
+  const closeHistory = useCallback(() => setHistoryOpen(false), [])
 
   const selected = useMemo(() => functions.find((item) => item.id === selectedId) || null, [functions, selectedId])
   const values = selected ? (working[selected.id] || defaultsFor(selected)) : { paths: {}, parameters: {} }
 
   useEffect(() => {
+    const url = new URL(window.location.href)
+    if (url.searchParams.has('hotReload')) {
+      setNotice('平台功能已热更新，可以直接使用。')
+      window.history.replaceState({}, '', `${url.pathname}${url.hash}`)
+    }
+  }, [])
+
+  useEffect(() => {
     getWorkspace().then((workspace) => {
+      migrateRemoteDefaults(workspace.functions)
+      migrateRemotePreviewDefaults(workspace.functions)
+      migrateYoloConnectionDefaults(workspace.functions)
+      migrateVideoClipDefault(workspace.functions)
       setFunctions(workspace.functions)
       setGroups(workspace.groups)
       if (workspace.functions[0]) setSelectedId(workspace.functions[0].id)
     }).catch((error) => setNotice(error.message))
+  }, [])
+
+  useEffect(() => {
+    let disposed = false
+    const refresh = () => getActiveTask()
+      .then((tasks) => {
+        if (disposed) return
+        setActiveTasks(tasks)
+        setOutputs((current) => {
+          let changed = false
+          const next = { ...current }
+          for (const task of tasks) {
+            if (task.logs?.length) {
+              next[task.functionId] = task.logs.join('\n')
+              changed = true
+            }
+          }
+          return changed ? next : current
+        })
+      })
+      .catch(() => { /* The main request will surface server errors. */ })
+    refresh()
+    const timer = window.setInterval(refresh, 800)
+    return () => {
+      disposed = true
+      window.clearInterval(timer)
+    }
   }, [])
 
   const applyWorkspace = (workspace: WorkspaceData) => {
@@ -148,28 +325,95 @@ export default function App() {
     await save(next)
   }
 
-  const run = async () => {
+  const run = async (parameterOverrides: Record<string, string | number | boolean> = {}) => {
     if (!selected) return
-    setRunning(true)
+    const item = selected
+    const runValues = values
+    setRunningIds((current) => [...current, item.id])
     const started = new Date().toLocaleTimeString('zh-CN', { hour12: false })
-    setOutputs((current) => ({ ...current, [selected.id]: `[${started}] 正在准备运行……` }))
+    setOutputs((current) => ({ ...current, [item.id]: `[${started}] 正在准备运行……` }))
     try {
-      const result = await runFunction(selected.id, values)
+      const result = await runFunction(item.id, {
+        ...runValues,
+        parameters: { ...runValues.parameters, ...parameterOverrides },
+      })
       const lines = [...result.messages]
       if (result.result.message) lines.push('', result.result.message)
       if (result.result.outputFolders?.length) lines.push('', '输出目录：', ...result.result.outputFolders)
-      setOutputs((current) => ({ ...current, [selected.id]: lines.join('\n') }))
+      const trainingDefaults = result.result.trainingDefaults
+      if (item.handlerId === 'yolo.split_dataset' && trainingDefaults && typeof trainingDefaults === 'object') {
+        const candidate = trainingDefaults as Record<string, unknown>
+        if (typeof candidate.data === 'string' && typeof candidate.project === 'string') {
+          const completedAt = new Date()
+          const recommendation: YoloTrainingRecommendation = {
+            data: candidate.data,
+            project: candidate.project,
+            runName: yoloRunName(completedAt),
+            updatedAt: completedAt.toISOString(),
+          }
+          setYoloTrainingRecommendation(recommendation)
+          try { localStorage.setItem(yoloTrainingRecommendationKey, JSON.stringify(recommendation)) } catch { /* keep current session state */ }
+          lines.push('', '已自动更新模型训练参数：', `data=${candidate.data}`, `project=${candidate.project}`, `name=${recommendation.runName}`)
+        }
+      }
+      const onnxQuantDefaults = result.result.onnxQuantDefaults
+      if (item.handlerId === 'model.export_jetson_onnx' && onnxQuantDefaults && typeof onnxQuantDefaults === 'object') {
+        const candidate = onnxQuantDefaults as Record<string, unknown>
+        const quantItem = functions.find((entry) => entry.handlerId === 'docker.quantize_onnx')
+        if (quantItem && typeof candidate.inputOnnx === 'string') {
+          setWorking((current) => {
+            const currentValues = current[quantItem.id] || defaultsFor(quantItem)
+            const next = {
+              ...currentValues,
+              paths: { ...currentValues.paths, input_onnx: candidate.inputOnnx as string },
+            }
+            try { localStorage.setItem(storageKey(quantItem.id), JSON.stringify(withoutSecrets(quantItem, next))) } catch { /* keep current session state */ }
+            return { ...current, [quantItem.id]: next }
+          })
+          lines.push('', '已自动更新 Docker ONNX 量化的输入模型：', candidate.inputOnnx)
+        }
+      }
+      setOutputs((current) => ({ ...current, [item.id]: lines.join('\n') }))
     } catch (error) {
       const message = error instanceof Error ? error.message : '运行失败'
-      setOutputs((current) => ({ ...current, [selected.id]: `[${started}] ${message}` }))
-    } finally { setRunning(false) }
+      setOutputs((current) => ({ ...current, [item.id]: `[${started}] ${message}` }))
+    } finally {
+      setRunningIds((current) => current.filter((id) => id !== item.id))
+      getActiveTask().then(setActiveTasks).catch(() => undefined)
+    }
+  }
+
+  const stopRunningTask = async (taskId: string) => {
+    try {
+      const task = await stopActiveTask(taskId)
+      setActiveTasks((current) => current.map((entry) => entry.id === task.id ? task : entry))
+      setOutputs((current) => ({
+        ...current,
+        [task.functionId]: `${current[task.functionId] || ''}\n正在终止运行，请稍候……`.trim(),
+      }))
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '终止运行失败')
+      getActiveTask().then(setActiveTasks).catch(() => undefined)
+    }
+  }
+
+  const toggleSidebar = () => {
+    setSidebarCollapsed((current) => {
+      const next = !current
+      try { localStorage.setItem(sidebarStorageKey, String(next)) } catch { /* keep session state */ }
+      return next
+    })
   }
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
-        <div className="top-actions"><span className="local-status"><i />本地运行</span><button aria-label="设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button></div>
+        <div className="top-actions">
+          <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="运行历史记录"><icons.Clock3 size={17} /><span>运行历史</span></button>
+          {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><span><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></span><button onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
+          <span className="local-status"><i />本地运行</span><button aria-label="设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
+        </div>
       </header>
       <FunctionSidebar
         functions={functions}
@@ -184,12 +428,15 @@ export default function App() {
         onDeleteGroup={removeGroup}
         onReorderGroups={changeGroupOrder}
         onMoveFunction={moveItem}
+        collapsed={sidebarCollapsed}
+        onToggleCollapsed={toggleSidebar}
       />
       <FunctionWorkspace
         item={selected}
         values={values}
         output={selected ? outputs[selected.id] || '' : ''}
-        running={running}
+        running={selected ? runningIds.includes(selected.id) : false}
+        activeTasks={activeTasks}
         onEdit={() => selected && setEditing(selected)}
         onBrowse={browse}
         onPathChange={updatePathValue}
@@ -197,9 +444,12 @@ export default function App() {
         onAddPath={() => appendPath().catch((error) => setNotice(error.message))}
         onAddParameter={() => appendParameter().catch((error) => setNotice(error.message))}
         onRun={run}
+        onStop={stopRunningTask}
+        yoloTrainingRecommendation={yoloTrainingRecommendation}
       />
       <FunctionEditor item={editing} onClose={() => setEditing(null)} onSave={save} onDelete={remove} />
       <GroupDialog group={groupDraft} onClose={() => setGroupDraft(undefined)} onSave={saveGroup} />
+      {historyOpen ? <RunHistoryDialog onClose={closeHistory} /> : null}
       {notice ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div> : null}
     </div>
   )

@@ -1,3 +1,3 @@
-import { ArrowDown, ArrowUp, Box, Check, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Code2, FileCog, Folder, FolderInput, FolderPlus, GripVertical, Info, Maximize2, Minimize2, Pencil, Play, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Box, Check, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clock3, Code2, FileCog, Folder, FolderInput, FolderPlus, GripVertical, Info, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, Pause, Pencil, Play, Plus, Search, Settings, SlidersHorizontal, Trash2, X } from 'lucide-react'
 
-export const icons = { ArrowDown, ArrowUp, Box, Check, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Code2, FileCog, Folder, FolderInput, FolderPlus, GripVertical, Info, Maximize2, Minimize2, Pencil, Play, Plus, Search, Settings, SlidersHorizontal, Trash2, X }
+export const icons = { ArrowDown, ArrowUp, Box, Check, ChevronDown, ChevronRight, CircleAlert, CircleHelp, Clock3, Code2, FileCog, Folder, FolderInput, FolderPlus, GripVertical, Info, Maximize2, Minimize2, PanelLeftClose, PanelLeftOpen, Pause, Pencil, Play, Plus, Search, Settings, SlidersHorizontal, Trash2, X }

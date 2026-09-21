@@ -21,7 +21,14 @@ DEFAULT_ASSIGNMENTS = {
     "video_frames": {"groupId": "video_processing", "order": 0},
     "video_clip": {"groupId": "video_processing", "order": 1},
     "yolo_dataset_split": {"groupId": "dataset_processing", "order": 0},
-    "remote_star_inference": {"groupId": "ai_inference", "order": 0},
+    "quant_calibration_dataset": {"groupId": "dataset_processing", "order": 1},
+    "image_dedup": {"groupId": "dataset_processing", "order": 2},
+    "jetson_onnx_export": {"groupId": "dataset_processing", "order": 3},
+    "docker_onnx_quant": {"groupId": "dataset_processing", "order": 4},
+    "remote_tensorrt_build": {"groupId": "ai_inference", "order": 0},
+    "remote_star_inference": {"groupId": "ai_inference", "order": 1},
+    "local_pt_inference": {"groupId": "ai_inference", "order": 2},
+    "local_star_package": {"groupId": "ai_inference", "order": 3},
 }
 
 
@@ -107,7 +114,7 @@ class GroupCatalog:
             group_positions = {group["id"]: group["order"] for group in self._groups}
             decorated = []
             for fallback_order, item in enumerate(functions):
-                assignment = self._assignments.get(str(item["id"]), {})
+                assignment = self._assignments.get(str(item["id"]), DEFAULT_ASSIGNMENTS.get(str(item["id"]), {}))
                 group_id = assignment.get("groupId")
                 if group_id not in valid_group_ids:
                     group_id = None

@@ -9,12 +9,19 @@ from pathlib import Path
 from typing import Any
 
 from .handlers import RunContext, register_handler
+from .task_manager import TaskCancelled
 
 
 HANDLER_ID = "video.clip"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
 CLIP_MODES = {"指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾"}
-ENCODING_MODES = {"精确裁剪（推荐）", "快速裁剪（不重新编码）"}
+COPY_MODE = "原画质裁剪（推荐，不重新编码）"
+PRECISE_MODE = "精确裁剪（重新编码）"
+LEGACY_ENCODING_MODES = {
+    "快速裁剪（不重新编码）": COPY_MODE,
+    "精确裁剪（推荐）": PRECISE_MODE,
+}
+ENCODING_MODES = {COPY_MODE, PRECISE_MODE}
 
 
 def parse_time(value: Any, label: str) -> float:
@@ -62,20 +69,39 @@ def _find_ffmpeg() -> str:
         ) from exc
 
 
-def _probe_duration(video: Path) -> float:
+def _run_process(command: list[str], context: RunContext) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        while True:
+            context.check_cancelled()
+            try:
+                stdout, stderr = process.communicate(timeout=0.2)
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    except TaskCancelled:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        raise
+
+
+def _probe_duration(video: Path, context: RunContext | None = None) -> float:
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
-        completed = subprocess.run(
-            [
+        command = [
                 ffprobe,
                 "-v", "error",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 str(video),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
+        completed = _run_process(command, context) if context else subprocess.run(
+            command, capture_output=True, text=True, check=False
         )
         try:
             duration = float(completed.stdout.strip())
@@ -152,7 +178,12 @@ def _configured_range(parameters: dict[str, Any], video_duration: float) -> tupl
 
     if mode == "指定开始和结束时间":
         start = parse_time(parameters.get("range_start_time", "00:00:00"), "开始时间")
-        requested_end = parse_time(parameters.get("range_end_time", "00:01:00"), "结束时间")
+        raw_end = parameters.get("range_end_time", "")
+        requested_end = (
+            video_duration
+            if str(raw_end if raw_end is not None else "").strip() == ""
+            else parse_time(raw_end, "结束时间")
+        )
         if requested_end <= start:
             raise ValueError("结束时间必须晚于开始时间。")
     elif mode == "指定开始时间和持续时长":
@@ -184,8 +215,9 @@ def _clip_one(
     start: float,
     end: float,
     encoding_mode: str,
+    context: RunContext,
 ) -> Path:
-    precise = encoding_mode == "精确裁剪（推荐）"
+    precise = encoding_mode == PRECISE_MODE
     suffix = ".mp4" if precise else video.suffix.lower()
     output = _unique_output_file(output_parent, video, start, end, suffix)
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
@@ -199,23 +231,32 @@ def _clip_one(
         "-ss", f"{start:.6f}",
         "-i", str(video),
         "-t", f"{duration:.6f}",
-        "-map", "0:v:0",
-        "-map", "0:a?",
     ]
     if precise:
         command.extend([
+            "-map", "0:v:0",
+            "-map", "0:a?",
             "-c:v", "libx264",
             "-preset", "medium",
-            "-crf", "18",
+            "-crf", "23",
             "-c:a", "aac",
-            "-b:a", "192k",
+            "-b:a", "128k",
             "-movflags", "+faststart",
         ])
     else:
-        command.extend(["-c", "copy", "-avoid_negative_ts", "make_zero"])
+        command.extend([
+            "-map", "0",
+            "-c", "copy",
+            "-map_metadata", "0",
+            "-avoid_negative_ts", "make_zero",
+        ])
     command.append(str(temporary))
 
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        completed = _run_process(command, context)
+    except TaskCancelled:
+        temporary.unlink(missing_ok=True)
+        raise
     if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
         temporary.unlink(missing_ok=True)
         detail = completed.stderr.strip().splitlines()
@@ -228,7 +269,8 @@ def _clip_one(
 def run_video_clip(context: RunContext) -> dict[str, Any]:
     videos = _resolve_videos(context)
     ffmpeg = _find_ffmpeg()
-    encoding_mode = str(context.parameters.get("encoding_mode", "精确裁剪（推荐）"))
+    encoding_mode = str(context.parameters.get("encoding_mode", COPY_MODE))
+    encoding_mode = LEGACY_ENCODING_MODES.get(encoding_mode, encoding_mode)
     if encoding_mode not in ENCODING_MODES:
         raise ValueError("请选择有效的裁剪处理方式。")
 
@@ -238,13 +280,16 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         output_root.mkdir(parents=True, exist_ok=True)
 
     context.report(f"找到 {len(videos)} 个视频，处理方式：{encoding_mode}")
+    if encoding_mode == COPY_MODE:
+        context.report("将直接复制原视频编码流，不改变分辨率、码率和画质；裁剪起点会对齐到附近的关键帧。")
     outputs: list[Path] = []
     details: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
 
     for index, video in enumerate(videos, start=1):
         try:
-            video_duration = _probe_duration(video)
+            context.check_cancelled()
+            video_duration = _probe_duration(video, context)
             start, end, clamped = _configured_range(context.parameters, video_duration)
             if clamped:
                 context.report(f"[{index}/{len(videos)}] {video.name}：结束位置超出视频，已自动截到结尾")
@@ -254,7 +299,9 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
             )
             output_parent = output_root or video.parent
             output_parent.mkdir(parents=True, exist_ok=True)
-            output = _clip_one(ffmpeg, video, output_parent, start, end, encoding_mode)
+            output = _clip_one(ffmpeg, video, output_parent, start, end, encoding_mode, context)
+            source_size = video.stat().st_size
+            output_size = output.stat().st_size
             outputs.append(output)
             details.append({
                 "video": str(video),
@@ -264,8 +311,15 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 "durationSec": end - start,
                 "sourceDurationSec": video_duration,
                 "encodingMode": encoding_mode,
+                "sourceSizeBytes": source_size,
+                "outputSizeBytes": output_size,
             })
-            context.report(f"[{index}/{len(videos)}] 完成：{output.name}")
+            context.report(
+                f"[{index}/{len(videos)}] 完成：{output.name}，"
+                f"文件大小 {source_size / 1024 / 1024:.1f} MB → {output_size / 1024 / 1024:.1f} MB"
+            )
+        except TaskCancelled:
+            raise
         except (ValueError, RuntimeError) as exc:
             failures.append({"video": str(video), "error": str(exc)})
             context.report(f"[{index}/{len(videos)}] 跳过 {video.name}：{exc}")

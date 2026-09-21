@@ -1,0 +1,2 @@
+# Optional only when not using the automatically detected Conda yolo26 environment.
+ultralytics>=8.3

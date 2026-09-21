@@ -16,15 +16,89 @@ from .catalog import FunctionCatalog
 from .groups import GroupCatalog
 from .handlers import RunContext, execute, has_handler
 from .remote_inference import manager as remote_inference_manager
+from .local_pt_inference import manager as local_pt_inference_manager
+from .run_history import RunHistoryStore
+from .remote_yolo_dataset import (
+    forget_remote_yolo_password,
+    is_remote_yolo_parameters,
+    remote_yolo_credential_status,
+    test_remote_yolo_connection,
+)
+from .task_manager import ActiveTask, TaskCancelled, manager as platform_task_manager
+from .yolo_training import (
+    TrainingProfileStore,
+    normalize_training_values,
+    training_task_key,
+    manager as yolo_training_manager,
+)
 from . import video_frames as _video_frames  # noqa: F401 - registers built-in handler
 from . import video_clip as _video_clip  # noqa: F401 - registers built-in handler
+from . import image_dedup as _image_dedup  # noqa: F401 - registers built-in handler
+from . import docker_onnx_quant as _docker_onnx_quant  # noqa: F401 - registers built-in handler
+from . import jetson_onnx_export as _jetson_onnx_export  # noqa: F401 - registers built-in handler
 from . import yolo_dataset_split as _yolo_dataset_split  # noqa: F401 - registers built-in handler
+from . import remote_calib_dataset as _remote_calib_dataset  # noqa: F401 - registers built-in handler
+from . import remote_tensorrt_build as _remote_tensorrt_build  # noqa: F401 - registers built-in handler
+from . import local_star_package as _local_star_package  # noqa: F401 - registers built-in handler
 
 
 ROOT = Path(__file__).resolve().parents[1]
 catalog = FunctionCatalog(ROOT / "runtime" / "functions.json")
 group_catalog = GroupCatalog(ROOT / "runtime" / "groups.json")
+training_profile_store = TrainingProfileStore(ROOT / "runtime" / "training_profiles.json")
+run_history = RunHistoryStore(ROOT / "runtime" / "run_history.json")
 _path_chooser: Callable[[str], list[str]] | None = None
+_system_notifier: Callable[[str, str], None] | None = None
+
+
+def set_system_notifier(notifier: Callable[[str, str], None] | None) -> None:
+    """Let the desktop shell display non-blocking operating-system notifications."""
+    global _system_notifier
+    _system_notifier = notifier
+
+
+def notify_system(title: str, message: str) -> None:
+    if _system_notifier is None:
+        return
+    try:
+        _system_notifier(str(title), str(message))
+    except Exception as exc:
+        # Notification failures must never change processing results.
+        print(f"[YOLO数据处理平台] 系统通知显示失败：{exc}", file=sys.stderr)
+
+
+def record_finished_run(
+    task: ActiveTask,
+    *,
+    status: str,
+    message: str,
+    logs: list[str] | None = None,
+    details: dict[str, str] | None = None,
+    outputs: list[str] | None = None,
+) -> None:
+    try:
+        run_history.add(task.snapshot(), status=status, message=message, logs=logs, details=details, outputs=outputs)
+    except Exception as exc:
+        # A history disk error must not turn a successful data-processing run into a failure.
+        print(f"[YOLO数据处理平台] 无法保存运行历史：{exc}", file=sys.stderr)
+    if status in {"completed", "finished"}:
+        notify_system(f"{task.name} 已完成", message or "任务已成功完成。")
+
+
+def finish_async_run(task: ActiveTask, snapshot: dict[str, Any], details: dict[str, str]) -> None:
+    try:
+        result = snapshot.get("result") or {}
+        outputs = [str(Path(str(result["project"])) / str(result["name"]))] if result.get("project") and result.get("name") else []
+        record_finished_run(
+            task,
+            status=str(snapshot["status"]),
+            message=str(snapshot.get("error") or snapshot.get("message") or ""),
+            logs=list(snapshot.get("logs") or []),
+            details=details,
+            outputs=outputs,
+        )
+    finally:
+        platform_task_manager.finish(task.id)
 
 
 def workspace_payload() -> dict[str, Any]:
@@ -94,6 +168,8 @@ class AppHandler(BaseHTTPRequestHandler):
     static_dir: Path
 
     def log_message(self, format: str, *args: Any) -> None:
+        if self.path.startswith("/api/tasks/active"):
+            return
         print(f"[YOLO数据处理平台] {self.address_string()} - {format % args}")
 
     def send_json(self, data: Any, status: int = 200) -> None:
@@ -126,11 +202,47 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/functions":
             self.send_json({"functions": workspace_payload()["functions"]})
             return
+        if parsed.path == "/api/tasks/active":
+            self.send_json({"active": platform_task_manager.active()})
+            return
+        if parsed.path == "/api/tasks/history":
+            try:
+                self.send_json({"history": run_history.list()})
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                self.send_json({"error": f"读取运行历史失败：{exc}"}, 500)
+            return
+        if parsed.path == "/api/yolo-training/profiles":
+            self.send_json(training_profile_store.payload())
+            return
+        if parsed.path == "/api/yolo-training/sessions":
+            self.send_json({"sessions": yolo_training_manager.list()})
+            return
+        if parsed.path.startswith("/api/yolo-training/") and parsed.path.endswith("/status"):
+            try:
+                session_id = parsed.path.strip("/").split("/")[2]
+                self.send_json(yolo_training_manager.get(session_id).snapshot())
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 404)
+            return
         if parsed.path.startswith("/api/remote-inference/"):
             parts = parsed.path.strip("/").split("/")
             if len(parts) == 4 and parts[:2] == ["api", "remote-inference"]:
                 try:
                     session = remote_inference_manager.get(parts[2])
+                    if parts[3] == "status":
+                        self.send_json(session.snapshot())
+                        return
+                    if parts[3] == "stream":
+                        self.serve_remote_stream(session)
+                        return
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 404)
+                    return
+        if parsed.path.startswith("/api/local-pt-inference/"):
+            parts = parsed.path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "local-pt-inference"]:
+                try:
+                    session = local_pt_inference_manager.get(parts[2])
                     if parts[3] == "status":
                         self.send_json(session.snapshot())
                         return
@@ -177,18 +289,154 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("SSH 连接参数格式不正确。")
                 self.send_json(remote_inference_manager.test_connection(parameters))
                 return
+            if self.path == "/api/remote-inference/credential-status":
+                parameters = payload.get("parameters", payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 连接参数格式不正确。")
+                self.send_json(remote_inference_manager.credential_status(parameters))
+                return
             if self.path == "/api/remote-inference/forget-password":
                 parameters = payload.get("parameters", payload)
                 if not isinstance(parameters, dict):
                     raise ValueError("SSH 连接参数格式不正确。")
                 self.send_json(remote_inference_manager.forget_password(parameters))
                 return
-            if self.path == "/api/remote-inference/start":
-                self.send_json(remote_inference_manager.start(payload), 201)
+            if self.path == "/api/yolo-dataset/test-connection":
+                parameters = payload.get("parameters", payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 连接参数格式不正确。")
+                self.send_json(test_remote_yolo_connection(parameters))
                 return
+            if self.path == "/api/yolo-dataset/credential-status":
+                parameters = payload.get("parameters", payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 连接参数格式不正确。")
+                self.send_json(remote_yolo_credential_status(parameters))
+                return
+            if self.path == "/api/yolo-dataset/forget-password":
+                parameters = payload.get("parameters", payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 连接参数格式不正确。")
+                self.send_json(forget_remote_yolo_password(parameters))
+                return
+            if self.path == "/api/yolo-training/profiles":
+                self.send_json(training_profile_store.create(payload), 201)
+                return
+            if self.path == "/api/yolo-training/start":
+                parameters = payload.get("parameters", payload)
+                if not isinstance(parameters, dict):
+                    raise ValueError("训练参数格式不正确。")
+                is_remote = is_remote_yolo_parameters(parameters)
+                values = normalize_training_values(parameters)
+                task = platform_task_manager.start(
+                    "yolo_dataset_split", f"YOLO 训练 · {values['run_name']} · {values['device']}", "remote-training" if is_remote else "local",
+                    task_key=training_task_key(parameters),
+                )
+                details: dict[str, str] = {}
+                try:
+                    details = {
+                        "数据配置": str(parameters.get("data", "")),
+                        "模型权重": str(parameters.get("model", "")),
+                        "训练输出": str(Path(str(parameters.get("project", ""))) / str(parameters.get("run_name", ""))) if parameters.get("project") else "",
+                        "设备": str(parameters.get("remote_host", "")) if is_remote else "本地",
+                    }
+                    snapshot = yolo_training_manager.start(
+                        parameters,
+                        on_finished=lambda finished: finish_async_run(task, finished, details),
+                    )
+                    session_id = str(snapshot["id"])
+                    platform_task_manager.set_stop_callback(
+                        task.id,
+                        lambda: yolo_training_manager.stop(session_id),
+                    )
+                except Exception as exc:
+                    record_finished_run(task, status="failed", message=str(exc), details=details)
+                    platform_task_manager.finish(task.id)
+                    raise
+                self.send_json(snapshot, 201)
+                return
+            if self.path.startswith("/api/yolo-training/") and self.path.endswith("/reconnect"):
+                session_id = self.path.strip("/").split("/")[2]
+                parameters = payload.get("parameters", payload)
+                self.send_json(yolo_training_manager.reconnect(session_id, parameters))
+                return
+            if self.path.startswith("/api/yolo-training/") and self.path.endswith("/stop"):
+                session_id = self.path.strip("/").split("/")[2]
+                self.send_json(yolo_training_manager.stop(session_id))
+                return
+            if self.path == "/api/remote-inference/start":
+                task = platform_task_manager.start(
+                    "remote_star_inference", "远程实时 AI 推理", "remote"
+                )
+                details = {}
+                try:
+                    paths = payload.get("paths", {})
+                    parameters = payload.get("parameters", {})
+                    details = {
+                        "模型文件": str(paths.get("local_model_file", "")),
+                        "视频文件": str(paths.get("local_video_file", "")),
+                        "推理设备": str(parameters.get("host", "")),
+                        "远端保存": str(parameters.get("save_path", "")),
+                    }
+                    snapshot = remote_inference_manager.start(
+                        payload,
+                        on_finished=lambda finished: finish_async_run(task, finished, details),
+                    )
+                    session_id = str(snapshot["id"])
+                    platform_task_manager.set_stop_callback(
+                        task.id,
+                        lambda: remote_inference_manager.stop(session_id),
+                    )
+                except Exception as exc:
+                    record_finished_run(task, status="failed", message=str(exc), details=details)
+                    platform_task_manager.finish(task.id)
+                    raise
+                self.send_json(snapshot, 201)
+                return
+            if self.path == "/api/local-pt-inference/start":
+                task = platform_task_manager.start("local_pt_inference", "本地 PT 视频检测", "local")
+                paths = payload.get("paths", {})
+                details = {"模型文件": str(paths.get("model_file", "")), "视频文件": str(paths.get("video_file", "")), "保存位置": str(paths.get("output_folder", ""))}
+                try:
+                    snapshot = local_pt_inference_manager.start(
+                        payload, on_finished=lambda finished: finish_async_run(task, finished, details),
+                    )
+                    session_id = str(snapshot["id"])
+                    platform_task_manager.set_stop_callback(task.id, lambda: local_pt_inference_manager.stop(session_id))
+                except Exception as exc:
+                    record_finished_run(task, status="failed", message=str(exc), details=details)
+                    platform_task_manager.finish(task.id)
+                    raise
+                self.send_json(snapshot, 201)
+                return
+            if self.path.startswith("/api/local-pt-inference/"):
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 4:
+                    session_id, action = parts[2], parts[3]
+                    if action == "stop":
+                        self.send_json(local_pt_inference_manager.stop(session_id))
+                        return
+                    if action == "seek":
+                        self.send_json(local_pt_inference_manager.seek(session_id, payload.get("seconds")))
+                        return
+                    if action == "playback":
+                        self.send_json(local_pt_inference_manager.set_paused(session_id, payload.get("paused")))
+                        return
             if self.path.startswith("/api/remote-inference/") and self.path.endswith("/stop"):
                 session_id = self.path.strip("/").split("/")[2]
                 self.send_json(remote_inference_manager.stop(session_id))
+                return
+            if self.path.startswith("/api/remote-inference/") and self.path.endswith("/seek"):
+                session_id = self.path.strip("/").split("/")[2]
+                self.send_json(remote_inference_manager.seek(session_id, payload.get("seconds")))
+                return
+            if self.path.startswith("/api/remote-inference/") and self.path.endswith("/playback"):
+                session_id = self.path.strip("/").split("/")[2]
+                self.send_json(remote_inference_manager.set_paused(session_id, payload.get("paused")))
+                return
+            if self.path.startswith("/api/tasks/") and self.path.endswith("/stop"):
+                task_id = self.path.strip("/").split("/")[2]
+                self.send_json({"active": platform_task_manager.stop(task_id)})
                 return
             if self.path.startswith("/api/functions/") and self.path.endswith("/run"):
                 item_id = self.path.split("/")[3]
@@ -203,21 +451,92 @@ class AppHandler(BaseHTTPRequestHandler):
                         "code": "handler_not_bound",
                     }, 409)
                     return
-                path_values = {key: Path(value).expanduser() for key, value in payload.get("paths", {}).items() if str(value).strip()}
+                is_remote_yolo = (
+                    handler_id == "yolo.split_dataset"
+                    and is_remote_yolo_parameters(payload.get("parameters", {}))
+                )
+                is_remote_calib = handler_id == "calib.select_dataset"
+                is_remote_trt = handler_id == "remote.build_tensorrt"
+                path_values = {
+                    key: Path(value) if is_remote_yolo else Path(value).expanduser()
+                    for key, value in payload.get("paths", {}).items()
+                    if str(value).strip()
+                }
                 messages: list[str] = []
-                result = execute(str(handler_id), RunContext(
-                    function_id=item_id,
-                    paths=path_values,
-                    parameters={
-                        **{
-                            str(parameter.get("id")): parameter.get("default")
-                            for parameter in item.get("parameters", [])
-                            if parameter.get("id")
+                task = platform_task_manager.start(
+                    item_id, str(item["name"]),
+                    "remote-build" if is_remote_trt else "remote" if is_remote_yolo or is_remote_calib else "local",
+                )
+                details = {
+                    str(field["label"]): str(payload.get("paths", {}).get(field["id"], ""))
+                    for field in item.get("pathFields", [])
+                    if field.get("id")
+                }
+                if is_remote_calib:
+                    parameters = payload.get("parameters", {})
+                    details.update({
+                        "图片目录": str(parameters.get("image_dirs", "")),
+                        "输出目录": str(parameters.get("output_dir", "")),
+                        "远程服务器": str(parameters.get("remote_host", "")),
+                    })
+                elif is_remote_yolo:
+                    details["远程服务器"] = str(payload.get("parameters", {}).get("remote_host", ""))
+                elif is_remote_trt:
+                    parameters = payload.get("parameters", {})
+                    details["远程服务器"] = f"{parameters.get('username', '')}@{parameters.get('host', '')}:{parameters.get('port', 22)}"
+                    raw_onnx_files = str(parameters.get("onnx_files", ""))
+                    try:
+                        onnx_files = json.loads(raw_onnx_files) if raw_onnx_files.strip().startswith("[") else raw_onnx_files.splitlines()
+                    except json.JSONDecodeError:
+                        onnx_files = []
+                    if isinstance(onnx_files, list) and onnx_files:
+                        normalized_onnx_files = [str(path).strip() for path in onnx_files if str(path).strip()]
+                        details["ONNX 模型"] = "\n".join(normalized_onnx_files)
+                        details["模型数量"] = str(len(normalized_onnx_files))
+                status = "failed"
+                message = ""
+                outputs: list[str] = []
+                try:
+                    def report(message: str) -> None:
+                        messages.append(message)
+                        task.add_log(message)
+
+                    result = execute(str(handler_id), RunContext(
+                        function_id=item_id,
+                        paths=path_values,
+                        parameters={
+                            **{
+                                str(parameter.get("id")): parameter.get("default")
+                                for parameter in item.get("parameters", [])
+                                if parameter.get("id")
+                            },
+                            **dict(payload.get("parameters", {})),
                         },
-                        **dict(payload.get("parameters", {})),
-                    },
-                    report=messages.append,
-                ))
+                        report=report,
+                        stop_event=task.stop_event,
+                        notify=notify_system,
+                    ))
+                    status = "completed"
+                    message = str(result.get("message", "处理完成。"))
+                    outputs = list(dict.fromkeys(
+                        str(path)
+                        for path in [*result.get("outputFiles", []), *result.get("outputFolders", [])]
+                    ))
+                except TaskCancelled as exc:
+                    status = "stopped"
+                    message = str(exc)
+                    self.send_json({
+                        "error": str(exc),
+                        "code": "task_cancelled",
+                        "messages": messages,
+                    }, 409)
+                    return
+                except Exception as exc:
+                    message = str(exc)
+                    raise
+                finally:
+                    record_finished_run(task, status=status, message=message, logs=messages, details=details, outputs=outputs)
+                    platform_task_manager.finish(task.id)
                 self.send_json({"ok": True, "result": result, "messages": messages})
                 return
             if self.path.startswith("/api/functions/") and self.path.endswith("/move"):
@@ -245,6 +564,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 group_catalog.rename(group_id, str(payload.get("name", "")))
                 self.send_json(workspace_payload())
                 return
+            if self.path.startswith("/api/yolo-training/profiles/"):
+                profile_id = self.path.rsplit("/", 1)[-1]
+                self.send_json(training_profile_store.update(profile_id, payload))
+                return
             if self.path.startswith("/api/functions/"):
                 item_id = self.path.rsplit("/", 1)[-1]
                 item = catalog.update(item_id, payload)
@@ -258,10 +581,20 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         try:
+            if self.path.startswith("/api/yolo-training/sessions/"):
+                session_id = self.path.rsplit("/", 1)[-1]
+                yolo_training_manager.delete(session_id)
+                self.send_json({"ok": True})
+                return
             if self.path.startswith("/api/groups/"):
                 group_id = self.path.rsplit("/", 1)[-1]
                 group_catalog.delete(group_id, catalog.list())
                 self.send_json(workspace_payload())
+                return
+            if self.path.startswith("/api/yolo-training/profiles/"):
+                profile_id = self.path.rsplit("/", 1)[-1]
+                training_profile_store.delete(profile_id)
+                self.send_json({"ok": True})
                 return
             if self.path.startswith("/api/functions/"):
                 item_id = self.path.rsplit("/", 1)[-1]
@@ -322,9 +655,13 @@ class AppHandler(BaseHTTPRequestHandler):
 
 class AppServer(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
     def server_close(self) -> None:
+        platform_task_manager.stop_all()
         remote_inference_manager.stop_all()
+        local_pt_inference_manager.stop_all()
+        yolo_training_manager.stop_all()
         super().server_close()
 
 

@@ -45,16 +45,45 @@ VIDEO_FUNCTION = {
     ],
 }
 
+IMAGE_DEDUP_FUNCTION = {
+    "id": "image_dedup",
+    "name": "图片智能去重",
+    "description": "面向 YOLO 训练筛选连续相似帧，保护工序变化与过程锚点；移出的图片保留备份并支持回滚。",
+    "handlerId": "image.smart_dedup",
+    "pathFields": [
+        {"id": "images_folder", "label": "需要去重的图片文件夹", "mode": "directory"},
+    ],
+    "parameters": [
+        {
+            "id": "operation",
+            "label": "操作方式",
+            "type": "select",
+            "default": "分析并去重",
+            "options": ["分析并去重", "回滚最近一次"],
+        },
+        {
+            "id": "dedup_strength",
+            "label": "去重力度",
+            "type": "select",
+            "default": "平衡（推荐）",
+            "options": ["保守", "较保守", "平衡（推荐）", "较强", "强力"],
+            "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"},
+        },
+        {"id": "minimum_keep_ratio", "label": "最低保留比例（0.05-1）", "type": "number", "default": 0.4, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"}},
+        {"id": "max_consecutive_skips", "label": "最多连续移除张数", "type": "number", "default": 8, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"}},
+    ],
+}
+
 YOLO_DATASET_FUNCTION = {
     "id": "yolo_dataset_split",
-    "name": "YOLO 数据集分配",
-    "description": "将图片和标签按比例复制到标准 YOLO 训练集与验证集目录，源数据保持不变。",
+    "name": "YOLO 数据集划分",
+    "description": "支持本地或 SSH 远程服务器完成数据集划分与 YOLO 模型训练，并可保存复用训练场景。",
     "handlerId": "yolo.split_dataset",
     "pathFields": [
         {"id": "images_folder", "label": "图片文件夹", "mode": "directory"},
-        {"id": "labels_folder", "label": "标签文件夹（TXT/XML）", "mode": "directory"},
+        {"id": "labels_folder", "label": "标签文件夹（XML/TXT）", "mode": "directory"},
         {"id": "negative_images_folder", "label": "负样本图片文件夹（可选）", "mode": "directory"},
-        {"id": "output_folder", "label": "输出文件夹", "mode": "directory"},
+        {"id": "output_folder", "label": "输出位置（将在其中新建数据集文件夹）", "mode": "directory"},
     ],
     "parameters": [
         {
@@ -64,13 +93,20 @@ YOLO_DATASET_FUNCTION = {
             "default": "目标检测",
             "options": ["目标检测", "旋转目标检测", "分割", "分类"],
         },
+        {"id": "remote_host", "label": "远程服务器 IP / 主机名（留空则本地运行）", "type": "text", "default": "", "options": []},
+        {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
+        {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
+        {"id": "remote_python", "label": "远程 Python 解释器（可填绝对路径）", "type": "text", "default": "python3", "options": []},
         {
             "id": "label_format",
             "label": "目标检测标签格式",
             "type": "select",
-            "default": "YOLO TXT",
+            "default": "VOC XML",
             "options": ["YOLO TXT", "VOC XML", "仅图片"],
         },
+        {"id": "dataset_folder_name", "label": "数据集子文件夹名称", "type": "text", "default": "yolo_train", "options": []},
         {"id": "train_ratio", "label": "训练集比例", "type": "number", "default": 0.7, "options": []},
         {"id": "random_seed", "label": "随机种子", "type": "number", "default": 42, "options": []},
         {
@@ -86,7 +122,7 @@ YOLO_DATASET_FUNCTION = {
 VIDEO_CLIP_FUNCTION = {
     "id": "video_clip",
     "name": "视频裁剪",
-    "description": "按指定时间范围批量裁剪视频，支持精确裁剪和快速裁剪，保留原视频不变。",
+    "description": "按指定时间范围批量裁剪视频，默认直接复制原编码流，不改变分辨率、码率和画质。",
     "handlerId": "video.clip",
     "pathFields": [
         {"id": "video_folder", "label": "视频文件夹", "mode": "directory"},
@@ -102,7 +138,7 @@ VIDEO_CLIP_FUNCTION = {
             "options": ["指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾"],
         },
         {"id": "range_start_time", "label": "开始时间（秒或 HH:MM:SS）", "type": "text", "default": "00:00:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始和结束时间"}},
-        {"id": "range_end_time", "label": "结束时间（秒或 HH:MM:SS）", "type": "text", "default": "00:01:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始和结束时间"}},
+        {"id": "range_end_time", "label": "结束时间（留空则到视频结尾）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始和结束时间"}},
         {"id": "duration_start_time", "label": "开始时间（秒或 HH:MM:SS）", "type": "text", "default": "00:00:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始时间和持续时长"}},
         {"id": "clip_duration", "label": "持续时长（秒或 HH:MM:SS）", "type": "text", "default": "00:01:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始时间和持续时长"}},
         {"id": "head_skip_time", "label": "跳过开头（秒或 HH:MM:SS）", "type": "text", "default": "00:00:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "跳过开头和结尾"}},
@@ -111,8 +147,8 @@ VIDEO_CLIP_FUNCTION = {
             "id": "encoding_mode",
             "label": "处理方式",
             "type": "select",
-            "default": "精确裁剪（推荐）",
-            "options": ["精确裁剪（推荐）", "快速裁剪（不重新编码）"],
+            "default": "原画质裁剪（推荐，不重新编码）",
+            "options": ["原画质裁剪（推荐，不重新编码）", "精确裁剪（重新编码）"],
         },
     ],
 }
@@ -120,7 +156,7 @@ VIDEO_CLIP_FUNCTION = {
 REMOTE_STAR_INFERENCE_FUNCTION = {
     "id": "remote_star_inference",
     "name": "远程实时 AI 推理",
-    "description": "平台自动上传内置推理脚本、所选模型和视频到远端 AI 设备，并实时显示 STAR/TensorRT 带框画面。",
+    "description": "平台自动上传模型和视频到远端 AI 设备，按原视频时间轴显示 STAR/TensorRT 带框画面；推理不足时自动跳过落后帧。",
     "handlerId": "remote.star_inference",
     "pathFields": [
         {"id": "local_script_file", "label": "本地推理脚本（可选，默认使用内置版本）", "mode": "file"},
@@ -132,17 +168,18 @@ REMOTE_STAR_INFERENCE_FUNCTION = {
         {"id": "port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
         {"id": "username", "label": "SSH 用户名", "type": "text", "default": "wel", "options": []},
         {"id": "password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
-        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": False, "options": []},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
         {"id": "python_path", "label": "远端 Python 解释器", "type": "text", "default": "python3", "options": []},
-        {"id": "labels", "label": "类别名称（英文逗号分隔）", "type": "text", "default": "class0", "options": []},
+        {"id": "labels", "label": "类别名称（英文逗号分隔）", "type": "text", "default": "", "options": []},
         {"id": "conf", "label": "置信度阈值", "type": "number", "default": 0.5, "options": []},
         {"id": "iou", "label": "NMS IoU 阈值", "type": "number", "default": 0.45, "options": []},
         {"id": "max_det", "label": "每帧最大检测框数", "type": "number", "default": 300, "options": []},
         {"id": "save_path", "label": "远端保存路径（可选）", "type": "text", "default": "", "options": []},
-        {"id": "realtime", "label": "按视频原帧率播放", "type": "boolean", "default": True, "options": []},
-        {"id": "preview_fps", "label": "本地预览帧率", "type": "number", "default": 12, "options": []},
-        {"id": "stream_width", "label": "本地预览宽度", "type": "number", "default": 1280, "options": []},
-        {"id": "jpeg_quality", "label": "预览画质（20-100）", "type": "number", "default": 80, "options": []},
+        {"id": "realtime", "label": "保持原视频速度（性能不足时自动跳帧）", "type": "boolean", "default": True, "options": []},
+        {"id": "preview_fps", "label": "本地预览帧率", "type": "number", "default": 20, "options": []},
+        {"id": "stream_width", "label": "本地预览宽度", "type": "number", "default": 960, "options": []},
+        {"id": "jpeg_quality", "label": "预览画质（20-100）", "type": "number", "default": 70, "options": []},
+        {"id": "replay_grace_seconds", "label": "结束后可回看时间（秒，0 为关闭）", "type": "number", "default": 120, "options": []},
         {
             "id": "cuda_backend",
             "label": "CUDA 后端",
@@ -153,7 +190,146 @@ REMOTE_STAR_INFERENCE_FUNCTION = {
     ],
 }
 
-DEFAULT_FUNCTIONS = [VIDEO_FUNCTION, YOLO_DATASET_FUNCTION, VIDEO_CLIP_FUNCTION, REMOTE_STAR_INFERENCE_FUNCTION]
+LOCAL_PT_INFERENCE_FUNCTION = {
+    "id": "local_pt_inference",
+    "name": "本地 PT 视频检测",
+    "description": "使用本机 Ultralytics YOLO .pt 权重检测本地视频，按原视频时间轴预览带框画面；性能不足时自动跳过落后帧。",
+    "handlerId": "local.pt_inference",
+    "pathFields": [
+        {"id": "model_file", "label": "本地 PT 权重文件", "mode": "file"},
+        {"id": "video_file", "label": "本地视频文件", "mode": "file"},
+        {"id": "output_folder", "label": "保存带框视频的文件夹（可选）", "mode": "directory"},
+    ],
+    "parameters": [
+        {"id": "conf", "label": "置信度阈值", "type": "number", "default": 0.5, "options": []},
+        {"id": "iou", "label": "NMS IoU 阈值", "type": "number", "default": 0.45, "options": []},
+        {"id": "max_det", "label": "每帧最大检测框数", "type": "number", "default": 300, "options": []},
+        {"id": "device", "label": "推理设备（auto、cpu、0 等）", "type": "text", "default": "auto", "options": []},
+        {"id": "realtime", "label": "保持原视频速度（性能不足时自动跳帧）", "type": "boolean", "default": True, "options": []},
+        {"id": "preview_fps", "label": "预览帧率（0 表示不限）", "type": "number", "default": 20, "options": []},
+        {"id": "stream_width", "label": "预览宽度", "type": "number", "default": 960, "options": []},
+        {"id": "jpeg_quality", "label": "预览画质（20-100）", "type": "number", "default": 70, "options": []},
+        {"id": "replay_grace_seconds", "label": "结束后可回看时间（秒）", "type": "number", "default": 120, "options": []},
+    ],
+}
+
+CALIB_DATASET_FUNCTION = {
+    "id": "quant_calibration_dataset",
+    "name": "制作量化数据集",
+    "description": "优先保留全部非 copy 原始图片，不足目标数量时再按类别和亮度补充 copy 扩充图片与负样本。",
+    "handlerId": "calib.select_dataset",
+    "pathFields": [],
+    "parameters": [
+        {"id": "image_dirs", "label": "远程图片目录（每行一个）", "type": "text", "default": "", "options": []},
+        {"id": "annotation_dirs", "label": "远程标注目录（每行一个，可选）", "type": "text", "default": "", "options": []},
+        {"id": "negative_dirs", "label": "远程负样本图片目录（每行一个，可选）", "type": "text", "default": "", "options": []},
+        {"id": "output_dir", "label": "远程输出目录（留空默认 calib_dataset）", "type": "text", "default": "", "options": []},
+        {"id": "annotation_format", "label": "标注格式", "type": "select", "default": "auto", "options": ["auto", "xml", "json"]},
+        {"id": "num_samples", "label": "抽取图片数量", "type": "number", "default": 128, "options": []},
+        {"id": "random_seed", "label": "随机种子", "type": "number", "default": 42, "options": []},
+        {"id": "remote_host", "label": "服务器 IP / 主机名", "type": "text", "default": "192.168.21.5", "options": []},
+        {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "dell", "options": []},
+        {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
+        {"id": "remote_python", "label": "远程 Python 解释器", "type": "text", "default": "python3", "options": []},
+    ],
+}
+
+DOCKER_ONNX_QUANT_FUNCTION = {
+    "id": "docker_onnx_quant",
+    "name": "Docker ONNX 量化",
+    "description": "在本机 onnx2quant Docker 容器的 onnxquant Conda 环境中，使用量化图片导出 INT8 ONNX。",
+    "handlerId": "docker.quantize_onnx",
+    "pathFields": [
+        {"id": "input_onnx", "label": "本机输入 ONNX 模型", "mode": "file"},
+        {"id": "calibration_images", "label": "本机量化图片文件夹", "mode": "directory"},
+        {"id": "output_folder", "label": "本机输出文件夹（留空则与模型同级）", "mode": "directory"},
+    ],
+    "parameters": [
+        {"id": "operation", "label": "操作方式", "type": "select", "default": "导出量化 ONNX", "options": ["导出量化 ONNX", "测试 Docker 环境"]},
+        {"id": "container_name", "label": "Docker 容器名称", "type": "text", "default": "onnx2quant", "options": []},
+        {"id": "conda_environment", "label": "容器内 Conda 环境", "type": "text", "default": "onnxquant", "options": []},
+        {"id": "conda_path", "label": "容器内 Conda 路径", "type": "text", "default": "/root/anaconda3/bin/conda", "options": []},
+        {"id": "model_type", "label": "模型类型 type", "type": "select", "default": "yolo", "options": ["yolo", "mobilenet", "custom"], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "limit", "label": "量化图片上限 limit", "type": "number", "default": 128, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "output_filename", "label": "输出文件名（留空自动生成）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "method", "label": "量化方法", "type": "select", "default": "默认", "options": ["默认", "minmax", "entropy"], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "nodes_to_exclude", "label": "排除节点（每行一个正则）", "type": "text", "default": "^/model\\.(13|16|17|23)(?:/|$).*", "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+    ],
+}
+
+JETSON_ONNX_EXPORT_FUNCTION = {
+    "id": "jetson_onnx_export",
+    "name": "Jetson ONNX 导出",
+    "description": "使用本机 yolo26 环境将 YOLO26 PT 权重切头导出为 Jetson/TensorRT 适配的静态 ONNX。",
+    "handlerId": "model.export_jetson_onnx",
+    "pathFields": [
+        {"id": "weights_file", "label": "本机 PT 权重文件", "mode": "file"},
+        {"id": "output_folder", "label": "ONNX 输出文件夹（留空则与 PT 同级）", "mode": "directory"},
+    ],
+    "parameters": [
+        {"id": "task_type", "label": "模型任务类型", "type": "select", "default": "目标检测", "options": ["目标检测", "目标分割", "旋转目标检测", "姿态估计", "图像分类"]},
+        {"id": "target_platform", "label": "目标平台", "type": "select", "default": "Jetson / TensorRT（NCHW）", "options": ["Jetson / TensorRT（NCHW）", "RKNN（NHWC）"]},
+        {"id": "imgsz", "label": "输入尺寸 imgsz", "type": "number", "default": 640, "options": []},
+        {"id": "opset", "label": "ONNX opset", "type": "number", "default": 12, "options": []},
+        {"id": "output_filename", "label": "输出文件名（留空自动添加 _cut）", "type": "text", "default": "", "options": []},
+        {"id": "python_path", "label": "YOLO Python（留空自动查找 yolo26）", "type": "text", "default": "", "options": []},
+    ],
+}
+
+REMOTE_TENSORRT_BUILD_FUNCTION = {
+    "id": "remote_tensorrt_build",
+    "name": "远程 TensorRT 引擎构建",
+    "description": "通过 SSH 读取 Jetson AI 推理盒子上的多个量化 ONNX，按填写顺序构建 TensorRT .plan 引擎并保存在原目录。",
+    "handlerId": "remote.build_tensorrt",
+    "pathFields": [],
+    "parameters": [
+        {"id": "onnx_files", "label": "量化 ONNX 路径（每行一个）", "type": "text", "default": "", "options": []},
+        {"id": "operation", "label": "操作方式", "type": "select", "default": "构建 TensorRT 引擎", "options": ["构建 TensorRT 引擎", "检查远程环境"]},
+        {"id": "trtexec_path", "label": "远端 trtexec 路径", "type": "text", "default": "/usr/src/tensorrt/bin/trtexec", "options": []},
+        {"id": "remote_workspace", "label": "远端任务根目录", "type": "text", "default": "~/.local/state/yolo-processing/tensorrt", "options": []},
+        {"id": "build_mode", "label": "构建精度", "type": "select", "default": "自动最佳（--best）", "options": ["自动最佳（--best）", "FP16", "FP32"]},
+        {"id": "run_benchmark", "label": "构建后执行性能测试", "type": "boolean", "default": True, "options": []},
+        {"id": "keep_remote_files", "label": "保留远端后台任务状态目录", "type": "boolean", "default": True, "options": []},
+        {"id": "overwrite_output", "label": "允许覆盖远端同名结果", "type": "boolean", "default": False, "options": []},
+        {"id": "host", "label": "AI 推理盒子 IP / 主机名", "type": "text", "default": "192.168.1.223", "options": []},
+        {"id": "port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
+        {"id": "username", "label": "SSH 用户名", "type": "text", "default": "wel", "options": []},
+        {"id": "password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
+    ],
+}
+
+LOCAL_STAR_PACKAGE_FUNCTION = {
+    "id": "local_star_package",
+    "name": "本地 STAR 模型打包",
+    "description": "使用本机 package_tool 和 trt.toml 模板，将 TensorRT .plan 打包为同级目录下的 .star 模型。",
+    "handlerId": "model.package_star",
+    "pathFields": [
+        {"id": "model_file", "label": "本机 TensorRT PLAN 模型", "mode": "file"},
+    ],
+    "parameters": [
+        {"id": "title", "label": "打包名称 title", "type": "text", "default": "", "options": []},
+        {"id": "labels", "label": "类别名称 labels", "type": "text", "default": "", "options": []},
+        {"id": "package_tool_path", "label": "package_tool 路径", "type": "text", "default": "/mnt/disk2/code/gen_package/package_tool", "options": []},
+        {"id": "template_file", "label": "trt.toml 模板路径", "type": "text", "default": "/mnt/disk2/code/gen_package/trt.toml", "options": []},
+        {"id": "hardware_name", "label": "硬件平台", "type": "text", "default": "TensorRT", "options": []},
+        {"id": "architecture", "label": "硬件架构", "type": "text", "default": "Turing", "options": []},
+        {"id": "driver", "label": "驱动信息", "type": "text", "default": "CUDA12.2", "options": []},
+        {"id": "model_name", "label": "模型架构名称", "type": "text", "default": "yolo26", "options": []},
+        {"id": "category", "label": "模型类别", "type": "select", "default": "generic", "options": ["generic", "seg", "classify"]},
+        {"id": "version", "label": "版本信息", "type": "text", "default": "1", "options": []},
+        {"id": "precision", "label": "模型精度", "type": "select", "default": "INT8 (1)", "options": ["INT4 (0)", "INT8 (1)", "FP8 (2)", "FP16 (3)", "FP32 (4)"]},
+        {"id": "input_n", "label": "输入张量 N", "type": "number", "default": 1, "options": []},
+        {"id": "input_c", "label": "输入张量 C", "type": "number", "default": 3, "options": []},
+        {"id": "input_h", "label": "输入张量 H", "type": "number", "default": 640, "options": []},
+        {"id": "input_w", "label": "输入张量 W", "type": "number", "default": 640, "options": []},
+        {"id": "color_format", "label": "颜色格式", "type": "select", "default": "RGB (2)", "options": ["NV12 (0)", "NV21 (1)", "RGB (2)", "BGR (3)", "GRAY (4)"]},
+    ],
+}
+
+DEFAULT_FUNCTIONS = [VIDEO_FUNCTION, YOLO_DATASET_FUNCTION, VIDEO_CLIP_FUNCTION, REMOTE_STAR_INFERENCE_FUNCTION, CALIB_DATASET_FUNCTION, LOCAL_PT_INFERENCE_FUNCTION, IMAGE_DEDUP_FUNCTION, JETSON_ONNX_EXPORT_FUNCTION, DOCKER_ONNX_QUANT_FUNCTION, REMOTE_TENSORRT_BUILD_FUNCTION, LOCAL_STAR_PACKAGE_FUNCTION]
 
 
 class FunctionCatalog:
@@ -215,7 +391,139 @@ class FunctionCatalog:
         try:
             content = json.loads(self.storage_file.read_text(encoding="utf-8"))
             if isinstance(content, list):
-                return [self._normalize(item) for item in content if isinstance(item, dict)]
+                migration_marker = self.storage_file.with_name(self.storage_file.name + ".local-pt-v1")
+                clip_migration_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1")
+                dedup_migration_marker = self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1")
+                quant_migration_marker = self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1")
+                export_migration_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1")
+                calib_priority_marker = self.storage_file.with_name(self.storage_file.name + ".calib-priority-v1")
+                remote_trt_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-build-v1")
+                remote_trt_launcher_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-launcher-v2")
+                remote_trt_batch_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-batch-v3")
+                remote_trt_paths_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-paths-v4")
+                remote_trt_remote_paths_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-remote-paths-v5")
+                local_star_package_marker = self.storage_file.with_name(self.storage_file.name + ".local-star-package-v1")
+                realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
+                changed = False
+                if not migration_marker.exists() and not any(isinstance(item, dict) and item.get("id") == LOCAL_PT_INFERENCE_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(LOCAL_PT_INFERENCE_FUNCTION))
+                    changed = True
+                if not dedup_migration_marker.exists() and not any(isinstance(item, dict) and item.get("id") == IMAGE_DEDUP_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(IMAGE_DEDUP_FUNCTION))
+                    changed = True
+                if not quant_migration_marker.exists() and not any(isinstance(item, dict) and item.get("id") == DOCKER_ONNX_QUANT_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(DOCKER_ONNX_QUANT_FUNCTION))
+                    changed = True
+                if not export_migration_marker.exists() and not any(isinstance(item, dict) and item.get("id") == JETSON_ONNX_EXPORT_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(JETSON_ONNX_EXPORT_FUNCTION))
+                    changed = True
+                if not remote_trt_marker.exists() and not any(isinstance(item, dict) and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(REMOTE_TENSORRT_BUILD_FUNCTION))
+                    changed = True
+                if not local_star_package_marker.exists() and not any(isinstance(item, dict) and item.get("id") == LOCAL_STAR_PACKAGE_FUNCTION["id"] for item in content):
+                    content.append(deepcopy(LOCAL_STAR_PACKAGE_FUNCTION))
+                    changed = True
+                for item in content:
+                    if (not realtime_playback_marker.exists() and isinstance(item, dict)
+                            and item.get("id") in {REMOTE_STAR_INFERENCE_FUNCTION["id"], LOCAL_PT_INFERENCE_FUNCTION["id"]}):
+                        source = REMOTE_STAR_INFERENCE_FUNCTION if item.get("id") == REMOTE_STAR_INFERENCE_FUNCTION["id"] else LOCAL_PT_INFERENCE_FUNCTION
+                        item["description"] = source["description"]
+                        source_realtime = next(parameter for parameter in source["parameters"] if parameter["id"] == "realtime")
+                        for parameter in item.get("parameters", []):
+                            if isinstance(parameter, dict) and parameter.get("id") == "realtime":
+                                parameter.update(deepcopy(source_realtime))
+                                break
+                        changed = True
+                    if isinstance(item, dict) and item.get("id") == LOCAL_PT_INFERENCE_FUNCTION["id"]:
+                        fields = item.get("pathFields", [])
+                        if any(isinstance(field, dict) and field.get("id") == "output_file" for field in fields):
+                            item["pathFields"] = [deepcopy(LOCAL_PT_INFERENCE_FUNCTION["pathFields"][2]) if isinstance(field, dict) and field.get("id") == "output_file" else field for field in fields]
+                            changed = True
+                    if (not clip_migration_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_CLIP_FUNCTION["id"]):
+                        item["description"] = VIDEO_CLIP_FUNCTION["description"]
+                        for parameter in item.get("parameters", []):
+                            if isinstance(parameter, dict) and parameter.get("id") == "encoding_mode":
+                                parameter.update(deepcopy(VIDEO_CLIP_FUNCTION["parameters"][-1]))
+                                changed = True
+                    if (not calib_priority_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == CALIB_DATASET_FUNCTION["id"]):
+                        item["description"] = CALIB_DATASET_FUNCTION["description"]
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(parameter, dict) and parameter.get("id") == "negative_dirs" for parameter in parameters):
+                            negative_parameter = next(
+                                parameter for parameter in CALIB_DATASET_FUNCTION["parameters"]
+                                if parameter["id"] == "negative_dirs"
+                            )
+                            insert_at = next(
+                                (index + 1 for index, parameter in enumerate(parameters)
+                                 if isinstance(parameter, dict) and parameter.get("id") == "annotation_dirs"),
+                                len(parameters),
+                            )
+                            parameters.insert(insert_at, deepcopy(negative_parameter))
+                        changed = True
+                    if (not remote_trt_launcher_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"]):
+                        item["description"] = REMOTE_TENSORRT_BUILD_FUNCTION["description"]
+                        changed = True
+                    if (not remote_trt_batch_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"]):
+                        item["description"] = REMOTE_TENSORRT_BUILD_FUNCTION["description"]
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(parameter, dict) and parameter.get("id") == "onnx_files" for parameter in parameters):
+                            parameters.insert(0, deepcopy(REMOTE_TENSORRT_BUILD_FUNCTION["parameters"][0]))
+                        changed = True
+                    if (not remote_trt_paths_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"]):
+                        parameters = item.setdefault("parameters", [])
+                        current_parameter = next(
+                            (parameter for parameter in parameters
+                             if isinstance(parameter, dict) and parameter.get("id") == "onnx_files"),
+                            None,
+                        )
+                        if current_parameter is None:
+                            parameters.insert(0, deepcopy(REMOTE_TENSORRT_BUILD_FUNCTION["parameters"][0]))
+                        else:
+                            current_parameter.update(deepcopy(REMOTE_TENSORRT_BUILD_FUNCTION["parameters"][0]))
+                        changed = True
+                    if (not remote_trt_remote_paths_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"]):
+                        item["description"] = REMOTE_TENSORRT_BUILD_FUNCTION["description"]
+                        item["pathFields"] = []
+                        item["parameters"] = deepcopy(REMOTE_TENSORRT_BUILD_FUNCTION["parameters"])
+                        changed = True
+                if changed:
+                    temporary = self.storage_file.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
+                    temporary.replace(self.storage_file)
+                if not migration_marker.exists():
+                    migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not clip_migration_marker.exists():
+                    clip_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not dedup_migration_marker.exists():
+                    dedup_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not quant_migration_marker.exists():
+                    quant_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not export_migration_marker.exists():
+                    export_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not calib_priority_marker.exists():
+                    calib_priority_marker.write_text("migrated\n", encoding="utf-8")
+                if not remote_trt_marker.exists():
+                    remote_trt_marker.write_text("migrated\n", encoding="utf-8")
+                if not remote_trt_launcher_marker.exists():
+                    remote_trt_launcher_marker.write_text("migrated\n", encoding="utf-8")
+                if not remote_trt_batch_marker.exists():
+                    remote_trt_batch_marker.write_text("migrated\n", encoding="utf-8")
+                if not remote_trt_paths_marker.exists():
+                    remote_trt_paths_marker.write_text("migrated\n", encoding="utf-8")
+                if not remote_trt_remote_paths_marker.exists():
+                    remote_trt_remote_paths_marker.write_text("migrated\n", encoding="utf-8")
+                if not local_star_package_marker.exists():
+                    local_star_package_marker.write_text("migrated\n", encoding="utf-8")
+                if not realtime_playback_marker.exists():
+                    realtime_playback_marker.write_text("migrated\n", encoding="utf-8")
+                items = [self._normalize(item) for item in content if isinstance(item, dict)]
+                return items
         except (OSError, json.JSONDecodeError):
             pass
         return [self._normalize(deepcopy(item)) for item in DEFAULT_FUNCTIONS]
@@ -225,6 +533,19 @@ class FunctionCatalog:
         temporary = self.storage_file.with_suffix(".tmp")
         temporary.write_text(json.dumps(self._items, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.storage_file)
+        self.storage_file.with_name(self.storage_file.name + ".local-pt-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".calib-priority-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-build-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-launcher-v2").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-batch-v3").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-paths-v4").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-remote-paths-v5").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".local-star-package-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1").write_text("migrated\n", encoding="utf-8")
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:

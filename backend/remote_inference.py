@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import json
+import math
 import shlex
 import socket
 import struct
@@ -28,6 +30,37 @@ HOST_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,252}$")
 MODEL_SUFFIXES = {".star", ".plan", ".engine"}
 VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", ".ts", ".mts"}
 SCRIPT_SUFFIXES = {".py"}
+REMEMBERED_PASSWORD_MARKER = "__YOLO_REMEMBERED_SSH_PASSWORD__"
+
+
+class PreviewPacketDecoder:
+    """Decode timestamped JPEG packets across arbitrary SSH chunk boundaries."""
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.expected_size: int | None = None
+        self.position = 0.0
+
+    def feed(self, chunk: bytes) -> list[tuple[int, float, bytes]]:
+        self.buffer.extend(chunk)
+        frames: list[tuple[int, float, bytes]] = []
+        while True:
+            if self.expected_size is None:
+                if len(self.buffer) < 16:
+                    break
+                self.generation, self.position, self.expected_size = struct.unpack(">IdI", self.buffer[:16])
+                del self.buffer[:16]
+                if not math.isfinite(self.position) or self.position < 0:
+                    raise RuntimeError("远端画面时间戳异常。")
+                if self.expected_size <= 0 or self.expected_size > MAX_FRAME_BYTES:
+                    raise RuntimeError("远端画面数据格式异常，请确认脚本路径指向兼容版本。")
+            if len(self.buffer) < self.expected_size:
+                break
+            frame = bytes(self.buffer[:self.expected_size])
+            del self.buffer[:self.expected_size]
+            frames.append((self.generation, self.position, frame))
+            self.expected_size = None
+        return frames
 
 
 def _number(value: Any, label: str, minimum: float, maximum: float) -> float:
@@ -72,8 +105,10 @@ def validate_connection_payload(
     credential_store: CredentialStore | None = None,
 ) -> dict[str, Any]:
     identity = validate_connection_identity(raw)
-    remember_password = bool(raw.get("remember_password", False))
+    remember_password = bool(raw.get("remember_password", True))
     password = str(raw.get("password", ""))
+    if password == REMEMBERED_PASSWORD_MARKER:
+        password = ""
     password_from_store = False
     if not password and remember_password and credential_store is not None:
         password = credential_store.get(
@@ -102,6 +137,7 @@ def validate_start_payload(
     python_path = str(raw.get("python_path", "python3")).strip()
     if not python_path:
         raise ValueError("请输入远端 Python 解释器路径。")
+    labels = str(raw.get("labels", "")).strip()
     local_script_value = str(paths.get("local_script_file", "")).strip()
     local_script_file = (
         _local_file(paths, "local_script_file", "本地推理脚本", SCRIPT_SUFFIXES)
@@ -110,24 +146,51 @@ def validate_start_payload(
     )
     if not local_script_file.is_file():
         raise RuntimeError("平台内置推理脚本缺失，请重新安装或选择本地 run_star_video.py。")
-    local_model_file = _local_file(paths, "local_model_file", "本地 STAR 模型文件", MODEL_SUFFIXES)
+    conf = _number(raw.get("conf", 0.5), "置信度阈值", 0, 1)
+    models_raw = raw.get("star_models", "[]")
+    try:
+        configured_models = json.loads(models_raw) if isinstance(models_raw, str) else models_raw
+    except json.JSONDecodeError as exc:
+        raise ValueError("STAR 模型配置格式不正确，请在界面中重新填写。") from exc
+    if configured_models in (None, []):
+        # Backward compatibility for saved configurations created before the
+        # unified model list was introduced.
+        if not labels:
+            raise ValueError("请填写类别名称；多个类别请使用英文逗号分隔。")
+        local_model_file = _local_file(paths, "local_model_file", "本地 STAR 模型文件", MODEL_SUFFIXES)
+        configured_models = [{"path": str(local_model_file), "labels": labels, "conf": conf}]
+    if not isinstance(configured_models, list) or not 1 <= len(configured_models) <= 8:
+        raise ValueError("请至少添加 1 个 STAR 模型，最多可添加 8 个。")
+    models = []
+    for index, item in enumerate(configured_models, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f"第 {index} 个模型的配置格式不正确。")
+        model_path = _local_file({"model": item.get("path", "")}, "model", f"第 {index} 个 STAR 模型文件", MODEL_SUFFIXES)
+        model_labels = str(item.get("labels", "")).strip()
+        if not model_labels:
+            raise ValueError(f"请填写第 {index} 个模型的类别名称。")
+        models.append({"local_path": model_path, "labels": model_labels,
+                       "conf": _number(item.get("conf", conf), f"第 {index} 个模型的置信度阈值", 0, 1)})
+
     local_video_file = _local_file(paths, "local_video_file", "本地视频文件", VIDEO_SUFFIXES)
 
     return {
         **connection,
         "python_path": python_path,
         "local_script_file": local_script_file,
-        "local_model_file": local_model_file,
+        "local_model_file": models[0]["local_path"],
+        "models": models,
         "local_video_file": local_video_file,
-        "labels": str(raw.get("labels", "class0")).strip() or "class0",
-        "conf": _number(raw.get("conf", 0.5), "置信度阈值", 0, 1),
+        "labels": labels,
+        "conf": conf,
         "iou": _number(raw.get("iou", 0.45), "NMS IoU 阈值", 0, 1),
         "max_det": int(_number(raw.get("max_det", 300), "每帧最大框数", 1, 10000)),
         "save_path": str(raw.get("save_path", "")).strip(),
         "realtime": bool(raw.get("realtime", True)),
-        "preview_fps": _number(raw.get("preview_fps", 12), "预览帧率", 0, 60),
-        "stream_width": int(_number(raw.get("stream_width", 1280), "预览宽度", 320, 3840)),
-        "jpeg_quality": int(_number(raw.get("jpeg_quality", 80), "画面质量", 20, 100)),
+        "preview_fps": _number(raw.get("preview_fps", 20), "预览帧率", 0, 60),
+        "stream_width": int(_number(raw.get("stream_width", 960), "预览宽度", 320, 3840)),
+        "jpeg_quality": int(_number(raw.get("jpeg_quality", 70), "画面质量", 20, 100)),
+        "replay_grace_seconds": int(_number(raw.get("replay_grace_seconds", 120), "结束后回看时间", 0, 3600)),
         "cuda_backend": str(raw.get("cuda_backend", "auto")),
     }
 
@@ -144,6 +207,14 @@ class RemoteInferenceSession:
     frame_count: int = 0
     latest_frame: bytes | None = None
     frame_version: int = 0
+    duration_seconds: float = 0.0
+    position_seconds: float = 0.0
+    source_fps: float = 0.0
+    seek_generation: int = 0
+    last_frame_generation: int = 0
+    pause_preview_pending: bool = False
+    at_end: bool = False
+    replay_deadline: float | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=160))
     error: str | None = None
     transfer_stage: str | None = None
@@ -151,8 +222,10 @@ class RemoteInferenceSession:
     stop_event: threading.Event = field(default_factory=threading.Event)
     condition: threading.Condition = field(default_factory=threading.Condition)
     ssh_client: Any = None
+    control_stdin: Any = None
     remote_temp_dir: str | None = None
     remote_files: list[str] = field(default_factory=list)
+    stream_prefix: str = "/api/remote-inference"
 
     def add_log(self, text: str) -> None:
         clean = text.strip()
@@ -162,11 +235,19 @@ class RemoteInferenceSession:
             self.logs.append(clean)
             self.condition.notify_all()
 
-    def publish_frame(self, frame: bytes) -> None:
+    def publish_frame(self, frame: bytes, position_seconds: float = 0.0, generation: int = 0) -> None:
         with self.condition:
+            if generation < self.seek_generation:
+                return
+            if self.status == "paused":
+                if not self.pause_preview_pending:
+                    return
+                self.pause_preview_pending = False
             self.latest_frame = frame
             self.frame_version += 1
             self.frame_count += 1
+            self.last_frame_generation = generation
+            self.position_seconds = max(0.0, min(position_seconds, self.duration_seconds)) if self.duration_seconds > 0 else max(0.0, position_seconds)
             if self.status == "starting":
                 self.status = "running"
                 self.message = "远端推理运行中，正在接收实时画面。"
@@ -192,11 +273,16 @@ class RemoteInferenceSession:
                 "startedAt": self.started_at,
                 "finishedAt": self.finished_at,
                 "frameCount": self.frame_count,
+                "durationSeconds": self.duration_seconds,
+                "positionSeconds": self.position_seconds,
+                "sourceFps": self.source_fps,
+                "atEnd": self.at_end,
+                "replayRemainingSeconds": max(0, round(self.replay_deadline - time.monotonic())) if self.replay_deadline is not None else 0,
                 "logs": list(self.logs),
                 "error": self.error,
                 "transferStage": self.transfer_stage,
                 "uploadProgress": self.upload_progress,
-                "streamUrl": f"/api/remote-inference/{self.id}/stream",
+                "streamUrl": f"{self.stream_prefix}/{self.id}/stream",
             }
 
     def wait_for_frame(self, version: int, timeout: float = 1.0) -> tuple[int, bytes | None, str]:
@@ -302,6 +388,21 @@ class RemoteInferenceManager:
             config["password"] = ""
             client.close()
 
+    def resolve_connection(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Resolve an SSH connection, including a password saved in the local vault."""
+        return validate_connection_payload(raw, self._credentials)
+
+    def credential_status(self, raw: dict[str, Any]) -> dict[str, Any]:
+        identity = validate_connection_identity(raw)
+        remembered = self._credentials.get(
+            identity["host"], identity["port"], identity["username"]
+        ) is not None
+        return {
+            "ok": True,
+            **identity,
+            "remembered": remembered,
+        }
+
     def forget_password(self, raw: dict[str, Any]) -> dict[str, Any]:
         identity = validate_connection_identity(raw)
         removed = self._credentials.delete(
@@ -313,7 +414,11 @@ class RemoteInferenceManager:
             "message": "已清除该设备保存的 SSH 密码。" if removed else "该设备没有已保存的 SSH 密码。",
         }
 
-    def start(self, raw: dict[str, Any]) -> dict[str, Any]:
+    def start(
+        self,
+        raw: dict[str, Any],
+        on_finished: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         raw_parameters = raw.get("parameters", raw)
         raw_paths = raw.get("paths", {})
         if not isinstance(raw_parameters, dict) or not isinstance(raw_paths, dict):
@@ -329,7 +434,7 @@ class RemoteInferenceManager:
             self._sessions[session.id] = session
         threading.Thread(
             target=self._run,
-            args=(session, config),
+            args=(session, config, on_finished),
             name=f"remote-inference-{session.id}",
             daemon=True,
         ).start()
@@ -349,6 +454,8 @@ class RemoteInferenceManager:
             if session.status not in TERMINAL_STATES:
                 session.status = "stopping"
                 session.message = "正在停止远端推理……"
+            session.at_end = False
+            session.replay_deadline = None
             session.condition.notify_all()
         client = session.ssh_client
         if client is not None:
@@ -379,6 +486,9 @@ class RemoteInferenceManager:
             config["script_path"],
             "--model",
             config["remote_model_file"],
+            "--models-json",
+            json.dumps(config.get("remote_models", [{"path": config["remote_model_file"],
+                "labels": config["labels"], "conf": config["conf"]}]), ensure_ascii=False),
             "--source",
             config["remote_video_file"],
             "--labels",
@@ -395,6 +505,8 @@ class RemoteInferenceManager:
             str(config["stream_width"]),
             "--jpeg-quality",
             str(config["jpeg_quality"]),
+            "--replay-grace-seconds",
+            str(config["replay_grace_seconds"]),
             "--cuda-backend",
             config["cuda_backend"],
             "--session-token",
@@ -413,7 +525,82 @@ class RemoteInferenceManager:
         while b"\n" in pending:
             line, _, remainder = pending.partition(b"\n")
             pending[:] = remainder
-            session.add_log(line.decode("utf-8", errors="replace"))
+            decoded = line.decode("utf-8", errors="replace").strip()
+            if decoded.startswith("VIDEO_META_JSON:"):
+                try:
+                    metadata = json.loads(decoded.removeprefix("VIDEO_META_JSON:"))
+                    duration = float(metadata.get("durationSeconds", 0))
+                    fps = float(metadata.get("sourceFps", 0))
+                    with session.condition:
+                        session.duration_seconds = duration if math.isfinite(duration) and duration > 0 else 0.0
+                        session.source_fps = fps if math.isfinite(fps) and fps > 0 else 0.0
+                        session.condition.notify_all()
+                except (ValueError, TypeError, AttributeError):
+                    session.add_log("警告：无法读取视频时长，进度条可能不可用。")
+            elif decoded.startswith("VIDEO_EOF_JSON:"):
+                try:
+                    metadata = json.loads(decoded.removeprefix("VIDEO_EOF_JSON:"))
+                    grace = int(metadata.get("graceSeconds", 0))
+                    with session.condition:
+                        session.at_end = True
+                        session.position_seconds = session.duration_seconds
+                        session.replay_deadline = time.monotonic() + max(0, grace)
+                        session.message = f"视频已到结尾，{grace} 秒内可以拖动进度条回看。"
+                        session.condition.notify_all()
+                except (ValueError, TypeError, AttributeError):
+                    session.add_log("视频播放已到结尾。")
+            else:
+                session.add_log(decoded)
+
+    def seek(self, session_id: str, seconds: Any) -> dict[str, Any]:
+        session = self.get(session_id)
+        try:
+            requested = float(seconds)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("跳转时间必须是有效秒数。") from exc
+        if not math.isfinite(requested):
+            raise ValueError("跳转时间必须是有效秒数。")
+        with session.condition:
+            if session.status not in {"starting", "running", "paused"} or session.control_stdin is None:
+                raise ValueError("当前任务尚未进入可拖动的视频播放阶段。")
+            if session.duration_seconds <= 0:
+                raise ValueError("视频未提供可用时长，暂时无法跳转。")
+            target = min(max(0.0, requested), max(0.0, session.duration_seconds - 0.001))
+            generation = session.seek_generation + 1
+            if generation > 0xFFFFFFFF:
+                raise RuntimeError("跳转次数已达到上限，请重新开始推理任务。")
+            try:
+                session.control_stdin.write(json.dumps({"action": "seek", "seconds": target, "generation": generation}) + "\n")
+                session.control_stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("跳转命令发送失败，远端任务可能已结束。") from exc
+            session.seek_generation = generation
+            session.pause_preview_pending = session.status == "paused"
+            session.at_end = False
+            session.replay_deadline = None
+        return {"ok": True, "requestedSeconds": target}
+
+    def set_paused(self, session_id: str, paused: bool) -> dict[str, Any]:
+        session = self.get(session_id)
+        if not isinstance(paused, bool):
+            raise ValueError("暂停状态必须是布尔值。")
+        with session.condition:
+            if session.status not in {"running", "paused"} or session.control_stdin is None:
+                raise ValueError("当前任务尚未进入可暂停的视频播放阶段。")
+            if session.at_end:
+                raise ValueError("视频已到结尾，请拖动进度条回看。")
+            if (session.status == "paused") == paused:
+                return session.snapshot()
+            try:
+                session.control_stdin.write(json.dumps({"action": "pause" if paused else "resume"}) + "\n")
+                session.control_stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("暂停/继续命令发送失败，远端任务可能已结束。") from exc
+            session.status = "paused" if paused else "running"
+            session.message = "视频已暂停，远端推理暂时停止。" if paused else "已继续从当前位置推理。"
+            session.pause_preview_pending = paused and session.seek_generation > session.last_frame_generation
+            session.condition.notify_all()
+        return session.snapshot()
 
     @staticmethod
     def _upload_file(
@@ -438,7 +625,12 @@ class RemoteInferenceManager:
         sftp.put(str(local_path), remote_path, callback=progress)
         session.add_log(f"{stage}上传完成：{local_path.name}")
 
-    def _run(self, session: RemoteInferenceSession, config: dict[str, Any]) -> None:
+    def _run(
+        self,
+        session: RemoteInferenceSession,
+        config: dict[str, Any],
+        on_finished: Callable[[dict[str, Any]], None] | None = None,
+    ) -> None:
         client = None
         sftp = None
         channel = None
@@ -483,10 +675,15 @@ class RemoteInferenceManager:
             remote_dir = f"/tmp/yolo_remote_inference_{session.id}"
             remote_worker = f"{remote_dir}/worker.py"
             remote_script = f"{remote_dir}/run_star_video.py"
-            remote_model = f"{remote_dir}/model{config['local_model_file'].suffix.lower()}"
+            remote_models = [
+                {"path": f"{remote_dir}/model_{index}{model['local_path'].suffix.lower()}",
+                 "labels": model["labels"], "conf": model["conf"]}
+                for index, model in enumerate(config["models"], 1)
+            ]
+            remote_model = remote_models[0]["path"]
             remote_video = f"{remote_dir}/input{config['local_video_file'].suffix.lower()}"
             session.remote_temp_dir = remote_dir
-            session.remote_files = [remote_worker, remote_script, remote_model, remote_video]
+            session.remote_files = [remote_worker, remote_script, *[model["path"] for model in remote_models], remote_video]
             sftp = client.open_sftp()
             sftp.mkdir(remote_dir)
             sftp.put(str(REMOTE_WORKER), remote_worker)
@@ -498,13 +695,9 @@ class RemoteInferenceManager:
                 "推理脚本",
                 session,
             )
-            self._upload_file(
-                sftp,
-                config["local_model_file"],
-                remote_model,
-                "模型文件",
-                session,
-            )
+            for index, model in enumerate(config["models"], 1):
+                self._upload_file(sftp, model["local_path"], remote_models[index - 1]["path"],
+                                  f"模型 {index}/{len(remote_models)}", session)
             self._upload_file(
                 sftp,
                 config["local_video_file"],
@@ -516,43 +709,30 @@ class RemoteInferenceManager:
             sftp = None
             config["script_path"] = remote_script
             config["remote_model_file"] = remote_model
+            config["remote_models"] = remote_models
             config["remote_video_file"] = remote_video
-            session.add_log("本地推理脚本、模型和视频已上传至任务临时目录。")
+            session.add_log(f"本地推理脚本、{len(remote_models)} 个模型和视频已上传至任务临时目录。")
 
             token = f"yolo-session-{session.id}"
             command = self._command(config, remote_worker, token)
-            _stdin, stdout, _stderr = client.exec_command(command, get_pty=False)
+            stdin, stdout, _stderr = client.exec_command(command, get_pty=False)
+            session.control_stdin = stdin
             channel = stdout.channel
             with session.condition:
                 session.status = "starting"
                 session.message = "设备已连接，正在加载模型并等待第一帧……"
                 session.condition.notify_all()
 
-            stdout_buffer = bytearray()
-            expected_size: int | None = None
+            decoder = PreviewPacketDecoder()
             while not session.stop_event.is_set():
                 received = False
                 if channel.recv_ready():
                     chunk = channel.recv(65536)
                     if chunk:
-                        stdout_buffer.extend(chunk)
+                        for generation, position, frame in decoder.feed(chunk):
+                            session.publish_frame(frame, position, generation)
                         received = True
                 self._drain_stderr(channel, session, stderr_pending)
-
-                while True:
-                    if expected_size is None:
-                        if len(stdout_buffer) < 4:
-                            break
-                        expected_size = struct.unpack(">I", stdout_buffer[:4])[0]
-                        del stdout_buffer[:4]
-                        if expected_size <= 0 or expected_size > MAX_FRAME_BYTES:
-                            raise RuntimeError("远端画面数据格式异常，请确认脚本路径指向兼容版本。")
-                    if len(stdout_buffer) < expected_size:
-                        break
-                    frame = bytes(stdout_buffer[:expected_size])
-                    del stdout_buffer[:expected_size]
-                    expected_size = None
-                    session.publish_frame(frame)
 
                 if channel.exit_status_ready() and not channel.recv_ready():
                     break
@@ -564,6 +744,8 @@ class RemoteInferenceManager:
                 session.add_log(stderr_pending.decode("utf-8", errors="replace"))
             exit_code = channel.recv_exit_status() if channel.exit_status_ready() else None
             with session.condition:
+                session.at_end = False
+                session.replay_deadline = None
                 if session.stop_event.is_set():
                     session.status = "stopped"
                     session.message = "远端推理已停止。"
@@ -578,6 +760,8 @@ class RemoteInferenceManager:
             config["password"] = ""
             message = str(exc).strip() or exc.__class__.__name__
             with session.condition:
+                session.at_end = False
+                session.replay_deadline = None
                 session.status = "stopped" if session.stop_event.is_set() else "failed"
                 session.message = "远端推理已停止。" if session.stop_event.is_set() else "远端推理启动或运行失败。"
                 session.error = None if session.stop_event.is_set() else message
@@ -585,6 +769,7 @@ class RemoteInferenceManager:
                 session.logs.append(f"错误：{message}")
                 session.condition.notify_all()
         finally:
+            session.control_stdin = None
             if channel is not None:
                 try:
                     channel.close()
@@ -615,6 +800,11 @@ class RemoteInferenceManager:
                 except Exception:
                     pass
             session.ssh_client = None
+            if on_finished is not None:
+                try:
+                    on_finished(session.snapshot())
+                except Exception:
+                    pass
 
 
 manager = RemoteInferenceManager()

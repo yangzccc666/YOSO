@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--realtime",
         action="store_true",
-        help="Pace a video file at its original FPS instead of processing as fast as possible",
+        help="Keep the original video timeline; skip late frames when inference is slower than the source FPS",
     )
     parser.add_argument(
         "--display-width",
@@ -974,6 +974,46 @@ def create_writer(path: str, capture: cv2.VideoCapture, frame: np.ndarray):
     return writer, output
 
 
+def capture_frame_index(capture: cv2.VideoCapture, *, after_read: bool = False) -> int:
+    value = capture.get(cv2.CAP_PROP_POS_FRAMES)
+    if not np.isfinite(value) or value < 0:
+        return 0
+    index = int(round(value))
+    return max(0, index - 1) if after_read else max(0, index)
+
+
+def skip_late_video_frames(capture: cv2.VideoCapture, source_fps: float,
+                           source_frames: float, anchor_source_seconds: float,
+                           anchor_wall_time: float) -> int:
+    if source_fps <= 0 or not np.isfinite(source_frames) or source_frames <= 0:
+        return 0
+    next_index = capture_frame_index(capture)
+    elapsed = max(0.0, time.monotonic() - anchor_wall_time)
+    target_index = min(
+        max(0, int((anchor_source_seconds + elapsed) * source_fps)),
+        max(0, int(source_frames) - 1),
+    )
+    skipped = 0
+    while next_index < target_index:
+        if not capture.grab():
+            break
+        next_index += 1
+        skipped += 1
+    return skipped
+
+
+def write_timeline_frame(writer: cv2.VideoWriter, frame: np.ndarray, source_index: int,
+                         previous_frame: np.ndarray | None,
+                         previous_index: int | None) -> tuple[np.ndarray, int, int]:
+    written = 0
+    if previous_frame is not None and previous_index is not None:
+        for _ in range(max(0, source_index - previous_index - 1)):
+            writer.write(previous_frame)
+            written += 1
+    writer.write(frame)
+    return frame.copy(), source_index, written + 1
+
+
 def main() -> int:
     args = parse_args()
     if not 0.0 <= args.conf <= 1.0:
@@ -1002,14 +1042,31 @@ def main() -> int:
     saved_video_path = None
     fps_ema = 0.0
     frame_index = 0
+    skipped_frames = 0
+    saved_frame_count = 0
     source_fps = capture.get(cv2.CAP_PROP_FPS)
     frame_period = 1.0 / source_fps if np.isfinite(source_fps) and source_fps > 0 else 0.0
+    source_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    playback_anchor_source = capture_frame_index(capture) / source_fps if frame_period > 0 else 0.0
+    playback_anchor_wall = time.monotonic()
+    previous_saved_frame = None
+    previous_saved_index = None
+
+    if args.realtime and frame_period > 0:
+        print("Real-time playback enabled: late source frames will be skipped when inference is slower than the video FPS.")
 
     try:
         while True:
+            if args.realtime and frame_period > 0:
+                skipped_frames += skip_late_video_frames(
+                    capture, source_fps, source_frames,
+                    playback_anchor_source, playback_anchor_wall,
+                )
             ok, frame = capture.read()
             if not ok:
                 break
+            source_index = capture_frame_index(capture, after_read=True)
+            source_position = (source_index + 1) / source_fps if frame_period > 0 else 0.0
             start = time.perf_counter()
             tensor, gain, pad = preprocess(frame, runner.input_shape)
             outputs = runner.infer(tensor)
@@ -1032,7 +1089,7 @@ def main() -> int:
             draw_detections(frame, boxes, scores, class_ids, labels)
             cv2.putText(
                 frame,
-                f"FPS {fps_ema:.1f}  detections {len(boxes)}  conf {args.conf:.2f}",
+                f"Infer {fps_ema:.1f} FPS  detections {len(boxes)}  skipped {skipped_frames}",
                 (18, 34),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -1044,11 +1101,15 @@ def main() -> int:
             if args.save:
                 if writer is None:
                     writer, saved_video_path = create_writer(args.save, capture, frame)
-                writer.write(frame)
+                previous_saved_frame, previous_saved_index, written = write_timeline_frame(
+                    writer, frame, source_index, previous_saved_frame, previous_saved_index,
+                )
+                saved_frame_count += written
 
             delay_ms = 1
             if args.realtime and frame_period > 0:
-                delay_ms = max(1, round((frame_period - (time.perf_counter() - start)) * 1000))
+                deadline = playback_anchor_wall + max(0.0, source_position - playback_anchor_source)
+                delay_ms = max(1, round((deadline - time.monotonic()) * 1000))
 
             if not args.no_show:
                 display = frame
@@ -1073,7 +1134,9 @@ def main() -> int:
             cv2.destroyAllWindows()
         runner.close()
 
-    print(f"Processed {frame_index} frames")
+    print(f"Processed {frame_index} frames; skipped {skipped_frames} late source frames")
+    if saved_frame_count:
+        print(f"Saved timeline frames: {saved_frame_count}")
     if saved_video_path is not None:
         print(f"Saved annotated video: {saved_video_path}")
     return 0

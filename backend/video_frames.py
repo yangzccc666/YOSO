@@ -135,13 +135,19 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
     details: list[dict[str, Any]] = []
 
     for index, video in enumerate(videos, start=1):
+        context.check_cancelled()
         parent = output_root or video.parent
         output_folder = _unique_output_folder(parent, video.stem)
         context.report(f"[{index}/{len(videos)}] 正在处理：{video.name}")
 
         captured = io.StringIO()
         original_tqdm = getattr(module, "tqdm", None)
-        module.tqdm = lambda iterable: iterable
+        def cancellable_progress(iterable: Any) -> Any:
+            for value in iterable:
+                context.check_cancelled()
+                yield value
+
+        module.tqdm = cancellable_progress
         try:
             with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
                 process_result = module.vedio2img(

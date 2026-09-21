@@ -15,6 +15,8 @@ type Props = {
   onDeleteGroup: (group: GroupDefinition) => void
   onReorderGroups: (groupIds: string[]) => void
   onMoveFunction: (itemId: string, groupId: string | null, position?: number) => void
+  collapsed: boolean
+  onToggleCollapsed: () => void
 }
 
 type GroupBlock = {
@@ -24,28 +26,9 @@ type GroupBlock = {
   items: FunctionDefinition[]
 }
 
-const collapsedStorageKey = 'yolo-data-platform:collapsed-groups:v1'
 const ungroupedKey = '__ungrouped__'
 
-function loadCollapsedGroups(): Set<string> {
-  try {
-    const stored = JSON.parse(localStorage.getItem(collapsedStorageKey) || '[]')
-    return new Set(Array.isArray(stored) ? stored.filter((value): value is string => typeof value === 'string') : [])
-  } catch {
-    return new Set()
-  }
-}
-
-function saveCollapsedGroups(groups: Set<string>) {
-  try {
-    localStorage.setItem(collapsedStorageKey, JSON.stringify([...groups]))
-  } catch {
-    // The controls still work for this session if browser storage is unavailable.
-  }
-}
-
 export function FunctionSidebar(props: Props) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(loadCollapsedGroups)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const isComposingSearch = useRef(false)
   const normalizedSearch = props.search.trim().toLowerCase()
@@ -69,26 +52,6 @@ export function FunctionSidebar(props: Props) {
     return normalizedSearch ? result.filter((block) => block.items.length) : result
   }, [props.functions, props.groups, normalizedSearch])
 
-  const toggle = (id: string | null) => {
-    const key = id || ungroupedKey
-    setCollapsed((current) => {
-      const next = new Set(current)
-      if (next.has(key)) next.delete(key)
-      else next.add(key)
-      saveCollapsedGroups(next)
-      return next
-    })
-  }
-
-  const allCollapseKeys = [...props.groups.map((group) => group.id), ungroupedKey]
-  const allCollapsed = allCollapseKeys.length > 0 && allCollapseKeys.every((key) => collapsed.has(key))
-
-  const toggleAllGroups = () => {
-    const next = allCollapsed ? new Set<string>() : new Set(allCollapseKeys)
-    saveCollapsedGroups(next)
-    setCollapsed(next)
-  }
-
   const reorderGroup = (groupId: string, direction: -1 | 1) => {
     const ids = [...props.groups].sort((left, right) => left.order - right.order).map((group) => group.id)
     const currentIndex = ids.indexOf(groupId)
@@ -107,62 +70,65 @@ export function FunctionSidebar(props: Props) {
   }
 
   return (
-    <aside className="function-sidebar">
-      <div className="sidebar-heading">
-        <div><h1>功能分组</h1><span>{props.functions.length}</span></div>
-        <button className="add-group-button" onClick={props.onCreateGroup}><icons.FolderPlus size={17} />新建分组</button>
-      </div>
-      <label className="search-box">
-        <icons.Search size={18} />
-        <input
-          defaultValue={props.search}
-          inputMode="text"
-          lang="zh-CN"
-          autoComplete="off"
-          spellCheck={false}
-          placeholder="搜索功能或分组"
-          onCompositionStart={() => { isComposingSearch.current = true }}
-          onCompositionEnd={(event) => {
-            isComposingSearch.current = false
-            props.onSearch(event.currentTarget.value)
-          }}
-          onChange={(event) => {
-            if (!isComposingSearch.current) props.onSearch(event.currentTarget.value)
-          }}
-        />
-      </label>
-      <div className="group-display-toolbar">
-        <span>分组显示</span>
-        <button onClick={toggleAllGroups} disabled={Boolean(normalizedSearch)} title={normalizedSearch ? '搜索时分组会自动展开' : allCollapsed ? '展开所有分组' : '折叠所有分组'}>
-          <icons.ChevronRight className={allCollapsed ? '' : 'expanded'} size={15} />
-          {allCollapsed ? '全部展开' : '全部折叠'}
+    <aside className={`function-sidebar ${props.collapsed ? 'is-collapsed' : ''}`}>
+      {props.collapsed ? (
+        <button className="sidebar-rail-toggle" onClick={props.onToggleCollapsed} title="展开功能栏" aria-label="展开功能栏">
+          <icons.PanelLeftOpen size={21} />
         </button>
-      </div>
-      <div className="function-list">
-        {blocks.map((block) => {
-          const collapseKey = block.id || ungroupedKey
-          const isCollapsed = !normalizedSearch && collapsed.has(collapseKey)
-          const groupIndex = block.group ? props.groups.findIndex((group) => group.id === block.group!.id) : -1
-          return (
-            <section className="function-group" key={collapseKey} onDragOver={(event) => event.preventDefault()} onDrop={(event) => dropFunction(event, block.id)}>
-              <div className="group-header">
-                <button className="group-toggle" onClick={() => toggle(block.id)} aria-expanded={!isCollapsed} aria-label={`${isCollapsed ? '展开' : '折叠'} ${block.name}`} disabled={Boolean(normalizedSearch)}>
-                  <icons.ChevronDown className={isCollapsed ? 'collapsed' : ''} size={15} />
-                  <icons.Folder size={17} />
-                  <strong title={block.name}>{block.name}</strong>
-                  <span>{block.items.length}</span>
-                </button>
-                {block.group ? (
-                  <div className="group-actions">
-                    <button onClick={() => reorderGroup(block.group!.id, -1)} disabled={groupIndex === 0} title="上移分组" aria-label={`上移 ${block.name}`}><icons.ArrowUp size={14} /></button>
-                    <button onClick={() => reorderGroup(block.group!.id, 1)} disabled={groupIndex === props.groups.length - 1} title="下移分组" aria-label={`下移 ${block.name}`}><icons.ArrowDown size={14} /></button>
-                    <button onClick={() => props.onRenameGroup(block.group!)} title="重命名分组" aria-label={`重命名 ${block.name}`}><icons.Pencil size={14} /></button>
-                    <button className="danger-action" onClick={() => props.onDeleteGroup(block.group!)} title="删除分组" aria-label={`删除 ${block.name}`}><icons.Trash2 size={14} /></button>
+      ) : (
+        <>
+          <div className="sidebar-heading">
+            <div><h1>功能分组</h1><span>{props.functions.length}</span></div>
+            <button className="add-group-button" onClick={props.onCreateGroup}><icons.FolderPlus size={17} />新建分组</button>
+          </div>
+          <label className="search-box">
+            <icons.Search size={18} />
+            <input
+              defaultValue={props.search}
+              inputMode="text"
+              lang="zh-CN"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="搜索功能或分组"
+              onCompositionStart={() => { isComposingSearch.current = true }}
+              onCompositionEnd={(event) => {
+                isComposingSearch.current = false
+                props.onSearch(event.currentTarget.value)
+              }}
+              onChange={(event) => {
+                if (!isComposingSearch.current) props.onSearch(event.currentTarget.value)
+              }}
+            />
+          </label>
+          <div className="group-display-toolbar">
+            <span>功能列表</span>
+            <button onClick={props.onToggleCollapsed} title="收起功能栏" aria-label="收起功能栏">
+              <icons.PanelLeftClose size={15} />
+              收起侧栏
+            </button>
+          </div>
+          <div className="function-list">
+            {blocks.map((block) => {
+              const collapseKey = block.id || ungroupedKey
+              const groupIndex = block.group ? props.groups.findIndex((group) => group.id === block.group!.id) : -1
+              return (
+                <section className="function-group" key={collapseKey} onDragOver={(event) => event.preventDefault()} onDrop={(event) => dropFunction(event, block.id)}>
+                  <div className="group-header">
+                    <div className="group-label">
+                      <icons.Folder size={17} />
+                      <strong title={block.name}>{block.name}</strong>
+                      <span>{block.items.length}</span>
+                    </div>
+                    {block.group ? (
+                      <div className="group-actions">
+                        <button onClick={() => reorderGroup(block.group!.id, -1)} disabled={groupIndex === 0} title="上移分组" aria-label={`上移 ${block.name}`}><icons.ArrowUp size={14} /></button>
+                        <button onClick={() => reorderGroup(block.group!.id, 1)} disabled={groupIndex === props.groups.length - 1} title="下移分组" aria-label={`下移 ${block.name}`}><icons.ArrowDown size={14} /></button>
+                        <button onClick={() => props.onRenameGroup(block.group!)} title="重命名分组" aria-label={`重命名 ${block.name}`}><icons.Pencil size={14} /></button>
+                        <button className="danger-action" onClick={() => props.onDeleteGroup(block.group!)} title="删除分组" aria-label={`删除 ${block.name}`}><icons.Trash2 size={14} /></button>
+                      </div>
+                    ) : null}
                   </div>
-                ) : null}
-              </div>
-              {!isCollapsed ? (
-                <div className={`group-functions ${draggingId ? 'accepting-drop' : ''}`}>
+                  <div className={`group-functions ${draggingId ? 'accepting-drop' : ''}`}>
                   {block.items.map((item, index) => (
                     <div
                       key={item.id}
@@ -191,14 +157,15 @@ export function FunctionSidebar(props: Props) {
                     </div>
                   ))}
                   {!block.items.length ? <p className="empty-group">拖拽功能到这里</p> : null}
-                </div>
-              ) : null}
-            </section>
-          )
-        })}
-        {!blocks.length ? <p className="no-functions">没有匹配的功能或分组</p> : null}
-      </div>
-      <p className="sidebar-note"><icons.Info size={14} />拖拽可排序，文件夹按钮可快速移动</p>
+                  </div>
+                </section>
+              )
+            })}
+            {!blocks.length ? <p className="no-functions">没有匹配的功能或分组</p> : null}
+          </div>
+          <p className="sidebar-note"><icons.Info size={14} />拖拽可排序，文件夹按钮可快速移动</p>
+        </>
+      )}
     </aside>
   )
 }
