@@ -8,7 +8,7 @@ from pathlib import Path
 
 from backend.catalog import FunctionCatalog, LOCAL_STAR_PACKAGE_FUNCTION
 from backend.handlers import RunContext, has_handler
-from backend.local_star_package import _labels, _render_template, run_local_star_package
+from backend.local_star_package import _labels, _render_template, detect_plan_labels, run_local_star_package
 
 
 TEMPLATE = """title = "old-title" # keep title comment
@@ -129,6 +129,29 @@ class LocalStarPackageTests(unittest.TestCase):
         self.assertEqual(_labels("one\ntwo，three,one"), ["one", "two", "three"])
         with self.assertRaisesRegex(ValueError, "至少填写一个类别名"):
             _labels("  \n ， ")
+
+    def test_detect_plan_labels_reads_indexed_classes_from_parent_folder(self) -> None:
+        classes = self.root / "classes.txt"
+        classes.write_text("0: screw\n1: board\n2: connector\n", encoding="utf-8")
+
+        result = detect_plan_labels(self.plan)
+
+        self.assertEqual(result["labels"], ["screw", "board", "connector"])
+        self.assertEqual(result["source"], str(classes.resolve()))
+        self.assertEqual(result["count"], 3)
+
+    def test_detect_plan_labels_reads_yaml_names_in_class_index_order(self) -> None:
+        data_yaml = self.model_folder / "data.yaml"
+        data_yaml.write_text("train: train.txt\nnames:\n  1: defect\n  0: ok\nnc: 2\n", encoding="utf-8")
+
+        result = detect_plan_labels(self.plan)
+
+        self.assertEqual(result["labels"], ["ok", "defect"])
+        self.assertEqual(result["source"], str(data_yaml.resolve()))
+
+    def test_detect_plan_labels_explains_that_plan_has_no_semantic_names(self) -> None:
+        with self.assertRaisesRegex(ValueError, "PLAN 文件本身通常不保存类别名称.*classes.txt"):
+            detect_plan_labels(self.plan)
 
     def test_catalog_contains_ready_local_package_function(self) -> None:
         catalog = FunctionCatalog(self.root / "functions.json")

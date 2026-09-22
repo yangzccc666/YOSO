@@ -100,11 +100,19 @@ export type RemoteCredentialStatus = {
   remembered: boolean
 }
 
+export type StarLabelDetectionResult = {
+  ok: true
+  labels: string[]
+  source: string
+  count: number
+  message: string
+}
+
 export type PlatformTaskStatus = {
   id: string
   functionId: string
   name: string
-  kind: 'local' | 'remote' | 'remote-build'
+  kind: 'local' | 'remote' | 'remote-build' | 'remote-training'
   status: 'running' | 'stopping'
   startedAt: string
   logs?: string[]
@@ -114,7 +122,7 @@ export type RunHistoryRecord = {
   id: string
   functionId: string
   name: string
-  kind: 'local' | 'remote' | 'remote-build'
+  kind: 'local' | 'remote' | 'remote-build' | 'remote-training'
   status: 'completed' | 'failed' | 'stopped'
   startedAt: string
   finishedAt: string

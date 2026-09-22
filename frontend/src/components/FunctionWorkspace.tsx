@@ -8,6 +8,7 @@ import { RemoteCalibrationPanel } from './RemoteCalibrationPanel'
 import { YoloTrainingPanel } from './YoloTrainingPanel'
 import { RemoteTensorRTBuildPanel } from './RemoteTensorRTBuildPanel'
 import { LocalStarPackagePanel } from './LocalStarPackagePanel'
+import { FunctionRunHistory } from './FunctionRunHistory'
 import type { FunctionDefinition, FunctionParameter, PlatformTaskStatus, WorkingValues, YoloTrainingRecommendation } from '../types'
 
 type Props = {
@@ -91,6 +92,7 @@ export function FunctionWorkspace(props: Props) {
         <div className="run-actions"><button className="run-button" onClick={() => props.onRun()} disabled={props.running || Boolean(currentTask)}><icons.Play size={18} fill="currentColor" />{currentTask ? '正在运行' : props.running ? '正在启动' : '一键运行'}</button><span className={item.handlerReady ? 'ready' : ''}><icons.Info size={17} />{item.handlerReady ? '处理逻辑已接入' : '处理逻辑尚未接入'}</span></div>
         <details className="run-output" open><summary><icons.ChevronRight size={18} />运行输出</summary><pre>{props.output || '运行后将在这里显示处理进度和结果'}</pre></details>
       </section>}
+      <FunctionRunHistory key={item.id} functionId={item.id} />
     </main>
   )
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import math
 import os
@@ -27,6 +28,20 @@ SAFE_TITLE = re.compile(r"^[^/\\\x00\r\n]+$")
 LABEL_SEPARATOR = re.compile(r"[,\uff0c\r\n]+")
 PRECISIONS = {"INT4 (0)": 0, "INT8 (1)": 1, "FP8 (2)": 2, "FP16 (3)": 3, "FP32 (4)": 4}
 COLOR_FORMATS = {"NV12 (0)": 0, "NV21 (1)": 1, "RGB (2)": 2, "BGR (3)": 3, "GRAY (4)": 4}
+LABEL_FILE_NAMES = (
+    "classes.txt",
+    "labels.txt",
+    "data.yaml",
+    "data.yml",
+    "dataset.yaml",
+    "dataset.yml",
+    "metadata.json",
+    "model_metadata.json",
+    "config.json",
+    "args.yaml",
+    "args.yml",
+    "trt.toml",
+)
 
 
 def _integer(raw: Any, label: str, default: int, minimum: int, maximum: int) -> int:
@@ -61,6 +76,177 @@ def _labels(raw: Any) -> list[str]:
     if not values:
         raise ValueError("\u8bf7\u81f3\u5c11\u586b\u5199\u4e00\u4e2a\u7c7b\u522b\u540d\uff0c\u53ef\u4ee5\u6bcf\u884c\u4e00\u4e2a\u6216\u7528\u9017\u53f7\u5206\u9694\u3002")
     return values
+
+
+def _unique_label_values(raw_values: Any) -> list[str]:
+    if isinstance(raw_values, dict):
+        entries = list(raw_values.items())
+        if entries and all(str(key).strip().isdigit() for key, _value in entries):
+            entries.sort(key=lambda item: int(str(item[0]).strip()))
+        raw_values = [value for _key, value in entries]
+    elif isinstance(raw_values, str):
+        raw_values = LABEL_SEPARATOR.split(raw_values)
+    if not isinstance(raw_values, (list, tuple)):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        value = str(raw).strip().strip("'\"").strip()
+        if value and "\x00" not in value and value not in seen:
+            seen.add(value)
+            values.append(value)
+    return values
+
+
+def _without_yaml_comment(value: str) -> str:
+    position = _comment_position(value)
+    return value[:position].rstrip() if position is not None else value.rstrip()
+
+
+def _parse_inline_labels(raw: str) -> list[str]:
+    value = _without_yaml_comment(raw).strip()
+    if not value:
+        return []
+    try:
+        parsed = ast.literal_eval(value)
+    except (ValueError, SyntaxError):
+        parsed = None
+    labels = _unique_label_values(parsed)
+    if labels:
+        return labels
+    if value[:1] in "[{" and value[-1:] in "]}":
+        value = value[1:-1]
+    parts = []
+    for item in LABEL_SEPARATOR.split(value):
+        item = item.strip()
+        if not item:
+            continue
+        key, separator, remainder = item.partition(":")
+        parts.append(remainder if separator and key.strip().strip("'\"").isdigit() else item)
+    return _unique_label_values(parts)
+
+
+def _parse_yaml_names(text: str) -> list[str]:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(\s*)names\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        inline = _parse_inline_labels(match.group(2))
+        if inline:
+            return inline
+        base_indent = len(match.group(1))
+        block: list[tuple[str, str]] = []
+        sequence: list[str] = []
+        for child in lines[index + 1:]:
+            if not child.strip() or child.lstrip().startswith("#"):
+                continue
+            indent = len(child) - len(child.lstrip())
+            if indent <= base_indent:
+                break
+            value = _without_yaml_comment(child.strip())
+            if value.startswith("-"):
+                sequence.append(value[1:].strip())
+                continue
+            key, separator, remainder = value.partition(":")
+            if separator and remainder.strip():
+                block.append((key.strip().strip("'\""), remainder.strip()))
+        if sequence:
+            return _unique_label_values(sequence)
+        if block:
+            ordered: dict[str, str] = {key: value for key, value in block}
+            return _unique_label_values(ordered)
+    return []
+
+
+def _labels_from_candidate(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError):
+        return []
+    suffix = path.suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        return _parse_yaml_names(text)
+    if suffix == ".json":
+        try:
+            content = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(content, dict):
+            for key in ("names", "labels", "class_names", "classes"):
+                labels = _unique_label_values(content.get(key))
+                if labels:
+                    return labels
+            model = content.get("model")
+            if isinstance(model, dict):
+                for key in ("names", "labels", "class_names", "classes"):
+                    labels = _unique_label_values(model.get(key))
+                    if labels:
+                        return labels
+        return []
+    if suffix == ".toml":
+        try:
+            content = tomllib.loads(text)
+        except tomllib.TOMLDecodeError:
+            return []
+        model = content.get("model", {})
+        return _unique_label_values(model.get("labels") if isinstance(model, dict) else None)
+
+    values: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        prefix, separator, remainder = line.partition(":")
+        values.append(remainder if separator and prefix.strip().isdigit() else line)
+    return _unique_label_values(values)
+
+
+def detect_plan_labels(plan_value: str | Path) -> dict[str, Any]:
+    """Find class names in sidecar dataset metadata; TensorRT plans do not retain them."""
+    plan = Path(plan_value).expanduser()
+    if plan.suffix.lower() != ".plan" or not plan.is_file():
+        raise ValueError("请先选择存在的本地 TensorRT .plan 模型文件。")
+    plan = plan.resolve()
+    stem_candidates = (
+        plan.with_suffix(".labels.txt"),
+        plan.with_suffix(".names"),
+        plan.with_name(f"{plan.stem}_labels.txt"),
+    )
+    candidates: list[Path] = list(stem_candidates)
+    folder = plan.parent
+    for _depth in range(5):
+        candidates.extend(folder / name for name in LABEL_FILE_NAMES)
+        parent = folder.parent
+        if parent == folder:
+            break
+        folder = parent
+
+    checked: set[Path] = set()
+    existing: list[Path] = []
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in checked:
+            continue
+        checked.add(candidate)
+        if not candidate.is_file():
+            continue
+        existing.append(candidate)
+        labels = _labels_from_candidate(candidate)
+        if labels:
+            return {
+                "ok": True,
+                "labels": labels,
+                "source": str(candidate),
+                "count": len(labels),
+                "message": f"已从 {candidate.name} 识别 {len(labels)} 个类别。",
+            }
+
+    detail = f"找到 {len(existing)} 个候选配置文件，但其中没有可识别的类别名称。" if existing else "附近未找到类别配置文件。"
+    raise ValueError(
+        "PLAN 文件本身通常不保存类别名称，无法直接从模型二进制中还原。"
+        f"{detail}请将 classes.txt 或 data.yaml 放在 PLAN 同目录或上级目录后重试。"
+    )
 
 
 def _choice(raw: Any, label: str, choices: dict[str, int], default: str) -> int:

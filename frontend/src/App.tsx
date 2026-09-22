@@ -2,9 +2,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, stopActiveTask, updateFunction } from './api'
 import { FunctionEditor } from './components/FunctionEditor'
 import { GroupDialog } from './components/GroupDialog'
-import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { FunctionSidebar } from './components/FunctionSidebar'
 import { FunctionWorkspace } from './components/FunctionWorkspace'
+import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { icons } from './icons'
 import type { FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
 
@@ -410,8 +410,8 @@ export default function App() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
         <div className="top-actions">
-          <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="运行历史记录"><icons.Clock3 size={17} /><span>运行历史</span></button>
-          {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><span><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></span><button onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
+          <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="全局运行历史"><icons.Clock3 size={17} /><span>运行历史</span></button>
+          {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><span><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></span><button onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
           <span className="local-status"><i />本地运行</span><button aria-label="设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
         </div>
       </header>

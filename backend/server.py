@@ -17,6 +17,7 @@ from .groups import GroupCatalog
 from .handlers import RunContext, execute, has_handler
 from .remote_inference import manager as remote_inference_manager
 from .local_pt_inference import manager as local_pt_inference_manager
+from .local_star_package import detect_plan_labels
 from .run_history import RunHistoryStore
 from .remote_yolo_dataset import (
     forget_remote_yolo_password,
@@ -207,7 +208,10 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/tasks/history":
             try:
-                self.send_json({"history": run_history.list()})
+                parameters = urllib.parse.parse_qs(parsed.query)
+                function_id = str(parameters.get("functionId", [""])[0]).strip()
+                records = run_history.list(function_id) if function_id else run_history.list()[: run_history.LIMIT]
+                self.send_json({"history": records})
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 self.send_json({"error": f"读取运行历史失败：{exc}"}, 500)
             return
@@ -282,6 +286,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/dialog":
                 self.send_json({"paths": choose_path(str(payload.get("mode", "multiple")))})
+                return
+            if self.path == "/api/local-star-package/detect-labels":
+                self.send_json(detect_plan_labels(str(payload.get("modelFile", ""))))
                 return
             if self.path == "/api/remote-inference/test-connection":
                 parameters = payload.get("parameters", payload)
@@ -581,6 +588,12 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         try:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/tasks/history/"):
+                record_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).strip()
+                run_history.delete(record_id)
+                self.send_json({"ok": True})
+                return
             if self.path.startswith("/api/yolo-training/sessions/"):
                 session_id = self.path.rsplit("/", 1)[-1]
                 yolo_training_manager.delete(session_id)

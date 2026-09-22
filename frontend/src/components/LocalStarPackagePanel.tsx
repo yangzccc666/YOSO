@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
+import { detectLocalStarLabels } from '../api'
 import { icons } from '../icons'
 import type { PlatformTaskStatus, WorkingValues } from '../types'
 
@@ -27,6 +28,8 @@ function parentFolder(path: string): string {
 
 export function LocalStarPackagePanel(props: Props) {
   const [error, setError] = useState('')
+  const [detectingLabels, setDetectingLabels] = useState(false)
+  const [labelDetection, setLabelDetection] = useState<{ modelFile: string; message: string } | null>(null)
   const parameter = (id: string) => props.values.parameters[id]
   const set = props.onParameterChange
   const modelFile = String(props.values.paths.model_file || '')
@@ -34,6 +37,32 @@ export function LocalStarPackagePanel(props: Props) {
   const labelsText = String(parameter('labels') || '')
   const labels = parseLabels(labelsText)
   const outputFolder = parentFolder(modelFile)
+  const labelDetectionMessage = labelDetection?.modelFile === modelFile ? labelDetection.message : ''
+  const latestModelFile = useRef(modelFile)
+  const detectionRequest = useRef(0)
+  latestModelFile.current = modelFile
+
+  const detectLabels = async () => {
+    setError('')
+    setLabelDetection(null)
+    if (!modelFile.trim().toLowerCase().endsWith('.plan')) {
+      setError('请先选择一个本机 TensorRT .plan 模型文件。')
+      return
+    }
+    const requestedModel = modelFile
+    const requestId = ++detectionRequest.current
+    setDetectingLabels(true)
+    try {
+      const result = await detectLocalStarLabels(requestedModel)
+      if (requestId !== detectionRequest.current || latestModelFile.current !== requestedModel) return
+      set('labels', result.labels.join('\n'))
+      setLabelDetection({ modelFile: requestedModel, message: `${result.message} 来源：${result.source}` })
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '自动识别类别失败。')
+    } finally {
+      setDetectingLabels(false)
+    }
+  }
 
   const run = () => {
     setError('')
@@ -58,7 +87,8 @@ export function LocalStarPackagePanel(props: Props) {
       <div className="calibration-form">
         <label className="wide"><span>TensorRT PLAN 模型 <em>必填</em></span><div className="package-file-picker"><input value={modelFile} onChange={(event) => props.onPathChange('model_file', event.target.value)} placeholder="请选择或粘贴 .plan 文件路径" /><button type="button" onClick={() => props.onBrowse('model_file', 'file')}>浏览</button></div></label>
         <label><span>打包名称 title <em>必填</em></span><input value={title} onChange={(event) => set('title', event.target.value)} placeholder="例如：tcl-191-0920" /></label>
-        <label className="wide"><span>类别名称 labels <em>必填；每行一个或用逗号分隔</em></span><textarea rows={5} value={labelsText} onChange={(event) => set('labels', event.target.value)} placeholder={'elec_screw\nboard\nconnector'} /></label>
+        <label className="wide"><span className="package-label-heading"><span>类别名称 labels <em>必填；每行一个或用逗号分隔</em></span><button type="button" onClick={detectLabels} disabled={detectingLabels || props.running}>{detectingLabels ? '正在识别…' : '自动识别类别'}</button></span><textarea rows={5} value={labelsText} onChange={(event) => { detectionRequest.current += 1; set('labels', event.target.value); setLabelDetection(null) }} placeholder={'elec_screw\nboard\nconnector'} /></label>
+        {labelDetectionMessage ? <p className="wide package-label-detection"><icons.Check size={16} /><span>{labelDetectionMessage}</span></p> : null}
         <p className="wide calibration-hint">已识别 <strong>{labels.length}</strong> 个类别。原始 trt.toml 不会被修改；生成的 STAR 将保存到 PLAN 同级目录{outputFolder ? <>：<strong>{outputFolder}</strong></> : null}。</p>
       </div>
     </section>

@@ -1,4 +1,4 @@
-import type { ConnectionTestResult, FunctionDefinition, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
+import type { ConnectionTestResult, FunctionDefinition, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, StarLabelDetectionResult, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -69,9 +69,16 @@ export async function getActiveTask(): Promise<PlatformTaskStatus[]> {
   return data.active
 }
 
-export async function getRunHistory(): Promise<RunHistoryRecord[]> {
-  const data = await request<{ history: RunHistoryRecord[] }>('/api/tasks/history')
+export async function getRunHistory(functionId?: string): Promise<RunHistoryRecord[]> {
+  const endpoint = functionId
+    ? `/api/tasks/history?${new URLSearchParams({ functionId })}`
+    : '/api/tasks/history'
+  const data = await request<{ history: RunHistoryRecord[] }>(endpoint)
   return data.history
+}
+
+export async function deleteRunHistory(recordId: string): Promise<void> {
+  await request(`/api/tasks/history/${encodeURIComponent(recordId)}`, { method: 'DELETE' })
 }
 
 export async function stopActiveTask(taskId: string): Promise<PlatformTaskStatus> {
@@ -85,6 +92,13 @@ export async function stopActiveTask(taskId: string): Promise<PlatformTaskStatus
 export async function choosePaths(mode: string): Promise<string[]> {
   const data = await request<{ paths: string[] }>('/api/dialog', { method: 'POST', body: JSON.stringify({ mode }) })
   return data.paths
+}
+
+export async function detectLocalStarLabels(modelFile: string): Promise<StarLabelDetectionResult> {
+  return request<StarLabelDetectionResult>('/api/local-star-package/detect-labels', {
+    method: 'POST',
+    body: JSON.stringify({ modelFile }),
+  })
 }
 
 export async function startRemoteInference(values: WorkingValues): Promise<RemoteInferenceStatus> {

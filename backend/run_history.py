@@ -1,4 +1,4 @@
-"""Persist the five most recently finished platform runs."""
+"""Persist the five most recently finished runs for every platform function."""
 
 from __future__ import annotations
 
@@ -18,14 +18,55 @@ class RunHistoryStore:
         self.path = path
         self._lock = threading.RLock()
 
-    def list(self) -> list[dict[str, Any]]:
+    def _read(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("运行历史文件格式不正确。")
+        return [record for record in data if isinstance(record, dict)]
+
+    def _limit_by_function(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        counts: dict[str, int] = {}
+        limited: list[dict[str, Any]] = []
+        for record in records:
+            function_id = str(record.get("functionId", ""))
+            if counts.get(function_id, 0) >= self.LIMIT:
+                continue
+            counts[function_id] = counts.get(function_id, 0) + 1
+            limited.append(record)
+        return limited
+
+    def list(self, function_id: str | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            if not self.path.exists():
-                return []
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            if not isinstance(data, list):
-                raise ValueError("运行历史文件格式不正确。")
-            return data[: self.LIMIT]
+            records = self._limit_by_function(self._read())
+            if function_id is None:
+                return records
+            target = str(function_id)
+            return [record for record in records if str(record.get("functionId", "")) == target]
+
+    def _write(self, records: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                json.dump(records, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def delete(self, record_id: str) -> None:
+        target = str(record_id).strip()
+        if not target:
+            raise ValueError("运行历史记录 ID 不能为空。")
+        with self._lock:
+            records = self._read()
+            remaining = [record for record in records if str(record.get("id", "")) != target]
+            if len(remaining) == len(records):
+                raise ValueError("运行历史记录不存在或已被删除。")
+            self._write(remaining)
 
     def add(
         self,
@@ -53,15 +94,9 @@ class RunHistoryStore:
             "logs": [str(line)[:2000] for line in (logs or [])][-500:],
         }
         with self._lock:
-            records = [entry, *(old for old in self.list() if old.get("id") != entry["id"])][: self.LIMIT]
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
-            try:
-                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-                    json.dump(records, stream, ensure_ascii=False, indent=2)
-                    stream.write("\n")
-                os.replace(temporary, self.path)
-            finally:
-                temporary.unlink(missing_ok=True)
+            records = self._limit_by_function([
+                entry,
+                *(old for old in self._read() if old.get("id") != entry["id"]),
+            ])
+            self._write(records)
         return entry
