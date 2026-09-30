@@ -113,7 +113,7 @@ export function LocalStarPackagePanel(props: Props) {
     </section>
 
     <section className="remote-inference-section calibration-run-section">
-      <div className="run-actions"><button className="run-button" onClick={run} disabled={props.running}><icons.Play size={18} fill="currentColor" />{props.platformTask ? '正在打包' : props.running ? '正在启动' : '开始打包 STAR'}</button><span className="ready"><icons.Info size={17} />完成后自动保存到 PLAN 同级目录</span></div>
+      <div className="run-actions"><button className="run-button" onClick={run} disabled={props.running}><icons.Play size={18} fill="currentColor" />{props.platformTask ? '正在打包' : props.running ? '正在启动' : '开始打包 STAR'}</button><span className="ready"><icons.Info size={17} />完成后保存到 PLAN 同级目录，并加入实时推理待办</span></div>
       {error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{error}</span></div> : null}
       <details className="run-output" open><summary><icons.ChevronRight size={18} />打包日志</summary><pre>{props.output || '开始后将在这里显示临时配置、package_tool 输出和最终 STAR 文件路径'}</pre></details>
     </section>

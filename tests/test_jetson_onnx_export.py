@@ -35,6 +35,7 @@ class JetsonOnnxExportTests(unittest.TestCase):
         self.assertIsNotNone(item)
         defaults = {field["id"]: field["default"] for field in item["parameters"]}
         self.assertEqual(defaults["task_type"], "目标检测")
+        self.assertEqual(defaults["model_family"], "YOLO26")
         self.assertEqual(defaults["target_platform"], "Jetson / TensorRT（NCHW）")
         self.assertEqual(defaults["imgsz"], 640)
         self.assertEqual(defaults["opset"], 12)
@@ -58,6 +59,28 @@ class JetsonOnnxExportTests(unittest.TestCase):
         self.assertEqual(result["onnxQuantDefaults"], {"inputOnnx": str(output)})
         self.assertEqual(output.read_bytes(), b"valid-onnx")
         self.assertEqual(self.weights.read_bytes(), b"weights")
+
+    def test_yolov5_requires_repository_and_uses_its_export_script(self) -> None:
+        with self.assertRaisesRegex(ValueError, "源码仓库目录"):
+            _configuration(self._context(model_family="YOLOv5"))
+        repository = self.root / "yolov5"
+        (repository / "models").mkdir(parents=True)
+        (repository / "export.py").write_text("# export", encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], _context: RunContext) -> None:
+            commands.append(command)
+            weights = Path(command[command.index("--weights") + 1])
+            weights.with_suffix(".onnx").write_bytes(b"yolov5-onnx")
+
+        with patch("backend.jetson_onnx_export._run_process", side_effect=fake_run):
+            result = run_jetson_onnx_export(self._context(
+                model_family="YOLOv5", yolov5_repo=str(repository), output_filename="v5.onnx"
+            ))
+        self.assertEqual(commands[0][3], str(repository / "export.py"))
+        self.assertIn("--include", commands[0])
+        self.assertEqual(result["modelFamily"], "YOLOv5")
+        self.assertEqual((self.root / "v5.onnx").read_bytes(), b"yolov5-onnx")
 
 
 if __name__ == "__main__":

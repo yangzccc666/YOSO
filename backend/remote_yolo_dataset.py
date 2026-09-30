@@ -7,6 +7,7 @@ import shlex
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -173,7 +174,8 @@ def _configuration(context: RunContext) -> dict[str, Any]:
         "labels_folder": _remote_path(context, "labels_folder", "标签文件夹", labels_required),
         "negative_folder": _remote_path(context, "negative_images_folder", "负样本图片文件夹", False),
         "output_parent": _remote_path(context, "output_folder", "输出位置"),
-        "dataset_folder_name": str(context.parameters.get("dataset_folder_name", "yolo_train")).strip() or "yolo_train",
+        "dataset_folder_name": str(context.parameters.get("dataset_folder_name", "")).strip()
+        or f"yolo_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         "label_format": format_map[label_format],
         "train_ratio": ratio,
         "seed": _integer(context.parameters.get("random_seed"), "随机种子", 42, -2_147_483_648, 2_147_483_647),

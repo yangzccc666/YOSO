@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from backend import server
@@ -11,6 +12,29 @@ from backend.task_manager import PlatformTaskManager
 
 
 class RunHistoryTests(unittest.TestCase):
+    def test_active_training_history_is_exposed_without_entering_finished_store(self) -> None:
+        session = {
+            "id": "training-1", "remote": True, "model": "/models/yolo26n.pt",
+            "device": "2", "output": "/data/runs/yolo26_0922_1200", "host": "192.168.21.5",
+            "status": "running", "message": "YOLO 模型训练正在运行。",
+            "startedAt": "2026-09-22T12:00:00", "finishedAt": None,
+            "logs": ["Epoch 3/200"], "error": None, "result": None,
+        }
+        fake_manager = SimpleNamespace(
+            list=lambda: [{key: value for key, value in session.items() if key != "logs"}],
+            get=lambda _session_id: SimpleNamespace(snapshot=lambda: dict(session)),
+        )
+
+        with patch.object(server, "yolo_training_manager", fake_manager):
+            records = server.active_training_history_records()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], "running")
+        self.assertEqual(records[0]["functionId"], "yolo_dataset_split")
+        self.assertEqual(records[0]["logs"], ["Epoch 3/200"])
+        self.assertEqual(records[0]["finishedAt"], "")
+        self.assertIn("yolo26_0922_1200", records[0]["name"])
+
     def test_persists_only_five_newest_finished_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run_history.json"

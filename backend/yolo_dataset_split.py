@@ -7,6 +7,7 @@ import random
 import shutil
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +67,9 @@ def _int_parameter(value: Any, label: str, default: int) -> int:
 
 
 def _dataset_folder_name(value: Any) -> str:
-    name = str(value if value not in (None, "") else "yolo_train").strip()
+    name = str(value if value not in (None, "") else "").strip()
+    if not name:
+        name = f"yolo_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
         raise ValueError("数据集子文件夹名称只能填写单个文件夹名称，不能包含路径。")
     return name

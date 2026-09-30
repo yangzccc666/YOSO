@@ -6,25 +6,32 @@ import json
 import shlex
 import time
 import uuid
+from types import SimpleNamespace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .handlers import RunContext, register_handler
 from .remote_inference import RemoteInferenceManager
 from .remote_yolo_dataset import _lines_from, resolve_tested_yolo_connection
+from .remote_calib_worker import run as run_calibration_worker
 from .task_manager import TaskCancelled
 
 
 WORKER_SCRIPT = Path(__file__).with_name("remote_calib_worker.py")
 
 
-def _directories(value: Any, label: str, required: bool = False) -> list[str]:
+def is_remote_calib_parameters(parameters: dict[str, Any]) -> bool:
+    return str(parameters.get("execution_location") or "本地运行").strip() == "SSH 远程服务器"
+
+
+def _directories(value: Any, label: str, required: bool = False, *, remote: bool) -> list[str]:
     entries = [line.strip() for line in str(value or "").splitlines() if line.strip()]
     if required and not entries:
-        raise ValueError(f"请至少填写一个远程{label}，每行一个绝对路径。")
+        raise ValueError(f"请至少填写一个{'远程' if remote else '本机'}{label}，每行一个路径。")
     for entry in entries:
-        if not PurePosixPath(entry).is_absolute() or "\x00" in entry:
-            raise ValueError(f"远程{label}必须是绝对路径：{entry}")
+        valid = PurePosixPath(entry).is_absolute() if remote else Path(entry).expanduser().is_absolute()
+        if not valid or "\x00" in entry:
+            raise ValueError(f"{'远程' if remote else '本机'}{label}必须是绝对路径：{entry}")
     return entries
 
 
@@ -40,26 +47,23 @@ def _integer(value: Any, label: str, default: int, minimum: int, maximum: int) -
 
 def _configuration(context: RunContext) -> dict[str, Any]:
     parameters = context.parameters
-    images = _directories(parameters.get("image_dirs"), "图片目录", True)
-    annotations = _directories(parameters.get("annotation_dirs"), "标注目录")
-    negatives = _directories(parameters.get("negative_dirs"), "负样本图片目录")
+    remote = is_remote_calib_parameters(parameters)
+    images = _directories(parameters.get("image_dirs"), "图片目录", True, remote=remote)
+    annotations = _directories(parameters.get("annotation_dirs"), "标注目录", remote=remote)
+    negatives = _directories(parameters.get("negative_dirs"), "负样本图片目录", remote=remote)
     if len(annotations) > len(images):
         raise ValueError("标注目录数量不能多于图片目录数量。")
     output = str(parameters.get("output_dir") or "").strip()
     if not output:
-        output = str(PurePosixPath(images[0]).parent / "calib_dataset")
-    if not PurePosixPath(output).is_absolute() or output == "/":
-        raise ValueError("输出目录必须是服务器上的绝对路径，且不能是根目录。")
+        output = str((PurePosixPath(images[0]) if remote else Path(images[0]).expanduser()).parent / "calib_dataset")
+    valid_output = PurePosixPath(output).is_absolute() if remote else Path(output).expanduser().is_absolute()
+    if not valid_output or output == "/":
+        raise ValueError(f"输出目录必须是{'服务器' if remote else '本机'}上的绝对路径，且不能是根目录。")
     annotation_format = str(parameters.get("annotation_format") or "auto")
     if annotation_format not in {"auto", "xml", "json"}:
         raise ValueError("请选择有效的标注格式。")
-    python = str(parameters.get("remote_python") or "python3").strip()
-    if not python:
-        raise ValueError("请填写远程 Python 解释器。")
-    connection = resolve_tested_yolo_connection(parameters, "制作量化数据集")
-    return {
-        **connection,
-        "python": python,
+    config = {
+        "remote": remote,
         "images": images,
         "annotations": annotations,
         "negatives": negatives,
@@ -68,6 +72,13 @@ def _configuration(context: RunContext) -> dict[str, Any]:
         "count": _integer(parameters.get("num_samples"), "图片数量", 128, 1, 100_000),
         "seed": _integer(parameters.get("random_seed"), "随机种子", 42, -2_147_483_648, 2_147_483_647),
     }
+    if remote:
+        python = str(parameters.get("remote_python") or "python3").strip()
+        if not python:
+            raise ValueError("请填写远程 Python 解释器。")
+        config.update(resolve_tested_yolo_connection(parameters, "制作量化数据集"))
+        config["python"] = python
+    return config
 
 
 def _command(config: dict[str, Any], worker: str, token: str) -> str:
@@ -84,8 +95,22 @@ def _command(config: dict[str, Any], worker: str, token: str) -> str:
     return "exec " + " ".join(shlex.quote(str(value)) for value in arguments)
 
 
+def _run_local_calib_dataset(context: RunContext, config: dict[str, Any]) -> dict[str, Any]:
+    context.report("正在使用本机 Python 制作量化数据集。")
+    args = SimpleNamespace(
+        image_dirs_json=json.dumps(config["images"], ensure_ascii=False),
+        annotation_dirs_json=json.dumps(config["annotations"], ensure_ascii=False),
+        negative_dirs_json=json.dumps(config["negatives"], ensure_ascii=False),
+        output_dir=config["output"], format=config["format"],
+        count=config["count"], seed=config["seed"],
+    )
+    return run_calibration_worker(args, report=context.report, check_cancelled=context.check_cancelled)
+
+
 def run_remote_calib_dataset(context: RunContext) -> dict[str, Any]:
     config = _configuration(context)
+    if not config["remote"]:
+        return _run_local_calib_dataset(context, config)
     if not WORKER_SCRIPT.is_file():
         raise RuntimeError("平台内置量化数据集处理脚本缺失，请重新安装平台。")
     paramiko = RemoteInferenceManager._load_paramiko()

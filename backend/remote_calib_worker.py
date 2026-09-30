@@ -160,7 +160,9 @@ def _select_prioritized(records: list[dict], count: int, seed: int) -> tuple[lis
     return selected, available, {name: selected_counts.get(name, 0) for name in pools}
 
 
-def run(args: argparse.Namespace) -> dict:
+def run(args: argparse.Namespace, report=None, check_cancelled=None) -> dict:
+    emit = report or (lambda message: print(message, flush=True))
+    checkpoint = check_cancelled or (lambda: None)
     image_values = json.loads(args.image_dirs_json)
     annotation_values = json.loads(args.annotation_dirs_json)
     negative_values = json.loads(getattr(args, "negative_dirs_json", "[]"))
@@ -184,11 +186,13 @@ def run(args: argparse.Namespace) -> dict:
     records: list[dict] = []
     seen_paths: set[Path] = set()
     for index, folder in enumerate(image_dirs):
+        checkpoint()
         ann_folder = annotation_dirs[index] if index < len(annotation_dirs) else folder
         ann_index = {path.stem: path for path in ann_folder.iterdir() if path.is_file() and path.suffix.lower() == f".{fmt}"}
         images = _images(folder)
-        print(f"图片目录 {index + 1}/{len(image_dirs)}：{folder}，找到 {len(images)} 张图片。", flush=True)
+        emit(f"图片目录 {index + 1}/{len(image_dirs)}：{folder}，找到 {len(images)} 张图片。")
         for path in images:
+            checkpoint()
             resolved = path.resolve()
             if resolved in seen_paths:
                 continue
@@ -205,11 +209,13 @@ def run(args: argparse.Namespace) -> dict:
                     "source": "copy" if "copy" in path.stem.casefold() else "original",
                 })
             except (OSError, ValueError, ET.ParseError, KeyError, TypeError) as exc:
-                print(f"警告：跳过无法读取的图片或标注 {path.name}：{exc}", flush=True)
+                emit(f"警告：跳过无法读取的图片或标注 {path.name}：{exc}")
     for index, folder in enumerate(negative_dirs):
+        checkpoint()
         images = _images(folder)
-        print(f"负样本目录 {index + 1}/{len(negative_dirs)}：{folder}，找到 {len(images)} 张图片。", flush=True)
+        emit(f"负样本目录 {index + 1}/{len(negative_dirs)}：{folder}，找到 {len(images)} 张图片。")
         for path in images:
+            checkpoint()
             resolved = path.resolve()
             if resolved in seen_paths:
                 continue
@@ -222,21 +228,21 @@ def run(args: argparse.Namespace) -> dict:
                     "source": "negative",
                 })
             except (OSError, ValueError) as exc:
-                print(f"警告：跳过无法读取的负样本 {path.name}：{exc}", flush=True)
+                emit(f"警告：跳过无法读取的负样本 {path.name}：{exc}")
     if not records:
-        raise ValueError("没有可用图片，请检查远程图片目录和文件格式。")
-    print(f"标注格式：{fmt}。可用图片 {len(records)} 张，目标抽取 {args.count} 张。", flush=True)
+        raise ValueError("没有可用图片，请检查图片目录和文件格式。")
+    emit(f"标注格式：{fmt}。可用图片 {len(records)} 张，目标抽取 {args.count} 张。")
     selected, available_sources, selected_sources = _select_prioritized(records, args.count, args.seed)
-    print(
+    emit(
         "分层统计："
         f"原始图片 {available_sources['original']} 张（选中 {selected_sources['original']}），"
         f"copy 扩充图片 {available_sources['copy']} 张（选中 {selected_sources['copy']}），"
-        f"负样本 {available_sources['negative']} 张（选中 {selected_sources['negative']}）。",
-        flush=True,
+        f"负样本 {available_sources['negative']} 张（选中 {selected_sources['negative']}）。"
     )
     output.mkdir(parents=True, exist_ok=True)
     used_names: set[str] = set()
     for index, record in enumerate(selected, 1):
+        checkpoint()
         source = record["path"]
         base = source.stem
         name = f"{base}.jpg"
@@ -252,10 +258,10 @@ def run(args: argparse.Namespace) -> dict:
             with Image.open(source) as image:
                 image.convert("RGB").save(destination, "JPEG", quality=95)
         if index == 1 or index % 25 == 0 or index == len(selected):
-            print(f"已生成 {index}/{len(selected)} 张校准图片。", flush=True)
+            emit(f"已生成 {index}/{len(selected)} 张校准图片。")
     distribution = Counter(label for record in selected for label in record["labels"])
     for label, amount in sorted(distribution.items(), key=lambda item: (-item[1], item[0])):
-        print(f"类别 {label}：{amount} 张", flush=True)
+        emit(f"类别 {label}：{amount} 张")
     return {
         "message": f"量化校准数据集制作完成：{len(selected)} 张 JPG 图片。",
         "sampleCount": len(selected),

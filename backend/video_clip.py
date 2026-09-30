@@ -223,7 +223,7 @@ def _clip_one(
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
     duration = end - start
 
-    command = [
+    command_prefix = [
         ffmpeg,
         "-hide_banner",
         "-loglevel", "error",
@@ -233,7 +233,7 @@ def _clip_one(
         "-t", f"{duration:.6f}",
     ]
     if precise:
-        command.extend([
+        output_options = [
             "-map", "0:v:0",
             "-map", "0:a?",
             "-c:v", "libx264",
@@ -242,25 +242,58 @@ def _clip_one(
             "-c:a", "aac",
             "-b:a", "128k",
             "-movflags", "+faststart",
-        ])
+        ]
     else:
-        command.extend([
+        output_options = [
             "-map", "0",
             "-c", "copy",
             "-map_metadata", "0",
             "-avoid_negative_ts", "make_zero",
-        ])
-    command.append(str(temporary))
+        ]
+
+    def execute(options: list[str]) -> subprocess.CompletedProcess[str]:
+        temporary.unlink(missing_ok=True)
+        return _run_process([*command_prefix, *options, str(temporary)], context)
+
+    def succeeded(completed: subprocess.CompletedProcess[str]) -> bool:
+        return completed.returncode == 0 and temporary.is_file() and temporary.stat().st_size > 0
 
     try:
-        completed = _run_process(command, context)
+        completed = execute(output_options)
+        incompatible_mp4_audio = (
+            not precise
+            and output.suffix.lower() in {".mp4", ".m4v", ".mov"}
+            and not succeeded(completed)
+            and any(marker in completed.stderr for marker in (
+                "Could not find tag for codec",
+                "codec not currently supported in container",
+                "Could not write header",
+            ))
+        )
+        if incompatible_mp4_audio:
+            context.report(
+                f"{video.name}：原音频编码与 MP4 不兼容，视频保持原编码，仅将音频转换为 AAC 后重试。"
+            )
+            completed = execute([
+                "-map", "0:v:0",
+                "-map", "0:a?",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-map_metadata", "0",
+                "-avoid_negative_ts", "make_zero",
+                "-movflags", "+faststart",
+            ])
     except TaskCancelled:
         temporary.unlink(missing_ok=True)
         raise
-    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+    if not succeeded(completed):
         temporary.unlink(missing_ok=True)
         detail = completed.stderr.strip().splitlines()
-        reason = detail[-1] if detail else "FFmpeg 未生成结果文件"
+        reason = next(
+            (line for line in detail if "Could not find tag for codec" in line or "not currently supported in container" in line),
+            detail[-1] if detail else "FFmpeg 未生成结果文件",
+        )
         raise RuntimeError(f"裁剪失败：{reason}")
     temporary.replace(output)
     return output

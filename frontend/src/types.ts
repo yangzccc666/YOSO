@@ -12,7 +12,7 @@ export type FunctionParameter = {
   type: 'text' | 'password' | 'number' | 'boolean' | 'select'
   default: string | number | boolean
   options: string[]
-  visibleWhen?: { fieldId: string; equals: string | number | boolean } | null
+  visibleWhen?: { fieldId: string; equals?: string | number | boolean; notEquals?: string | number | boolean } | null
 }
 
 export type RemoteInferenceStatus = {
@@ -81,6 +81,8 @@ export type YoloTrainingSession = {
   device: string
   output: string
   host: string
+  port: number
+  username: string
   status: 'starting' | 'running' | 'disconnected' | 'stopping' | 'completed' | 'stopped' | 'failed'
   message: string
   startedAt: string
@@ -123,7 +125,7 @@ export type RunHistoryRecord = {
   functionId: string
   name: string
   kind: 'local' | 'remote' | 'remote-build' | 'remote-training'
-  status: 'completed' | 'failed' | 'stopped'
+  status: 'running' | 'completed' | 'failed' | 'stopped'
   startedAt: string
   finishedAt: string
   message: string

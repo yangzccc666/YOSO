@@ -40,10 +40,23 @@ DEFAULT_TRAINING_VALUES: dict[str, Any] = {
     "workers": 12,
     "device": "2",
     "project": "/home/dell/yzc_ws/data/Longcheng/shentou2-gw2-state",
-    "run_name": "yolo26n_0915",
+    "run_name": "",
+    "seed": 0,
+    "deterministic": True,
+    "amp": True,
+    "cache": "False",
+    "rect": False,
+    "close_mosaic": 10,
+    "save_period": -1,
+    "plots": True,
     "mosaic": 0.0,
     "mixup": 0.0,
+    "cutmix": 0.0,
     "copy_paste": 0.0,
+    "hsv_h": 0.015,
+    "hsv_s": 0.7,
+    "hsv_v": 0.4,
+    "bgr": 0.0,
     "degrees": 3.0,
     "translate": 0.08,
     "scale": 0.25,
@@ -60,15 +73,20 @@ DEFAULT_TRAINING_VALUES: dict[str, Any] = {
     "warmup_epochs": 3.0,
     "multi_scale": 0.1,
     "weight_decay": 0.0005,
+    "momentum": 0.937,
+    "warmup_momentum": 0.8,
+    "warmup_bias_lr": 0.1,
     "optimizer": "SGD",
 }
 
 TRAIN_ARGUMENT_ORDER = [
     "data", "model", "epochs", "patience", "imgsz", "batch", "nbs", "workers",
-    "device", "project", "run_name", "mosaic", "mixup", "copy_paste", "degrees",
+    "device", "project", "run_name", "seed", "deterministic", "amp", "cache", "rect",
+    "close_mosaic", "save_period", "plots", "mosaic", "mixup", "cutmix", "copy_paste",
+    "hsv_h", "hsv_s", "hsv_v", "bgr", "degrees",
     "translate", "scale", "shear", "perspective", "fliplr", "flipud", "cls", "box",
     "dfl", "cos_lr", "lr0", "lrf", "warmup_epochs", "multi_scale", "weight_decay",
-    "optimizer",
+    "momentum", "warmup_momentum", "warmup_bias_lr", "optimizer",
 ]
 
 INTEGER_RANGES = {
@@ -77,12 +95,20 @@ INTEGER_RANGES = {
     "imgsz": (32, 16384),
     "nbs": (1, 1_000_000),
     "workers": (0, 4096),
+    "seed": (0, 2_147_483_647),
+    "close_mosaic": (0, 1_000_000),
+    "save_period": (-1, 1_000_000),
 }
 
 FLOAT_RANGES = {
     "mosaic": (0.0, 1.0),
     "mixup": (0.0, 1.0),
+    "cutmix": (0.0, 1.0),
     "copy_paste": (0.0, 1.0),
+    "hsv_h": (0.0, 1.0),
+    "hsv_s": (0.0, 1.0),
+    "hsv_v": (0.0, 1.0),
+    "bgr": (0.0, 1.0),
     "degrees": (0.0, 180.0),
     "translate": (0.0, 1.0),
     "scale": (0.0, 10.0),
@@ -98,6 +124,9 @@ FLOAT_RANGES = {
     "warmup_epochs": (0.0, 100_000.0),
     "multi_scale": (0.0, 1.0),
     "weight_decay": (0.0, 1.0),
+    "momentum": (0.0, 1.0),
+    "warmup_momentum": (0.0, 1.0),
+    "warmup_bias_lr": (0.0, 1.0),
 }
 
 
@@ -112,7 +141,11 @@ def _number(value: Any, key: str, minimum: float, maximum: float, integer: bool 
     return parsed
 
 
-def normalize_training_values(raw: dict[str, Any]) -> dict[str, Any]:
+def automatic_training_run_name(now: datetime | None = None) -> str:
+    return f"yolo26_{(now or datetime.now()).strftime('%m%d_%H%M')}"
+
+
+def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = True) -> dict[str, Any]:
     values = {**DEFAULT_TRAINING_VALUES, **{key: raw[key] for key in DEFAULT_TRAINING_VALUES if key in raw}}
     for key, bounds in INTEGER_RANGES.items():
         values[key] = _number(values[key], key, *bounds, integer=True)
@@ -122,15 +155,23 @@ def normalize_training_values(raw: dict[str, Any]) -> dict[str, Any]:
     if batch != -1 and not (0 < batch <= 1) and not float(batch).is_integer():
         raise ValueError("训练参数 batch 应为正整数、-1（自动批量）或 0 到 1 之间的显存比例。")
     values["batch"] = int(batch) if float(batch).is_integer() else batch
-    cos_lr = values["cos_lr"]
-    if isinstance(cos_lr, str):
-        lowered = cos_lr.strip().lower()
-        if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
-            raise ValueError("训练参数 cos_lr 必须是开启或关闭。")
-        values["cos_lr"] = lowered in {"true", "1", "yes", "on"}
-    else:
-        values["cos_lr"] = bool(cos_lr)
-    for key in ("yolo_executable", "task", "data", "model", "device", "project", "run_name", "optimizer"):
+    for key in ("cos_lr", "deterministic", "amp", "rect", "plots"):
+        raw_boolean = values[key]
+        if isinstance(raw_boolean, str):
+            lowered = raw_boolean.strip().lower()
+            if lowered not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+                raise ValueError(f"训练参数 {key} 必须是开启或关闭。")
+            values[key] = lowered in {"true", "1", "yes", "on"}
+        else:
+            values[key] = bool(raw_boolean)
+    cache = str(values.get("cache", "False")).strip().lower()
+    if cache not in {"false", "true", "ram", "disk"}:
+        raise ValueError("训练参数 cache 只能是 False、True、ram 或 disk。")
+    values["cache"] = "False" if cache == "false" else "True" if cache == "true" else cache
+    values["run_name"] = str(values.get("run_name", "")).strip()
+    if generate_run_name and not values["run_name"]:
+        values["run_name"] = automatic_training_run_name()
+    for key in ("yolo_executable", "task", "data", "model", "device", "project", "optimizer"):
         values[key] = str(values[key]).strip()
         if not values[key]:
             raise ValueError(f"训练参数 {key} 不能为空。")
@@ -173,7 +214,7 @@ class TrainingProfileStore:
         return {
             "id": "general-training",
             "name": "通用训练",
-            "description": "通用目标检测训练参数：最多 200 轮，验证指标连续 30 轮未提升则早停；可复制后按场景调整。",
+            "description": "用于兼容既有配置的通用目标检测参数；数据增强策略现在直接在训练界面中切换。",
             "values": deepcopy(DEFAULT_TRAINING_VALUES),
             "updatedAt": datetime.now().isoformat(timespec="seconds"),
         }
@@ -198,11 +239,15 @@ class TrainingProfileStore:
         name = str(raw.get("name", "")).strip()
         if not name:
             raise ValueError("请填写训练场景名称。")
+        values = normalize_training_values(dict(raw.get("values", {})), generate_run_name=False)
+        # A profile describes a reusable scenario; a per-run output name must not
+        # be carried into the next training and is generated when execution starts.
+        values["run_name"] = ""
         return {
             "id": profile_id or uuid.uuid4().hex[:12],
             "name": name,
             "description": str(raw.get("description", "")).strip(),
-            "values": normalize_training_values(dict(raw.get("values", {}))),
+            "values": values,
             "updatedAt": datetime.now().isoformat(timespec="seconds"),
         }
 
@@ -280,6 +325,8 @@ class TrainingSession:
             "device": self.device,
             "output": self.output,
             "host": self.host,
+            "port": self.port,
+            "username": self.username,
             "remoteDir": self.remote_dir,
             "status": self.status,
             "message": self.message,

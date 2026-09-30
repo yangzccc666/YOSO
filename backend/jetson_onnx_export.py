@@ -28,6 +28,7 @@ TASKS = {
     "图像分类": "classify",
 }
 PLATFORMS = {"Jetson / TensorRT（NCHW）": "jetson", "RKNN（NHWC）": "rknn"}
+MODEL_FAMILIES = {"YOLO26", "YOLOv5"}
 
 
 def _integer(raw: Any, label: str, default: int, minimum: int, maximum: int) -> int:
@@ -72,6 +73,19 @@ def _configuration(context: RunContext) -> dict[str, Any]:
     image_size = _integer(context.parameters.get("imgsz"), "输入尺寸 imgsz", 640, 32, 4096)
     if image_size % 32:
         raise ValueError("输入尺寸 imgsz 必须是 32 的整数倍。")
+    model_family = str(context.parameters.get("model_family") or "YOLO26")
+    if model_family not in MODEL_FAMILIES:
+        raise ValueError("请选择有效的模型版本。")
+    yolov5_repo: Path | None = None
+    if model_family == "YOLOv5":
+        if task_name != "目标检测":
+            raise ValueError("当前 YOLOv5 导出仅支持目标检测模型。")
+        raw_repo = str(context.parameters.get("yolov5_repo") or "").strip()
+        if not raw_repo:
+            raise ValueError("YOLOv5 模型需要填写源码仓库目录；该目录应包含 export.py 和 models 文件夹。")
+        yolov5_repo = Path(raw_repo).expanduser().resolve()
+        if not (yolov5_repo / "export.py").is_file() or not (yolov5_repo / "models").is_dir():
+            raise ValueError(f"YOLOv5 仓库不完整：{yolov5_repo}。需要包含 export.py 和 models 文件夹。")
     return {
         "weights": weights.expanduser().resolve(),
         "output": output,
@@ -82,6 +96,8 @@ def _configuration(context: RunContext) -> dict[str, Any]:
         "platform_name": platform_name,
         "imgsz": image_size,
         "opset": _integer(context.parameters.get("opset"), "ONNX opset", 12, 11, 20),
+        "model_family": model_family,
+        "yolov5_repo": yolov5_repo,
     }
 
 
@@ -144,7 +160,7 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
     context.report(f"使用 YOLO 环境：{config['python']}")
     context.report(
         f"输入权重：{config['weights']}\n输出 ONNX：{config['output']}\n"
-        f"任务：{config['task_name']}；平台：{config['platform_name']}；"
+        f"模型版本：{config['model_family']}；任务：{config['task_name']}；平台：{config['platform_name']}；"
         f"imgsz={config['imgsz']}；opset={config['opset']}"
     )
     context.check_cancelled()
@@ -153,16 +169,29 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
         temporary_weights = work / "weights.pt"
         temporary_output = work / "export.onnx"
         shutil.copy2(config["weights"], temporary_weights)
-        command = [
-            str(config["python"]), "-u", "-B", str(WORKER_SCRIPT),
-            "--weights", str(temporary_weights),
-            "--output", str(temporary_output),
-            "--imgsz", str(config["imgsz"]),
-            "--opset", str(config["opset"]),
-            "--task", config["task"],
-            "--platform", config["platform"],
-        ]
+        if config["model_family"] == "YOLOv5":
+            context.report(f"使用 YOLOv5 仓库：{config['yolov5_repo']}")
+            command = [
+                str(config["python"]), "-u", "-B", str(config["yolov5_repo"] / "export.py"),
+                "--weights", str(temporary_weights), "--include", "onnx",
+                "--imgsz", str(config["imgsz"]), "--opset", str(config["opset"]),
+                "--batch-size", "1", "--device", "cpu", "--simplify",
+            ]
+        else:
+            command = [
+                str(config["python"]), "-u", "-B", str(WORKER_SCRIPT),
+                "--weights", str(temporary_weights),
+                "--output", str(temporary_output),
+                "--imgsz", str(config["imgsz"]),
+                "--opset", str(config["opset"]),
+                "--task", config["task"],
+                "--platform", config["platform"],
+            ]
         _run_process(command, context)
+        if config["model_family"] == "YOLOv5":
+            exported = temporary_weights.with_suffix(".onnx")
+            if exported.is_file():
+                exported.replace(temporary_output)
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise RuntimeError("导出进程已结束，但没有生成有效的 ONNX 文件。")
         temporary_output.replace(config["output"])
@@ -178,6 +207,7 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
         "targetPlatform": config["platform_name"],
         "imgsz": config["imgsz"],
         "opset": config["opset"],
+        "modelFamily": config["model_family"],
         "onnxQuantDefaults": {"inputOnnx": str(config["output"])},
     }
 

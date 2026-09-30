@@ -11,6 +11,7 @@ import shutil
 import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 try:
@@ -248,7 +249,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-folder", default="")
     parser.add_argument("--negative-folder", default="")
     parser.add_argument("--output-parent", required=True)
-    parser.add_argument("--dataset-folder-name", default="yolo_train")
+    parser.add_argument("--dataset-folder-name", default="")
     parser.add_argument("--label-format", choices=["yolo_txt", "voc_xml", "images_only"], required=True)
     parser.add_argument("--train-ratio", type=float, default=0.7)
     parser.add_argument("--seed", type=int, default=42)
@@ -260,7 +261,7 @@ def parse_args() -> argparse.Namespace:
 def run(args: argparse.Namespace) -> dict[str, object]:
     if not 0 < args.train_ratio < 1:
         raise ValueError("训练集比例必须大于 0 且小于 1。")
-    name = args.dataset_folder_name.strip() or "yolo_train"
+    name = args.dataset_folder_name.strip() or f"yolo_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     if name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
         raise ValueError("数据集子文件夹名称只能填写单个文件夹名称，不能包含路径。")
 

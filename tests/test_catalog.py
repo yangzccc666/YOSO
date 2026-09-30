@@ -5,11 +5,14 @@ import json
 import unittest
 import shutil
 import os
+import re
 import shlex
 import stat
+import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -25,9 +28,9 @@ from backend.handlers import RunContext, execute, has_handler, register_handler
 from backend.remote_inference import BUNDLED_INFERENCE_SCRIPT, REMEMBERED_PASSWORD_MARKER, RemoteInferenceManager, validate_connection_payload, validate_start_payload
 from backend.task_manager import PlatformTaskManager, TaskCancelled
 from backend.video_clip import COPY_MODE, _configured_range, parse_time, run_video_clip
-from backend.video_frames import run_video_frames
-from backend.yolo_training import DEFAULT_TRAINING_VALUES, TrainingManager, TrainingProfileStore, TrainingSession, _conda_environment_for_yolo, _follow_remote_session, _remote_output_lines, _remote_training_shell, build_training_command, select_remote_yolo_candidate, training_task_key
-from backend.yolo_dataset_split import run_yolo_dataset_split
+from backend.video_frames import _priority_time_ranges, run_video_frames
+from backend.yolo_training import DEFAULT_TRAINING_VALUES, TrainingManager, TrainingProfileStore, TrainingSession, _conda_environment_for_yolo, _follow_remote_session, _remote_output_lines, _remote_training_shell, automatic_training_run_name, build_training_command, normalize_training_values, select_remote_yolo_candidate, training_task_key
+from backend.yolo_dataset_split import _dataset_folder_name, run_yolo_dataset_split
 from desktop import configure_linux_input_method
 
 
@@ -43,7 +46,14 @@ class CatalogTests(unittest.TestCase):
         items = self.catalog.list()
         item = items[0]
         self.assertEqual(item["name"], "视频切图")
+        parameters = {parameter["id"]: parameter for parameter in item["parameters"]}
+        self.assertIn("工序时间段高密度", parameters["extraction_mode"]["options"])
+        self.assertEqual(parameters["priority_fps"]["default"], 25)
+        self.assertEqual(parameters["background_fps"]["default"], 5)
+        self.assertEqual(parameters["priority_max_images"]["default"], 500)
         self.assertEqual(item["handlerId"], "video.extract_frames")
+        self.assertEqual(item["parameters"][0]["id"], "project_code")
+        self.assertEqual(item["parameters"][1]["id"], "scene_code")
         max_images = next(parameter for parameter in item["parameters"] if parameter["id"] == "max_images_limit")
         self.assertEqual(max_images["default"], "")
         start_time = next(parameter for parameter in item["parameters"] if parameter["id"] == "range_start_time")
@@ -60,7 +70,8 @@ class CatalogTests(unittest.TestCase):
         label_format = next(parameter for parameter in items[1]["parameters"] if parameter["id"] == "label_format")
         self.assertEqual(label_format["default"], "VOC XML")
         dataset_folder_name = next(parameter for parameter in items[1]["parameters"] if parameter["id"] == "dataset_folder_name")
-        self.assertEqual(dataset_folder_name["default"], "yolo_train")
+        self.assertEqual(dataset_folder_name["default"], "")
+        self.assertIn("日期时间", dataset_folder_name["label"])
         parameter_ids = {parameter["id"] for parameter in items[1]["parameters"]}
         remote_host = next(parameter for parameter in items[1]["parameters"] if parameter["id"] == "remote_host")
         remote_username = next(parameter for parameter in items[1]["parameters"] if parameter["id"] == "remote_username")
@@ -94,6 +105,23 @@ class CatalogTests(unittest.TestCase):
             ["local_script_file", "local_model_file", "local_video_file"],
         )
         self.assertNotIn("script_path", {parameter["id"] for parameter in items[3]["parameters"]})
+
+    def test_existing_video_function_receives_english_naming_fields(self) -> None:
+        old_item = self.catalog.get("video_frames")
+        self.assertIsNotNone(old_item)
+        old_item["parameters"] = [
+            parameter for parameter in old_item["parameters"]
+            if parameter["id"] not in {"project_code", "scene_code"}
+        ]
+        storage = Path(self.temp.name) / "legacy-functions.json"
+        storage.write_text(json.dumps([old_item], ensure_ascii=False), encoding="utf-8")
+
+        migrated = FunctionCatalog(storage).get("video_frames")
+
+        self.assertEqual([parameter["id"] for parameter in migrated["parameters"][:2]], [
+            "project_code", "scene_code",
+        ])
+        self.assertTrue(storage.with_name("legacy-functions.json.video-frame-naming-v1").exists())
 
     def test_remote_inference_configuration_and_command_do_not_expose_password(self) -> None:
         model = Path(self.temp.name) / "sample.star"
@@ -461,13 +489,13 @@ class CatalogTests(unittest.TestCase):
             run_video_frames(RunContext(
                 function_id="video_frames",
                 paths={"video_file": source},
-                parameters={"target_fps": 1},
+                parameters={"project_code": "tcl", "scene_code": "cancel_test", "target_fps": 1},
                 report=lambda _message: None,
                 stop_event=stop_event,
             ))
 
     def test_video_frame_extraction_adapter(self) -> None:
-        source = Path(self.temp.name) / "sample.mp4"
+        source = Path(self.temp.name) / "二号线工位三.mp4"
         output = Path(self.temp.name) / "frames"
         writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48))
         self.assertTrue(writer.isOpened())
@@ -482,6 +510,8 @@ class CatalogTests(unittest.TestCase):
             paths={"video_file": source, "output_folder": output},
             parameters={
                 "extraction_mode": "每秒抽取张数",
+                "project_code": "TCL 191",
+                "scene_code": "Line2-Station3",
                 "target_fps": 2,
                 "fallback_step": 24,
                 "max_images_limit": "",
@@ -494,6 +524,17 @@ class CatalogTests(unittest.TestCase):
         self.assertIsNone(result["maxImagesPerVideo"])
         self.assertFalse(result["details"][0]["limitReached"])
         self.assertTrue(Path(result["outputFolders"][0]).exists())
+        self.assertRegex(Path(result["outputFolders"][0]).name, r"^tcl_191_line2_station3_video01_fps2_\d{8}_\d{6}$")
+        image_names = sorted(path.name for path in Path(result["outputFolders"][0]).glob("*.jpg"))
+        self.assertEqual(image_names, [
+            "tcl_191_line2_station3_video01_fps2_t000000000ms_f00000000.jpg",
+            "tcl_191_line2_station3_video01_fps2_t000000500ms_f00000005.jpg",
+        ])
+        self.assertTrue(all(name.isascii() for name in image_names))
+        self.assertEqual(result["projectCode"], "tcl_191")
+        self.assertEqual(result["sceneCode"], "line2_station3")
+        self.assertEqual(result["details"][0]["samplingTag"], "fps2")
+        self.assertTrue(any("文件名抽帧标记：fps2" in message for message in messages))
         self.assertTrue(any("已生成 2 张图片" in message for message in messages))
 
     def test_video_frame_extraction_stops_at_maximum(self) -> None:
@@ -511,6 +552,8 @@ class CatalogTests(unittest.TestCase):
             paths={"video_file": source, "output_folder": output},
             parameters={
                 "extraction_mode": "每秒抽取张数",
+                "project_code": "factory_a",
+                "scene_code": "long_test",
                 "target_fps": 10,
                 "fallback_step": 24,
                 "max_images": 3,
@@ -524,6 +567,101 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result["details"][0]["selectedFrameIndices"], [0, 14, 29])
         self.assertEqual(len(list(Path(result["outputFolders"][0]).glob("*.jpg"))), 3)
         self.assertTrue(any("已达到上限" in message for message in messages))
+
+    def test_video_frame_priority_ranges_keep_operations_before_background(self) -> None:
+        source = Path(self.temp.name) / "priority_sample.mp4"
+        output = Path(self.temp.name) / "priority_frames"
+        writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 25.0, (64, 48))
+        self.assertTrue(writer.isOpened())
+        for index in range(100):
+            writer.write(np.full((48, 64, 3), index % 255, dtype=np.uint8))
+        writer.release()
+
+        result = run_video_frames(RunContext(
+            function_id="video_frames",
+            paths={"video_file": source, "output_folder": output},
+            parameters={
+                "project_code": "factory_a",
+                "scene_code": "priority_test",
+                "extraction_mode": "工序时间段高密度",
+                "priority_time_ranges": "00:01-00:01.4; 00:02-00:02.4",
+                "priority_fps": 25,
+                "background_fps": 5,
+                "priority_max_images": 25,
+            },
+            report=lambda _message: None,
+        ))
+
+        selected = result["details"][0]["selectedFrameIndices"]
+        expected_priority = set(range(25, 35)) | set(range(50, 60))
+        self.assertEqual(result["imageCount"], 25)
+        self.assertEqual(result["maxImagesPerVideo"], 25)
+        self.assertEqual(result["details"][0]["priorityCandidateCount"], 20)
+        self.assertTrue(expected_priority.issubset(selected))
+        self.assertEqual(result["details"][0]["samplingTag"], "priority25_bg5")
+        self.assertTrue(all("priority25_bg5" in path.name for path in Path(result["outputFolders"][0]).glob("*.jpg")))
+
+    def test_video_frame_priority_range_parser_accepts_multiple_rounds(self) -> None:
+        self.assertEqual(
+            _priority_time_ranges("00:10-00:20；00:40 至 00:55\n01:30~01:50"),
+            [(10.0, 20.0), (40.0, 55.0), (90.0, 110.0)],
+        )
+        with self.assertRaisesRegex(ValueError, "结束时间必须晚于开始时间"):
+            _priority_time_ranges("00:20-00:10")
+
+    def test_video_frame_priority_rate_is_accurate_for_thirty_fps_source(self) -> None:
+        source = Path(self.temp.name) / "thirty_fps_priority.mp4"
+        writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 30.0, (64, 48))
+        self.assertTrue(writer.isOpened())
+        for index in range(60):
+            writer.write(np.full((48, 64, 3), index, dtype=np.uint8))
+        writer.release()
+
+        result = run_video_frames(RunContext(
+            function_id="video_frames",
+            paths={"video_file": source},
+            parameters={
+                "project_code": "factory_a",
+                "scene_code": "rate_test",
+                "extraction_mode": "工序时间段高密度",
+                "priority_time_ranges": "00:00-00:01",
+                "priority_fps": 25,
+                "background_fps": 5,
+                "priority_max_images": 500,
+            },
+            report=lambda _message: None,
+        ))
+
+        self.assertEqual(result["details"][0]["priorityCandidateCount"], 25)
+        self.assertEqual(result["details"][0]["backgroundCandidateCount"], 5)
+        self.assertEqual(result["imageCount"], 30)
+
+    def test_video_frame_interval_name_records_method_and_rate(self) -> None:
+        source = Path(self.temp.name) / "中文间隔视频.mp4"
+        output = Path(self.temp.name) / "interval_frames"
+        writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48))
+        self.assertTrue(writer.isOpened())
+        for index in range(10):
+            writer.write(np.full((48, 64, 3), index * 10, dtype=np.uint8))
+        writer.release()
+
+        result = run_video_frames(RunContext(
+            function_id="video_frames",
+            paths={"video_file": source, "output_folder": output},
+            parameters={
+                "project_code": "TCL",
+                "scene_code": "Line 2",
+                "extraction_mode": "按时间间隔",
+                "interval_sec": 0.5,
+            },
+            report=lambda _message: None,
+        ))
+
+        self.assertEqual(result["details"][0]["samplingTag"], "every0p5s_fps2")
+        names = [path.name for path in Path(result["outputFolders"][0]).glob("*.jpg")]
+        self.assertTrue(names)
+        self.assertTrue(all(name.startswith("tcl_line_2_video01_every0p5s_fps2_") for name in names))
+        self.assertTrue(all(name.isascii() for name in names))
 
     def test_video_frame_extraction_respects_absolute_time_range(self) -> None:
         source = Path(self.temp.name) / "trimmed_sample.mp4"
@@ -539,6 +677,8 @@ class CatalogTests(unittest.TestCase):
             paths={"video_file": source, "output_folder": output},
             parameters={
                 "extraction_mode": "每秒抽取张数",
+                "project_code": "factory_a",
+                "scene_code": "range_test",
                 "target_fps": 10,
                 "max_images": 4,
                 "range_start_time": "00:01",
@@ -567,7 +707,23 @@ class CatalogTests(unittest.TestCase):
             run_video_frames(RunContext(
                 function_id="video_frames",
                 paths={"video_file": source},
-                parameters={"range_start_time": "02:40", "range_end_time": "01:30"},
+                parameters={
+                    "project_code": "factory_a",
+                    "scene_code": "invalid_range",
+                    "range_start_time": "02:40",
+                    "range_end_time": "01:30",
+                },
+                report=lambda _message: None,
+            ))
+
+    def test_video_frame_extraction_requires_english_project_and_scene(self) -> None:
+        source = Path(self.temp.name) / "中文视频.mp4"
+        source.write_bytes(b"placeholder")
+        with self.assertRaisesRegex(ValueError, "项目英文标识只能包含英文"):
+            run_video_frames(RunContext(
+                function_id="video_frames",
+                paths={"video_file": source},
+                parameters={"project_code": "中文项目", "scene_code": "station1"},
                 report=lambda _message: None,
             ))
 
@@ -663,6 +819,44 @@ class CatalogTests(unittest.TestCase):
         self.assertLess(clipped.stat().st_size, source.stat().st_size * 0.6)
         self.assertTrue(any("直接复制原视频编码流" in message for message in messages))
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for the integration test")
+    def test_video_clip_keeps_video_and_converts_incompatible_mp4_audio(self) -> None:
+        source_container = Path(self.temp.name) / "nvr_source.mkv"
+        source = Path(self.temp.name) / "nvr_source.mp4"
+        output = Path(self.temp.name) / "nvr_clips"
+        generated = subprocess.run([
+            shutil.which("ffmpeg") or "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=3",
+            "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=8000:duration=3",
+            "-c:v", "mpeg4", "-c:a", "pcm_alaw", "-shortest", str(source_container),
+        ], capture_output=True, text=True, check=False)
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        source_container.replace(source)
+
+        messages: list[str] = []
+        result = run_video_clip(RunContext(
+            function_id="video_clip",
+            paths={"video_file": source, "output_folder": output},
+            parameters={
+                "clip_mode": "指定开始时间和持续时长",
+                "duration_start_time": "0.5",
+                "clip_duration": "1.5",
+            },
+            report=messages.append,
+        ))
+
+        clipped = Path(result["outputFiles"][0])
+        probe = subprocess.run([
+            "ffprobe", "-v", "error", "-show_entries", "stream=codec_type,codec_name",
+            "-of", "json", str(clipped),
+        ], capture_output=True, text=True, check=False)
+        streams = json.loads(probe.stdout)["streams"]
+        codecs = {stream["codec_type"]: stream["codec_name"] for stream in streams}
+        self.assertEqual(result["successCount"], 1)
+        self.assertEqual(codecs["video"], "mpeg4")
+        self.assertEqual(codecs["audio"], "aac")
+        self.assertTrue(any("视频保持原编码，仅将音频转换为 AAC" in message for message in messages))
+
     def test_yolo_txt_split_is_repeatable_and_preserves_sources(self) -> None:
         images = Path(self.temp.name) / "images"
         labels = Path(self.temp.name) / "labels"
@@ -698,7 +892,8 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result["trainCount"], 4)
         self.assertEqual(result["valCount"], 3)
         self.assertEqual(result["taskType"], "目标检测")
-        self.assertEqual(dataset, output / "yolo_train")
+        self.assertEqual(dataset.parent, output)
+        self.assertRegex(dataset.name, r"^yolo_train_\d{8}_\d{6}$")
         self.assertTrue(dataset.is_dir())
         self.assertEqual(len(list((dataset / "train").glob("*.jpg"))), 4)
         self.assertEqual(len(list((dataset / "val").glob("*.jpg"))), 3)
@@ -738,9 +933,18 @@ class CatalogTests(unittest.TestCase):
                     "negative_images_folder": negatives,
                     "output_folder": output,
                 },
-                parameters={"label_format": "YOLO TXT", "train_ratio": 0.7, "random_seed": 42},
+                parameters={
+                    "label_format": "YOLO TXT",
+                    "dataset_folder_name": dataset.name,
+                    "train_ratio": 0.7,
+                    "random_seed": 42,
+                },
                 report=lambda _message: None,
             ))
+
+    def test_dataset_folder_name_is_timestamped_when_blank_and_preserves_custom_name(self) -> None:
+        self.assertRegex(_dataset_folder_name(""), r"^yolo_train_\d{8}_\d{6}$")
+        self.assertEqual(_dataset_folder_name("custom_dataset"), "custom_dataset")
 
     def test_unimplemented_yolo_task_type_is_rejected_before_processing(self) -> None:
         with self.assertRaisesRegex(ValueError, "旋转目标检测.*尚未接入"):
@@ -832,10 +1036,31 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("epochs=200", command)
         self.assertIn("patience=30", command)
         self.assertIn("device=2", command)
-        self.assertIn("name=yolo26n_0915", command)
+        self.assertTrue(any(re.fullmatch(r"name=yolo26_\d{4}_\d{4}", item) for item in command))
         self.assertIn("cos_lr=True", command)
         self.assertIn("optimizer=SGD", command)
-        self.assertEqual(len(command), 34)
+        self.assertIn("amp=True", command)
+        self.assertIn("cache=False", command)
+        self.assertIn("close_mosaic=10", command)
+        self.assertIn("hsv_h=0.015", command)
+        self.assertIn("hsv_s=0.7", command)
+        self.assertIn("hsv_v=0.4", command)
+        self.assertIn("cutmix=0.0", command)
+        self.assertIn("momentum=0.937", command)
+        self.assertEqual(len(command), 50)
+
+    def test_yolo_training_name_is_generated_only_for_execution(self) -> None:
+        self.assertEqual(DEFAULT_TRAINING_VALUES["run_name"], "")
+        self.assertEqual(automatic_training_run_name(datetime(2026, 9, 23, 14, 5)), "yolo26_0923_1405")
+        self.assertRegex(normalize_training_values(DEFAULT_TRAINING_VALUES)["run_name"], r"^yolo26_\d{4}_\d{4}$")
+        self.assertEqual(
+            normalize_training_values({**DEFAULT_TRAINING_VALUES, "run_name": "custom_run"})["run_name"],
+            "custom_run",
+        )
+        with self.assertRaisesRegex(ValueError, "cache 只能是"):
+            normalize_training_values({**DEFAULT_TRAINING_VALUES, "cache": "network"})
+        with self.assertRaisesRegex(ValueError, "cutmix 必须在 0 到 1 之间"):
+            normalize_training_values({**DEFAULT_TRAINING_VALUES, "cutmix": 1.1})
 
     def test_yolo_training_selects_environment_matching_model_family(self) -> None:
         candidates = [
@@ -873,12 +1098,14 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(payload["profiles"][0]["name"], "通用训练")
         self.assertEqual(payload["defaults"]["patience"], 30)
         self.assertEqual(payload["profiles"][0]["values"]["patience"], 30)
+        self.assertEqual(payload["profiles"][0]["values"]["run_name"], "")
         profile = store.create({
             "name": "光线变化",
             "description": "增强旋转和缩放，适合跨时段画面。",
             "values": {**DEFAULT_TRAINING_VALUES, "degrees": 5, "scale": 0.35},
         })
         self.assertEqual(profile["values"]["degrees"], 5.0)
+        self.assertEqual(profile["values"]["run_name"], "")
         updated = store.update(profile["id"], {
             **profile,
             "description": "夜间与白天混合数据。",
@@ -899,6 +1126,16 @@ class CatalogTests(unittest.TestCase):
             time.sleep(0.02)
         self.assertEqual(current["status"], "completed")
         self.assertTrue(any("detect train" in line for line in current["logs"]))
+
+    def test_yolo_training_snapshot_keeps_connection_identity_for_reconnect(self) -> None:
+        session = TrainingSession(
+            id="reconnect-test", remote=True, host="192.168.21.5", port=2202,
+            username="dell", remote_dir="$HOME/.local/state/yolo-processing/training/reconnect-test",
+        )
+        snapshot = session.snapshot()
+        self.assertEqual(snapshot["host"], "192.168.21.5")
+        self.assertEqual(snapshot["port"], 2202)
+        self.assertEqual(snapshot["username"], "dell")
 
     def test_parallel_training_sessions_keep_outputs_and_controls_independent(self) -> None:
         gate = threading.Event()

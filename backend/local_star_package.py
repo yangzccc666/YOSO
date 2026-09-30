@@ -259,7 +259,7 @@ def _choice(raw: Any, label: str, choices: dict[str, int], default: str) -> int:
 def _configuration(context: RunContext) -> dict[str, Any]:
     plan = context.paths.get("model_file")
     if not plan or plan.suffix.lower() != ".plan" or not plan.is_file():
-        raise ValueError("\u8bf7\u9009\u62e9\u5b58\u5728\u7684\u672c\u5730 .plan \u6a21\u578b\u6587\u4ef6\u3002")
+        raise ValueError("请选择存在的本地 .plan 模型文件。")
     tool = Path(str(context.parameters.get("package_tool_path") or DEFAULT_TOOL)).expanduser()
     if not tool.is_file():
         raise ValueError(f"\u6253\u5305\u5de5\u5177\u4e0d\u5b58\u5728\uff1a{tool}")
@@ -496,6 +496,10 @@ def run_local_star_package(context: RunContext) -> dict[str, Any]:
         "outputFolders": [str(output.parent)],
         "title": config["title"],
         "labelCount": len(config["labels"]),
+        "remoteInferenceDefaults": {
+            "modelFile": str(output),
+            "labels": config["labels"],
+        },
     }
 
 

@@ -12,7 +12,12 @@ from PIL import Image
 from backend.catalog import FunctionCatalog
 from backend.groups import GroupCatalog
 from backend.handlers import RunContext, has_handler
-from backend.remote_calib_dataset import _command, _configuration
+from backend.remote_calib_dataset import (
+    _command,
+    _configuration,
+    is_remote_calib_parameters,
+    run_remote_calib_dataset,
+)
 from backend.remote_calib_worker import run
 
 
@@ -43,6 +48,9 @@ class CalibrationDatasetTests(unittest.TestCase):
         item = catalog.get("quant_calibration_dataset")
         self.assertIsNotNone(item)
         self.assertTrue(has_handler(item["handlerId"]))
+        parameters = {parameter["id"]: parameter for parameter in item["parameters"]}
+        self.assertEqual(parameters["execution_location"]["default"], "本地运行")
+        self.assertEqual(parameters["remote_host"]["default"], "")
         grouped = GroupCatalog(self.root / "groups.json").decorate(catalog.list())
         item = next(entry for entry in grouped if entry["id"] == "quant_calibration_dataset")
         self.assertEqual(item["groupId"], "dataset_processing")
@@ -120,6 +128,7 @@ class CalibrationDatasetTests(unittest.TestCase):
 
     def test_configuration_requires_tested_connection_and_quotes_paths(self) -> None:
         parameters = {
+            "execution_location": "SSH 远程服务器",
             "image_dirs": "/srv/data/正样本\n/srv/data/负样本",
             "annotation_dirs": "/srv/data/labels",
             "negative_dirs": "/srv/data/独立负样本",
@@ -137,6 +146,33 @@ class CalibrationDatasetTests(unittest.TestCase):
         self.assertNotIn("secret", command)
         self.assertIn("--count 128", command)
         self.assertIn("--negative-dirs-json", command)
+
+    def test_local_mode_does_not_resolve_ssh_and_runs_worker(self) -> None:
+        Image.new("RGB", (8, 8), color=(80, 100, 120)).save(self.images / "part.jpg")
+        (self.annotations / "part.xml").write_text(
+            "<annotation><object><name>part</name></object></annotation>", encoding="utf-8"
+        )
+        output = self.root / "local_calib"
+        parameters = {
+            "execution_location": "本地运行",
+            "image_dirs": str(self.images),
+            "annotation_dirs": str(self.annotations),
+            "output_dir": str(output),
+            "num_samples": 128,
+        }
+        messages: list[str] = []
+        context = RunContext("quant_calibration_dataset", {}, parameters, messages.append)
+        with patch("backend.remote_calib_dataset.resolve_tested_yolo_connection") as resolve_connection:
+            result = run_remote_calib_dataset(context)
+        resolve_connection.assert_not_called()
+        self.assertFalse(is_remote_calib_parameters(parameters))
+        self.assertEqual(result["sampleCount"], 1)
+        self.assertTrue((output / "part.jpg").is_file())
+        self.assertTrue(any("本机 Python" in message for message in messages))
+
+    def test_remote_mode_detection_is_explicit(self) -> None:
+        self.assertTrue(is_remote_calib_parameters({"execution_location": "SSH 远程服务器"}))
+        self.assertFalse(is_remote_calib_parameters({}))
 
 
 if __name__ == "__main__":

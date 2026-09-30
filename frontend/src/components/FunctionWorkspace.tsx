@@ -9,7 +9,9 @@ import { YoloTrainingPanel } from './YoloTrainingPanel'
 import { RemoteTensorRTBuildPanel } from './RemoteTensorRTBuildPanel'
 import { LocalStarPackagePanel } from './LocalStarPackagePanel'
 import { FunctionRunHistory } from './FunctionRunHistory'
+import { WorkflowTodoPanel } from './WorkflowTodoPanel'
 import type { FunctionDefinition, FunctionParameter, PlatformTaskStatus, WorkingValues, YoloTrainingRecommendation } from '../types'
+import type { WorkflowTodo } from '../workflowTodos'
 
 type Props = {
   item: FunctionDefinition | null
@@ -26,6 +28,10 @@ type Props = {
   onRun: (parameterOverrides?: Record<string, string | number | boolean>) => void
   onStop: (taskId: string) => void
   yoloTrainingRecommendation: YoloTrainingRecommendation | null
+  workflowTodos: WorkflowTodo[]
+  onApplyWorkflowTodo: (item: WorkflowTodo) => void
+  onDeleteWorkflowTodo: (id: string) => void
+  onWorkflowComplete: (handlerId: string) => void
 }
 
 function ParameterValue({ field, value, onChange }: { field: FunctionParameter; value: string | number | boolean; onChange: (value: string | number | boolean) => void }) {
@@ -54,7 +60,9 @@ export function FunctionWorkspace(props: Props) {
   const isLocalStarPackageWorkspace = item.handlerId === 'model.package_star'
   const currentTask = isYoloWorkspace && yoloMode === 'training' ? undefined : props.activeTasks.find((task) => task.functionId === item.id && !task.name.startsWith('YOLO 训练 ·'))
   const visibleParameters = item.parameters.filter((field) =>
-    (!field.visibleWhen || props.values.parameters[field.visibleWhen.fieldId] === field.visibleWhen.equals)
+    (!field.visibleWhen
+      || (field.visibleWhen.equals !== undefined && props.values.parameters[field.visibleWhen.fieldId] === field.visibleWhen.equals)
+      || (field.visibleWhen.notEquals !== undefined && props.values.parameters[field.visibleWhen.fieldId] !== field.visibleWhen.notEquals))
     && (!isRemoteStarWorkspace || !['labels', 'conf', 'additional_models', 'star_models'].includes(field.id)))
   const visiblePathFields = item.pathFields.filter((field) => !isRemoteStarWorkspace || field.id !== 'local_model_file')
   const remoteYoloPaths = item.handlerId === 'yolo.split_dataset' && Boolean(
@@ -69,6 +77,7 @@ export function FunctionWorkspace(props: Props) {
         <span><i /><strong>{currentTask.status === 'stopping' ? '正在终止任务' : '任务正在运行'}</strong><em>“{currentTask.name}”正在运行；其他功能仍可独立使用。</em></span>
         <button className="stop-run-button" onClick={() => props.onStop(currentTask.id)} disabled={currentTask.status === 'stopping'}><icons.X size={17} />{currentTask.status === 'stopping' ? '正在终止…' : '终止运行'}</button>
       </section> : null}
+      <WorkflowTodoPanel items={props.workflowTodos} onApply={props.onApplyWorkflowTodo} onDelete={props.onDeleteWorkflowTodo} />
       {isYoloWorkspace ? <nav className="yolo-mode-tabs" aria-label="YOLO 数据集操作">
         <button className={yoloMode === 'dataset' ? 'active' : ''} onClick={() => setYoloMode('dataset')}><icons.Folder size={18} /><span>数据集划分<small>整理数据并生成 data.yaml</small></span></button>
         <button className={yoloMode === 'training' ? 'active' : ''} onClick={() => setYoloMode('training')}><icons.Play size={18} /><span>模型训练<small>配置参数、保存场景并启动训练</small></span></button>
@@ -88,7 +97,7 @@ export function FunctionWorkspace(props: Props) {
         {!isRemoteStarWorkspace ? <button className="text-action" onClick={props.onAddParameter}><icons.Plus size={17} />添加参数</button> : null}
       </section>
       </> : null}
-        {item.handlerId === 'remote.star_inference' ? <RemoteInferencePanel itemId={item.id} values={props.values} onParameterChange={props.onParameterChange} platformTask={currentTask || null} /> : item.handlerId === 'local.pt_inference' ? <LocalPTInferencePanel itemId={item.id} values={props.values} platformTask={currentTask || null} /> : isRemoteTrtWorkspace ? <RemoteTensorRTBuildPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isLocalStarPackageWorkspace ? <LocalStarPackagePanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onBrowse={props.onBrowse} onPathChange={props.onPathChange} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isCalibrationWorkspace ? <RemoteCalibrationPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isYoloWorkspace ? (yoloMode === 'dataset' ? <RemoteYoloDatasetPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : <YoloTrainingPanel values={props.values} onParameterChange={props.onParameterChange} recommendation={props.yoloTrainingRecommendation} />) : <section className="run-section">
+        {item.handlerId === 'remote.star_inference' ? <RemoteInferencePanel itemId={item.id} values={props.values} onParameterChange={props.onParameterChange} platformTask={currentTask || null} onCompleted={() => props.onWorkflowComplete('remote.star_inference')} /> : item.handlerId === 'local.pt_inference' ? <LocalPTInferencePanel itemId={item.id} values={props.values} platformTask={currentTask || null} /> : isRemoteTrtWorkspace ? <RemoteTensorRTBuildPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isLocalStarPackageWorkspace ? <LocalStarPackagePanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onBrowse={props.onBrowse} onPathChange={props.onPathChange} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isCalibrationWorkspace ? <RemoteCalibrationPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isYoloWorkspace ? (yoloMode === 'dataset' ? <RemoteYoloDatasetPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : <YoloTrainingPanel values={props.values} onParameterChange={props.onParameterChange} recommendation={props.yoloTrainingRecommendation} onCompleted={() => props.onWorkflowComplete('yolo.split_dataset')} />) : <section className="run-section">
         <div className="run-actions"><button className="run-button" onClick={() => props.onRun()} disabled={props.running || Boolean(currentTask)}><icons.Play size={18} fill="currentColor" />{currentTask ? '正在运行' : props.running ? '正在启动' : '一键运行'}</button><span className={item.handlerReady ? 'ready' : ''}><icons.Info size={17} />{item.handlerReady ? '处理逻辑已接入' : '处理逻辑尚未接入'}</span></div>
         <details className="run-output" open><summary><icons.ChevronRight size={18} />运行输出</summary><pre>{props.output || '运行后将在这里显示处理进度和结果'}</pre></details>
       </section>}

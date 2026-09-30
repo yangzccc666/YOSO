@@ -25,6 +25,7 @@ from .remote_yolo_dataset import (
     remote_yolo_credential_status,
     test_remote_yolo_connection,
 )
+from .remote_calib_dataset import is_remote_calib_parameters
 from .task_manager import ActiveTask, TaskCancelled, manager as platform_task_manager
 from .yolo_training import (
     TrainingProfileStore,
@@ -100,6 +101,51 @@ def finish_async_run(task: ActiveTask, snapshot: dict[str, Any], details: dict[s
         )
     finally:
         platform_task_manager.finish(task.id)
+
+
+def active_training_history_records() -> list[dict[str, Any]]:
+    """Expose active training sessions alongside, but outside, the five-item finished history."""
+    records: list[dict[str, Any]] = []
+    terminal = {"completed", "failed", "stopped"}
+    for summary in yolo_training_manager.list():
+        if str(summary.get("status", "")) in terminal:
+            continue
+        try:
+            session = yolo_training_manager.get(str(summary["id"])).snapshot()
+        except (KeyError, ValueError):
+            continue
+        output = str(session.get("output", "")).strip()
+        run_name = Path(output).name if output else str(session.get("id", ""))
+        remote = bool(session.get("remote"))
+        status = str(session.get("status", "running"))
+        if status == "disconnected":
+            state_message = "远程训练可能仍在运行，当前等待重新连接。"
+        elif status == "stopping":
+            state_message = "训练正在终止。"
+        elif status == "starting":
+            state_message = "训练正在准备启动。"
+        else:
+            state_message = "模型正在训练中。"
+        records.append({
+            "id": f"active-training-{session['id']}",
+            "functionId": "yolo_dataset_split",
+            "name": f"YOLO 训练 · {run_name}",
+            "kind": "remote-training" if remote else "local",
+            "status": "running",
+            "startedAt": str(session.get("startedAt", "")),
+            "finishedAt": "",
+            "message": str(session.get("message") or state_message),
+            "details": {
+                "训练状态": state_message,
+                "模型权重": str(session.get("model", "")),
+                "训练输出": output,
+                "设备": f"{session.get('host', '')} · GPU {session.get('device', '')}" if remote
+                else f"本地 · GPU {session.get('device', '')}",
+            },
+            "outputs": [output] if output else [],
+            "logs": [str(line) for line in session.get("logs", [])][-500:],
+        })
+    return records
 
 
 def workspace_payload() -> dict[str, Any]:
@@ -210,8 +256,13 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 parameters = urllib.parse.parse_qs(parsed.query)
                 function_id = str(parameters.get("functionId", [""])[0]).strip()
-                records = run_history.list(function_id) if function_id else run_history.list()[: run_history.LIMIT]
-                self.send_json({"history": records})
+                active_records = active_training_history_records()
+                if function_id:
+                    active_records = [record for record in active_records if record["functionId"] == function_id]
+                    finished_records = run_history.list(function_id)
+                else:
+                    finished_records = run_history.list()[: run_history.LIMIT]
+                self.send_json({"history": [*active_records, *finished_records]})
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 self.send_json({"error": f"读取运行历史失败：{exc}"}, 500)
             return
@@ -462,7 +513,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     handler_id == "yolo.split_dataset"
                     and is_remote_yolo_parameters(payload.get("parameters", {}))
                 )
-                is_remote_calib = handler_id == "calib.select_dataset"
+                parameters = payload.get("parameters", {})
+                is_remote_calib = handler_id == "calib.select_dataset" and is_remote_calib_parameters(parameters)
                 is_remote_trt = handler_id == "remote.build_tensorrt"
                 path_values = {
                     key: Path(value) if is_remote_yolo else Path(value).expanduser()
@@ -479,12 +531,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     for field in item.get("pathFields", [])
                     if field.get("id")
                 }
-                if is_remote_calib:
-                    parameters = payload.get("parameters", {})
+                if handler_id == "calib.select_dataset":
                     details.update({
                         "图片目录": str(parameters.get("image_dirs", "")),
                         "输出目录": str(parameters.get("output_dir", "")),
-                        "远程服务器": str(parameters.get("remote_host", "")),
+                        "执行位置": f"{parameters.get('remote_username', '')}@{parameters.get('remote_host', '')}" if is_remote_calib else "本机",
                     })
                 elif is_remote_yolo:
                     details["远程服务器"] = str(payload.get("parameters", {}).get("remote_host", ""))

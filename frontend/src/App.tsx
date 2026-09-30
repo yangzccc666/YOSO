@@ -5,8 +5,12 @@ import { GroupDialog } from './components/GroupDialog'
 import { FunctionSidebar } from './components/FunctionSidebar'
 import { FunctionWorkspace } from './components/FunctionWorkspace'
 import { RunHistoryDialog } from './components/RunHistoryDialog'
+import { WorkflowTodoDialog } from './components/WorkflowTodoDialog'
 import { icons } from './icons'
+import { parseStarModels, upsertStarModel } from './remoteStarModels'
+import { createWorkflowTodo, loadWorkflowTodos, saveWorkflowTodos } from './workflowTodos'
 import type { FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
+import type { WorkflowTodo, WorkflowTodoPayload } from './workflowTodos'
 
 const storageKey = (id: string) => `processing-view:values:${id}`
 const sidebarStorageKey = 'yolo-data-platform:sidebar-collapsed:v1'
@@ -14,28 +18,21 @@ const remoteDefaultsMigrationKey = 'yolo-data-platform:remote-defaults:v2'
 const remotePreviewMigrationKey = 'yolo-data-platform:remote-preview:v3'
 const yoloConnectionMigrationKey = 'yolo-data-platform:yolo-connection:v1'
 const videoClipCopyMigrationKey = 'yolo-data-platform:video-clip-copy:v1'
-const yoloTrainingRecommendationKey = 'yolo-data-platform:training-recommendation:v1'
+const datasetFolderBlankMigrationKey = 'yolo-data-platform:dataset-folder-blank:v1'
+const automaticDatasetFolderPattern = /^yolo_train_\d{8}_\d{6}$/
 
-function yoloRunName(date: Date): string {
-  const twoDigits = (value: number) => String(value).padStart(2, '0')
-  return `yolo26_${twoDigits(date.getMonth() + 1)}${twoDigits(date.getDate())}_${twoDigits(date.getHours())}${twoDigits(date.getMinutes())}`
-}
-
-function loadYoloTrainingRecommendation(): YoloTrainingRecommendation | null {
-  try {
-    const stored = localStorage.getItem(yoloTrainingRecommendationKey)
-    if (!stored) return null
-    const parsed = JSON.parse(stored) as Partial<YoloTrainingRecommendation>
-    if (typeof parsed.data !== 'string' || typeof parsed.project !== 'string' || typeof parsed.updatedAt !== 'string') return null
-    return {
-      data: parsed.data,
-      project: parsed.project,
-      runName: typeof parsed.runName === 'string' ? parsed.runName : undefined,
-      updatedAt: parsed.updatedAt,
-    }
-  } catch {
-    return null
-  }
+function sameActiveTaskState(current: PlatformTaskStatus[], next: PlatformTaskStatus[]): boolean {
+  if (current.length !== next.length) return false
+  return current.every((task, index) => {
+    const candidate = next[index]
+    return candidate !== undefined
+      && task.id === candidate.id
+      && task.functionId === candidate.functionId
+      && task.name === candidate.name
+      && task.kind === candidate.kind
+      && task.status === candidate.status
+      && task.startedAt === candidate.startedAt
+  })
 }
 
 function loadSidebarCollapsed(): boolean {
@@ -118,6 +115,30 @@ function migrateYoloConnectionDefaults(items: FunctionDefinition[]) {
   }
 }
 
+function migrateDatasetFolderToBlank(items: FunctionDefinition[]) {
+  try {
+    if (localStorage.getItem(datasetFolderBlankMigrationKey) === 'done') return
+    const yoloItem = items.find((item) => item.handlerId === 'yolo.split_dataset')
+    if (yoloItem) {
+      const key = storageKey(yoloItem.id)
+      const stored = localStorage.getItem(key)
+      if (stored) {
+        const values = JSON.parse(stored) as WorkingValues
+        const currentName = String(values.parameters.dataset_folder_name ?? '').trim()
+        if (currentName === 'yolo_train' || automaticDatasetFolderPattern.test(currentName)) {
+          localStorage.setItem(key, JSON.stringify(withoutSecrets(yoloItem, {
+            ...values,
+            parameters: { ...values.parameters, dataset_folder_name: '' },
+          })))
+        }
+      }
+    }
+    localStorage.setItem(datasetFolderBlankMigrationKey, 'done')
+  } catch {
+    // The field remains manually editable if browser storage is unavailable.
+  }
+}
+
 function migrateVideoClipDefault(items: FunctionDefinition[]) {
   try {
     if (localStorage.getItem(videoClipCopyMigrationKey) === 'done') return
@@ -174,8 +195,10 @@ export default function App() {
   const [activeTasks, setActiveTasks] = useState<PlatformTaskStatus[]>([])
   const [notice, setNotice] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [workflowOpen, setWorkflowOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed)
-  const [yoloTrainingRecommendation, setYoloTrainingRecommendation] = useState<YoloTrainingRecommendation | null>(loadYoloTrainingRecommendation)
+  const [yoloTrainingRecommendation, setYoloTrainingRecommendation] = useState<YoloTrainingRecommendation | null>(null)
+  const [workflowTodos, setWorkflowTodos] = useState<WorkflowTodo[]>(loadWorkflowTodos)
   const closeHistory = useCallback(() => setHistoryOpen(false), [])
 
   const selected = useMemo(() => functions.find((item) => item.id === selectedId) || null, [functions, selectedId])
@@ -195,6 +218,7 @@ export default function App() {
       migrateRemotePreviewDefaults(workspace.functions)
       migrateYoloConnectionDefaults(workspace.functions)
       migrateVideoClipDefault(workspace.functions)
+      migrateDatasetFolderToBlank(workspace.functions)
       setFunctions(workspace.functions)
       setGroups(workspace.groups)
       if (workspace.functions[0]) setSelectedId(workspace.functions[0].id)
@@ -203,28 +227,36 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false
-    const refresh = () => getActiveTask()
-      .then((tasks) => {
+    let timer: number | undefined
+    const refresh = async () => {
+      try {
+        const tasks = await getActiveTask()
         if (disposed) return
-        setActiveTasks(tasks)
+        setActiveTasks((current) => sameActiveTaskState(current, tasks) ? current : tasks)
         setOutputs((current) => {
           let changed = false
           const next = { ...current }
           for (const task of tasks) {
             if (task.logs?.length) {
-              next[task.functionId] = task.logs.join('\n')
-              changed = true
+              const output = task.logs.join('\n')
+              if (current[task.functionId] !== output) {
+                next[task.functionId] = output
+                changed = true
+              }
             }
           }
           return changed ? next : current
         })
-      })
-      .catch(() => { /* The main request will surface server errors. */ })
-    refresh()
-    const timer = window.setInterval(refresh, 800)
+      } catch {
+        // The main request will surface server errors.
+      } finally {
+        if (!disposed) timer = window.setTimeout(refresh, 800)
+      }
+    }
+    void refresh()
     return () => {
       disposed = true
-      window.clearInterval(timer)
+      if (timer !== undefined) window.clearTimeout(timer)
     }
   }, [])
 
@@ -325,6 +357,105 @@ export default function App() {
     await save(next)
   }
 
+  const updateWorkflowTodos = (updater: (current: WorkflowTodo[]) => WorkflowTodo[]) => {
+    setWorkflowTodos((current) => {
+      const next = updater(current).slice(0, 100)
+      saveWorkflowTodos(next)
+      return next
+    })
+  }
+
+  const enqueueWorkflowTodo = (
+    source: FunctionDefinition,
+    targetHandlerId: string,
+    title: string,
+    description: string,
+    payload: WorkflowTodoPayload,
+  ) => {
+    const todo = createWorkflowTodo({
+      sourceFunctionId: source.id,
+      sourceName: source.name,
+      targetHandlerId,
+      title,
+      description,
+      payload,
+    })
+    updateWorkflowTodos((current) => [todo, ...current])
+    return todo
+  }
+
+  const deleteWorkflowTodo = (id: string) => updateWorkflowTodos((current) => current.filter((item) => item.id !== id))
+
+  const completeWorkflowTarget = (handlerId: string) => {
+    if (handlerId === 'yolo.split_dataset') setYoloTrainingRecommendation(null)
+    updateWorkflowTodos((current) => current.filter((todo) => !(todo.targetHandlerId === handlerId && todo.status === 'applied')))
+  }
+
+  const applyWorkflowTodo = (todo: WorkflowTodo) => {
+    if (workflowTodos.some((item) => item.targetHandlerId === todo.targetHandlerId && item.status === 'applied' && item.id !== todo.id)) {
+      setNotice('请先运行当前已应用的工作流待办，或将它删除后再应用下一条。')
+      return
+    }
+    const target = functions.find((item) => item.handlerId === todo.targetHandlerId)
+    if (!target) {
+      setNotice('待办对应的目标功能不存在，可能已被删除。')
+      return
+    }
+    if (todo.payload.training) {
+      const recommendation: YoloTrainingRecommendation = {
+        ...todo.payload.training,
+        updatedAt: new Date().toISOString(),
+      }
+      setYoloTrainingRecommendation(recommendation)
+    } else {
+      const currentValues = working[target.id] || defaultsFor(target)
+      let next: WorkingValues = {
+        paths: { ...currentValues.paths, ...todo.payload.paths },
+        parameters: { ...currentValues.parameters, ...todo.payload.parameters },
+      }
+      if (todo.payload.starModel) {
+        const configuredConfidence = Number(currentValues.parameters.conf ?? 0.5)
+        const confidence = Number.isFinite(configuredConfidence) ? configuredConfidence : 0.5
+        const models = parseStarModels(
+          currentValues.parameters.star_models,
+          String(currentValues.paths.local_model_file || ''),
+          String(currentValues.parameters.labels || ''),
+          confidence,
+        )
+        const model = todo.payload.starModel
+        const merged = upsertStarModel(models, {
+          path: model.path,
+          labels: model.labels,
+          conf: model.conf ?? confidence,
+        })
+        if (merged.action === 'full') {
+          setNotice('远程实时 AI 推理已有 8 个模型，请先删除一个模型后再应用此待办。')
+          return
+        }
+        next = {
+          ...next,
+          paths: { ...next.paths, local_model_file: model.path },
+          parameters: {
+            ...next.parameters,
+            labels: model.labels,
+            star_models: JSON.stringify(merged.models),
+          },
+        }
+      }
+      setWorking((current) => ({ ...current, [target.id]: next }))
+      try { localStorage.setItem(storageKey(target.id), JSON.stringify(withoutSecrets(target, next))) } catch { /* keep current session state */ }
+    }
+    updateWorkflowTodos((current) => current.map((item) => item.id === todo.id ? { ...item, status: 'applied' } : item))
+    setNotice(`已应用待办“${todo.title}”。本功能成功运行后会自动清理该待办。`)
+  }
+
+  const applyWorkflowTodoFromDialog = (todo: WorkflowTodo) => {
+    const target = functions.find((item) => item.handlerId === todo.targetHandlerId)
+    if (target) setSelectedId(target.id)
+    applyWorkflowTodo(todo)
+    setWorkflowOpen(false)
+  }
+
   const run = async (parameterOverrides: Record<string, string | number | boolean> = {}) => {
     if (!selected) return
     const item = selected
@@ -344,42 +475,51 @@ export default function App() {
       if (item.handlerId === 'yolo.split_dataset' && trainingDefaults && typeof trainingDefaults === 'object') {
         const candidate = trainingDefaults as Record<string, unknown>
         if (typeof candidate.data === 'string' && typeof candidate.project === 'string') {
-          const completedAt = new Date()
-          const recommendation: YoloTrainingRecommendation = {
-            data: candidate.data,
-            project: candidate.project,
-            runName: yoloRunName(completedAt),
-            updatedAt: completedAt.toISOString(),
-          }
-          setYoloTrainingRecommendation(recommendation)
-          try { localStorage.setItem(yoloTrainingRecommendationKey, JSON.stringify(recommendation)) } catch { /* keep current session state */ }
-          lines.push('', '已自动更新模型训练参数：', `data=${candidate.data}`, `project=${candidate.project}`, `name=${recommendation.runName}`)
+          enqueueWorkflowTodo(item, 'yolo.split_dataset', '使用本次数据集开始模型训练', `data=${candidate.data}；project=${candidate.project}；name=运行时自动生成`, {
+            training: { data: candidate.data, project: candidate.project },
+          })
+          lines.push('', '已加入工作流待办：模型训练参数。当前训练配置没有被覆盖。')
         }
       }
       const onnxQuantDefaults = result.result.onnxQuantDefaults
       if (item.handlerId === 'model.export_jetson_onnx' && onnxQuantDefaults && typeof onnxQuantDefaults === 'object') {
         const candidate = onnxQuantDefaults as Record<string, unknown>
-        const quantItem = functions.find((entry) => entry.handlerId === 'docker.quantize_onnx')
-        if (quantItem && typeof candidate.inputOnnx === 'string') {
-          setWorking((current) => {
-            const currentValues = current[quantItem.id] || defaultsFor(quantItem)
-            const next = {
-              ...currentValues,
-              paths: { ...currentValues.paths, input_onnx: candidate.inputOnnx as string },
-            }
-            try { localStorage.setItem(storageKey(quantItem.id), JSON.stringify(withoutSecrets(quantItem, next))) } catch { /* keep current session state */ }
-            return { ...current, [quantItem.id]: next }
+        if (typeof candidate.inputOnnx === 'string') {
+          enqueueWorkflowTodo(item, 'docker.quantize_onnx', '量化本次导出的 ONNX', candidate.inputOnnx, {
+            paths: { input_onnx: candidate.inputOnnx },
           })
-          lines.push('', '已自动更新 Docker ONNX 量化的输入模型：', candidate.inputOnnx)
+          lines.push('', '已加入工作流待办：Docker ONNX 量化。当前量化配置没有被覆盖。')
         }
       }
+      const remoteInferenceDefaults = result.result.remoteInferenceDefaults
+      if (item.handlerId === 'model.package_star' && remoteInferenceDefaults && typeof remoteInferenceDefaults === 'object') {
+        const candidate = remoteInferenceDefaults as Record<string, unknown>
+        const labels = Array.isArray(candidate.labels)
+          ? candidate.labels.filter((label): label is string => typeof label === 'string' && Boolean(label.trim()))
+          : []
+        if (typeof candidate.modelFile === 'string' && candidate.modelFile.trim() && labels.length) {
+          const joinedLabels = labels.join(',')
+          enqueueWorkflowTodo(item, 'remote.star_inference', '测试新打包的 STAR 模型', `${candidate.modelFile}；类别：${joinedLabels}`, {
+            starModel: {
+              path: candidate.modelFile,
+              labels: joinedLabels,
+            },
+          })
+          lines.push('', '已加入工作流待办：远程实时 AI 推理模型。当前推理模型配置没有被覆盖。')
+        }
+      }
+      const operation = parameterOverrides.operation ?? runValues.parameters.operation
+      const consumedWorkflowTodo = item.handlerId !== 'yolo.split_dataset'
+        && !(item.handlerId === 'docker.quantize_onnx' && operation === '测试 Docker 环境')
+        && !(item.handlerId === 'remote.build_tensorrt' && operation === '检查远程环境')
+      if (consumedWorkflowTodo) completeWorkflowTarget(String(item.handlerId || ''))
       setOutputs((current) => ({ ...current, [item.id]: lines.join('\n') }))
     } catch (error) {
       const message = error instanceof Error ? error.message : '运行失败'
       setOutputs((current) => ({ ...current, [item.id]: `[${started}] ${message}` }))
     } finally {
       setRunningIds((current) => current.filter((id) => id !== item.id))
-      getActiveTask().then(setActiveTasks).catch(() => undefined)
+      setActiveTasks((current) => current.filter((task) => task.functionId !== item.id))
     }
   }
 
@@ -393,7 +533,6 @@ export default function App() {
       }))
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '终止运行失败')
-      getActiveTask().then(setActiveTasks).catch(() => undefined)
     }
   }
 
@@ -410,6 +549,7 @@ export default function App() {
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
         <div className="top-actions">
+          <button className="history-trigger workflow-trigger" onClick={() => setWorkflowOpen(true)} aria-label={`工作流待办 ${workflowTodos.length} 条`}><icons.FolderInput size={17} /><span>待办 {workflowTodos.length}</span></button>
           <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="全局运行历史"><icons.Clock3 size={17} /><span>运行历史</span></button>
           {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><span><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></span><button onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
           <span className="local-status"><i />本地运行</span><button aria-label="设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
@@ -446,10 +586,15 @@ export default function App() {
         onRun={run}
         onStop={stopRunningTask}
         yoloTrainingRecommendation={yoloTrainingRecommendation}
+        workflowTodos={selected ? workflowTodos.filter((todo) => todo.targetHandlerId === selected.handlerId) : []}
+        onApplyWorkflowTodo={applyWorkflowTodo}
+        onDeleteWorkflowTodo={deleteWorkflowTodo}
+        onWorkflowComplete={completeWorkflowTarget}
       />
       <FunctionEditor item={editing} onClose={() => setEditing(null)} onSave={save} onDelete={remove} />
       <GroupDialog group={groupDraft} onClose={() => setGroupDraft(undefined)} onSave={saveGroup} />
       {historyOpen ? <RunHistoryDialog onClose={closeHistory} /> : null}
+      {workflowOpen ? <WorkflowTodoDialog items={workflowTodos} onApply={applyWorkflowTodoFromDialog} onDelete={deleteWorkflowTodo} onClose={() => setWorkflowOpen(false)} /> : null}
       {notice ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div> : null}
     </div>
   )

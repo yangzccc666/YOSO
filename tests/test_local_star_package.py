@@ -106,6 +106,10 @@ class LocalStarPackageTests(unittest.TestCase):
         self.assertEqual(self.template.read_text(encoding="utf-8"), original_template)
         self.assertEqual(list(self.tool_folder.glob(".yolo-package-*.toml")), [])
         self.assertEqual(result["labelCount"], 3)
+        self.assertEqual(result["remoteInferenceDefaults"], {
+            "modelFile": str(output),
+            "labels": ["screw", "board", "connector"],
+        })
         self.assertTrue(any("packaged factory-line-a with 3 labels" in line for line in self.messages))
 
     def test_template_render_changes_supported_values_and_preserves_comment(self) -> None:
@@ -159,6 +163,8 @@ class LocalStarPackageTests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertEqual(item["handlerId"], "model.package_star")
         self.assertEqual(item["pathFields"][0]["id"], "model_file")
+        self.assertEqual(item["name"], "本地 STAR 模型打包")
+        self.assertEqual(item["parameters"][0]["id"], "title")
         self.assertTrue(has_handler("model.package_star"))
 
     def test_existing_catalog_is_migrated_without_losing_items(self) -> None:

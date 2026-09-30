@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { choosePaths, forgetRemotePassword, getRemoteCredentialStatus, getRemoteInferenceStatus, seekRemoteInference, setRemoteInferencePaused, startRemoteInference, stopRemoteInference, testRemoteConnection } from '../api'
 import { icons } from '../icons'
+import { parseStarModels } from '../remoteStarModels'
+import type { StarModel } from '../remoteStarModels'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { ConnectionTestResult, PlatformTaskStatus, RemoteInferenceStatus, WorkingValues } from '../types'
 
@@ -9,6 +11,7 @@ type Props = {
   values: WorkingValues
   onParameterChange: (fieldId: string, value: string | number | boolean) => void
   platformTask: PlatformTaskStatus | null
+  onCompleted?: () => void
 }
 
 const terminalStates = new Set<RemoteInferenceStatus['status']>(['completed', 'stopped', 'failed'])
@@ -40,20 +43,7 @@ type ConnectionCheck = {
   error?: string
 }
 
-type StarModel = { path: string; labels: string; conf: number }
-
-function parseStarModels(value: unknown, legacyPath: string, legacyLabels: string, legacyConf: number): StarModel[] {
-  try {
-    const parsed: unknown = JSON.parse(String(value || '[]'))
-    if (Array.isArray(parsed) && parsed.length) return parsed.flatMap((item): StarModel[] =>
-      item !== null && typeof item === 'object' && typeof item.path === 'string'
-        ? [{ path: item.path, labels: typeof item.labels === 'string' ? item.labels : '', conf: Number(item.conf ?? legacyConf) }]
-        : [])
-  } catch { /* use saved single-model values */ }
-  return [{ path: legacyPath, labels: legacyLabels, conf: legacyConf }]
-}
-
-export function RemoteInferencePanel({ itemId, values, onParameterChange, platformTask }: Props) {
+export function RemoteInferencePanel({ itemId, values, onParameterChange, platformTask, onCompleted }: Props) {
   const storageKey = `processing-view:remote-session:${itemId}`
   const [sessionId, setSessionId] = useState(() => sessionStorage.getItem(storageKey) || '')
   const [session, setSession] = useState<RemoteInferenceStatus | null>(null)
@@ -71,6 +61,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const timelineHideTimer = useRef<number | undefined>(undefined)
   const timelineHolding = useRef(false)
   const checkedCredentialIdentity = useRef('')
+  const completedSession = useRef('')
 
   const clearTimelineTimer = () => {
     if (timelineHideTimer.current !== undefined) window.clearTimeout(timelineHideTimer.current)
@@ -115,6 +106,20 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const saveStarModels = (models: StarModel[]) => onParameterChange('star_models', JSON.stringify(models))
   const updateStarModel = (index: number, patch: Partial<StarModel>) => {
     saveStarModels(starModels.map((model, position) => position === index ? { ...model, ...patch } : model))
+  }
+  const removeStarModel = (index: number) => {
+    if (starModels.length <= 1) {
+      setError('远程实时 AI 推理至少需要保留一个 STAR 模型。')
+      return
+    }
+    saveStarModels(starModels.filter((_, position) => position !== index))
+    setError('')
+  }
+  const clearAllStarModels = () => {
+    const configuredConfidence = Number(values.parameters.conf ?? 0.5)
+    const confidence = Number.isFinite(configuredConfidence) ? configuredConfidence : 0.5
+    saveStarModels([{ path: '', labels: '', conf: confidence }])
+    setError('')
   }
   const browseStarModel = async (index: number) => {
     try {
@@ -178,6 +183,12 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
       if (timer !== undefined) window.clearTimeout(timer)
     }
   }, [sessionId, storageKey])
+
+  useEffect(() => {
+    if (session?.status !== 'completed' || completedSession.current === session.id) return
+    completedSession.current = session.id
+    onCompleted?.()
+  }, [onCompleted, session?.id, session?.status])
 
   useEffect(() => {
     if (!previewExpanded) return
@@ -357,14 +368,17 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
         <div className="section-title"><icons.Settings size={19} /><h2>同一视频使用多个 STAR 模型</h2></div>
         <p className="section-description">所有 STAR 模型都在这里统一配置。每个模型分别填写文件、类别名和置信度，检测框会叠加在同一视频上。多个模型会降低推理帧率；开启“保持原视频速度”后，平台会自动跳过已经落后的源帧，避免画面变成慢动作。</p>
         {starModels.map((model, index) => <div className="remote-model-card" key={index}>
-          <div className="remote-model-card-title"><strong>模型 {index + 1}</strong>{index > 0 ? <button type="button" onClick={() => saveStarModels(starModels.filter((_, position) => position !== index))}>移除</button> : <small>至少保留一个模型</small>}</div>
+          <div className="remote-model-card-title"><strong>模型 {index + 1}</strong><button type="button" onClick={() => removeStarModel(index)} title={starModels.length === 1 ? '至少需要保留一个模型' : `移除模型 ${index + 1}`}>移除</button></div>
           <label><span>模型文件</span><div className="remote-model-path"><input value={model.path} onChange={(event) => updateStarModel(index, { path: event.target.value })} placeholder="选择本机 .star / .plan / .engine 文件" /><button type="button" onClick={() => void browseStarModel(index)}>浏览</button></div></label>
           <div className="remote-model-options">
             <label><span>类别名称（英文逗号分隔）</span><input value={model.labels} onChange={(event) => updateStarModel(index, { labels: event.target.value })} placeholder="例如：person,car" /></label>
             <label><span>置信度阈值</span><input type="number" min="0" max="1" step="0.01" value={model.conf} onChange={(event) => updateStarModel(index, { conf: Number(event.target.value) })} /></label>
           </div>
         </div>)}
-        <button type="button" className="text-action" disabled={starModels.length >= 8} onClick={() => saveStarModels([...starModels, { path: '', labels: '', conf: Number(values.parameters.conf ?? 0.5) }])}><icons.Plus size={16} />添加 STAR 模型（最多 8 个）</button>
+        <div className="remote-model-actions">
+          <button type="button" className="text-action" disabled={starModels.length >= 8} onClick={() => saveStarModels([...starModels, { path: '', labels: '', conf: Number(values.parameters.conf ?? 0.5) }])}><icons.Plus size={16} />添加 STAR 模型（最多 8 个）</button>
+          <button type="button" className="text-action danger" disabled={starModels.length === 1 && !starModels[0].path.trim() && !starModels[0].labels.trim()} onClick={clearAllStarModels} title="删除全部模型配置并保留一个空白上传窗口"><icons.Trash2 size={16} />清空全部模型</button>
+        </div>
       </div>
       <div className="remote-run-actions">
         {!active ? <button className="connection-test-button" onClick={testConnection} disabled={testingConnection || submitting}>

@@ -1,8 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   choosePaths,
-  createYoloTrainingProfile,
-  deleteYoloTrainingProfile,
   deleteYoloTrainingSession,
   forgetYoloRemotePassword,
   getYoloRemoteCredentialStatus,
@@ -13,16 +11,16 @@ import {
   startYoloTraining,
   stopYoloTraining,
   testYoloRemoteConnection,
-  updateYoloTrainingProfile,
 } from '../api'
 import { icons } from '../icons'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
-import type { WorkingValues, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingRecommendation, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from '../types'
+import type { WorkingValues, YoloConnectionTestResult, YoloTrainingRecommendation, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from '../types'
 
 type Props = {
   values: WorkingValues
   onParameterChange: (fieldId: string, value: string | number | boolean) => void
   recommendation: YoloTrainingRecommendation | null
+  onCompleted?: () => void
 }
 
 type TrainingField = {
@@ -32,6 +30,8 @@ type TrainingField = {
   options?: string[]
   step?: string
   browse?: 'file' | 'directory'
+  help: string
+  range?: string
 }
 
 type ConnectionCheck = {
@@ -41,70 +41,108 @@ type ConnectionCheck = {
   error?: string
 }
 
-const fieldGroups: Array<{ title: string; description: string; fields: TrainingField[] }> = [
+const fieldGroups: Array<{ title: string; description: string; defaultOpen?: boolean; fields: TrainingField[] }> = [
   {
-    title: '基础训练配置',
-    description: '数据、模型、训练轮次、批量大小、GPU 和输出目录。',
+    title: '常用训练配置',
+    description: '最常修改的数据、模型、轮次、批量大小、尺寸、GPU 和输出位置。',
+    defaultOpen: true,
     fields: [
-      { id: 'yolo_executable', label: 'YOLO 命令或可执行文件路径' },
-      { id: 'task', label: '训练任务类型', type: 'select', options: ['detect', 'segment', 'classify', 'pose', 'obb'] },
-      { id: 'data', label: 'data.yaml 路径', browse: 'file' },
-      { id: 'model', label: '预训练模型或模型配置' },
-      { id: 'epochs', label: '训练轮次 epochs', type: 'number' },
-      { id: 'patience', label: '早停等待 patience', type: 'number' },
-      { id: 'imgsz', label: '输入尺寸 imgsz', type: 'number' },
-      { id: 'batch', label: '批量大小 batch', type: 'number', step: 'any' },
-      { id: 'nbs', label: '标称批量 nbs', type: 'number' },
-      { id: 'workers', label: '数据线程 workers', type: 'number' },
-      { id: 'device', label: '训练设备 device' },
-      { id: 'project', label: '训练输出目录 project', browse: 'directory' },
-      { id: 'run_name', label: '本次训练名称 name' },
+      { id: 'data', label: 'data.yaml 路径', browse: 'file', help: '数据集配置文件，定义 train/val/test 路径、类别数量和类别名称。' },
+      { id: 'model', label: '预训练模型 model', help: '预训练 .pt 权重或模型 YAML。使用预训练权重通常能更快收敛。' },
+      { id: 'epochs', label: '训练轮次 epochs', type: 'number', help: '完整遍历训练集的最大次数；与 patience 共同决定实际训练时长。', range: '建议 50–500，当前工业任务默认 200' },
+      { id: 'patience', label: '早停等待 patience', type: 'number', help: '验证指标连续多少轮没有改善后停止；0 表示关闭早停。', range: '≥ 0，常用 30–100' },
+      { id: 'imgsz', label: '输入尺寸 imgsz', type: 'number', help: '训练输入图像尺寸。更大有利于小目标，但显存和训练时间明显增加。', range: '通常为 32 的倍数，如 640、960、1280' },
+      { id: 'batch', label: '批量大小 batch', type: 'number', step: 'any', help: '每批图像数；-1 自动估算，0–1 可表示显存占用比例，正整数为固定批量。', range: '-1、0–1 或正整数' },
+      { id: 'device', label: '训练设备 device', help: 'GPU 编号或列表，例如 0、0,1；也可填写 cpu。多任务训练时应合理分配 GPU。' },
+      { id: 'workers', label: '数据线程 workers', type: 'number', help: '每个训练进程的数据加载线程数。过高可能占满 CPU 或共享内存。', range: '≥ 0，常用 4–16' },
+      { id: 'project', label: '训练输出目录 project', browse: 'directory', help: '训练结果的父目录；最终结果保存在 project/name 下。' },
+      { id: 'run_name', label: '本次训练名称 name', help: '本次实验子目录名。留空时平台自动生成 yolo26_日期_时间。' },
     ],
   },
   {
     title: '数据增强',
-    description: '控制拼图、混合、旋转、位移、缩放、透视和翻转。',
+    description: '先选择工业场景策略，再按需要微调；切换策略只修改本组增强参数。',
+    defaultOpen: true,
     fields: [
-      { id: 'mosaic', label: 'mosaic', type: 'number', step: '0.01' },
-      { id: 'mixup', label: 'mixup', type: 'number', step: '0.01' },
-      { id: 'copy_paste', label: 'copy_paste', type: 'number', step: '0.01' },
-      { id: 'degrees', label: '旋转角度 degrees', type: 'number', step: '0.01' },
-      { id: 'translate', label: '平移比例 translate', type: 'number', step: '0.01' },
-      { id: 'scale', label: '缩放比例 scale', type: 'number', step: '0.01' },
-      { id: 'shear', label: '剪切角度 shear', type: 'number', step: '0.01' },
-      { id: 'perspective', label: '透视 perspective', type: 'number', step: '0.0001' },
-      { id: 'fliplr', label: '水平翻转 fliplr', type: 'number', step: '0.01' },
-      { id: 'flipud', label: '垂直翻转 flipud', type: 'number', step: '0.01' },
-      { id: 'multi_scale', label: '多尺度 multi_scale', type: 'number', step: '0.01' },
+      { id: 'hsv_h', label: '色相扰动 hsv_h', type: 'number', step: '0.001', help: '按色轮比例随机改变色相，增强不同灯光颜色下的泛化能力。', range: '官方范围 0–1，默认 0.015' },
+      { id: 'hsv_s', label: '饱和度扰动 hsv_s', type: 'number', step: '0.01', help: '随机改变颜色饱和度，模拟颜色浓淡和成像差异。', range: '官方范围 0–1，默认 0.7' },
+      { id: 'hsv_v', label: '亮度扰动 hsv_v', type: 'number', step: '0.01', help: '随机改变明暗，是处理光线变化最直接的增强参数。', range: '官方范围 0–1，默认 0.4' },
+      { id: 'mosaic', label: '拼图概率 mosaic', type: 'number', step: '0.01', help: '把 4 张训练图组合为一张，可增加场景和尺度多样性，对小目标常有帮助。', range: '官方范围 0–1' },
+      { id: 'mixup', label: '图像混合概率 mixup', type: 'number', step: '0.01', help: '混合两张图及其标签，提高泛化但会引入视觉与标签噪声。', range: '官方范围 0–1' },
+      { id: 'cutmix', label: '区域混合概率 cutmix', type: 'number', step: '0.01', help: '将另一张图的局部区域贴入当前图，适合增强遮挡鲁棒性。', range: '官方范围 0–1；检测/分割/姿态/OBB 可用' },
+      { id: 'degrees', label: '旋转角度 degrees', type: 'number', step: '0.1', help: '在正负该角度内随机旋转。固定方向工位不宜设置过大。', range: '官方范围 0–180°' },
+      { id: 'translate', label: '平移比例 translate', type: 'number', step: '0.01', help: '按图像尺寸比例随机水平和垂直平移，有助于学习部分可见目标。', range: '官方范围 0–1' },
+      { id: 'scale', label: '缩放幅度 scale', type: 'number', step: '0.01', help: '随机缩放图像，模拟目标距离变化；数值越大尺度变化越强。', range: '官方常用范围 0–1' },
+      { id: 'shear', label: '剪切角度 shear', type: 'number', step: '0.1', help: '随机剪切图像。工业固定相机通常只需很小的值。', range: '官方范围 0–180°' },
+      { id: 'perspective', label: '透视变化 perspective', type: 'number', step: '0.0001', help: '增加透视形变；固定机位应谨慎使用，过大会扭曲工件。', range: '官方范围 0–0.001' },
+      { id: 'fliplr', label: '水平翻转概率 fliplr', type: 'number', step: '0.01', help: '水平翻转概率。左右方向具有业务含义时应设为 0。', range: '官方范围 0–1' },
+      { id: 'flipud', label: '垂直翻转概率 flipud', type: 'number', step: '0.01', help: '垂直翻转概率。多数固定工业相机建议保持 0。', range: '官方范围 0–1' },
+      { id: 'bgr', label: 'RGB/BGR 通道交换概率 bgr', type: 'number', step: '0.01', help: '按概率交换 RGB 与 BGR 通道；仅在颜色不具有明确业务含义时谨慎尝试。', range: '官方范围 0–1' },
+      { id: 'copy_paste', label: '复制粘贴概率 copy_paste', type: 'number', step: '0.01', help: '复制目标实例进行增强，官方主要支持分割和旋转框任务。', range: '官方范围 0–1；detect 通常保持 0' },
     ],
   },
   {
-    title: '损失与优化器',
-    description: '损失权重、学习率、预热、权重衰减和优化器。',
+    title: '训练稳定性与性能',
+    description: '学习率、优化器、精度、复现、缓存和训练后期稳定策略。',
     fields: [
-      { id: 'cls', label: '分类损失 cls', type: 'number', step: '0.01' },
-      { id: 'box', label: '框损失 box', type: 'number', step: '0.01' },
-      { id: 'dfl', label: 'DFL 损失 dfl', type: 'number', step: '0.01' },
-      { id: 'cos_lr', label: '余弦学习率 cos_lr', type: 'boolean' },
-      { id: 'lr0', label: '初始学习率 lr0', type: 'number', step: '0.0001' },
-      { id: 'lrf', label: '最终学习率比例 lrf', type: 'number', step: '0.001' },
-      { id: 'warmup_epochs', label: '预热轮次 warmup_epochs', type: 'number', step: '0.1' },
-      { id: 'weight_decay', label: '权重衰减 weight_decay', type: 'number', step: '0.0001' },
-      { id: 'optimizer', label: '优化器 optimizer' },
+      { id: 'optimizer', label: '优化器 optimizer', type: 'select', options: ['SGD', 'Adam', 'AdamW', 'NAdam', 'RAdam', 'RMSProp', 'auto'], help: '选择权重更新算法；auto 让 Ultralytics 根据训练配置选择。' },
+      { id: 'lr0', label: '初始学习率 lr0', type: 'number', step: '0.0001', help: '训练开始时的学习率。过大会震荡，过小会收敛缓慢。', range: '通常 SGD 约 0.01，Adam 类约 0.001' },
+      { id: 'lrf', label: '最终学习率比例 lrf', type: 'number', step: '0.001', help: '最终学习率相对于 lr0 的比例。', range: '0–1' },
+      { id: 'momentum', label: '动量 momentum', type: 'number', step: '0.001', help: 'SGD 动量或 Adam beta1，帮助平滑梯度并加速收敛。', range: '0–1，官方默认 0.937' },
+      { id: 'weight_decay', label: '权重衰减 weight_decay', type: 'number', step: '0.0001', help: 'L2 正则强度，用于抑制过拟合。', range: '≥ 0，官方默认 0.0005' },
+      { id: 'cos_lr', label: '余弦学习率 cos_lr', type: 'boolean', help: '使用余弦曲线逐步降低学习率，通常适合较长训练。' },
+      { id: 'warmup_epochs', label: '预热轮次 warmup_epochs', type: 'number', step: '0.1', help: '训练开始时逐步提高学习率，降低初期不稳定。', range: '≥ 0，官方默认 3' },
+      { id: 'warmup_momentum', label: '预热初始动量 warmup_momentum', type: 'number', step: '0.01', help: '预热阶段起始动量，随后过渡到 momentum。', range: '0–1，官方默认 0.8' },
+      { id: 'warmup_bias_lr', label: '偏置预热学习率 warmup_bias_lr', type: 'number', step: '0.01', help: '预热阶段偏置参数的初始学习率。', range: '0–1，官方默认 0.1' },
+      { id: 'amp', label: '混合精度 amp', type: 'boolean', help: 'CUDA 上使用 FP16 混合精度，通常能降低显存并加速训练。发生数值异常时可关闭。' },
+      { id: 'close_mosaic', label: '最后关闭 Mosaic 轮次 close_mosaic', type: 'number', help: '最后 N 轮关闭 Mosaic，使训练末期回到自然图像分布并稳定收敛。', range: '≥ 0，官方默认 10；0 表示不关闭' },
+      { id: 'cache', label: '图像缓存 cache', type: 'select', options: ['False', 'ram', 'disk'], help: '缓存训练图像以减少读取开销。ram 最快但占内存，disk 较省内存但占磁盘。' },
+      { id: 'rect', label: '矩形训练 rect', type: 'boolean', help: '按相近宽高比分批以减少填充；可能影响随机打乱和部分增强方式。' },
+      { id: 'multi_scale', label: '多尺度训练 multi_scale', type: 'number', step: '0.01', help: '训练时随机改变 imgsz 的幅度，提高对不同输入尺度的适应性。', range: '0–1，0 表示关闭' },
+      { id: 'seed', label: '随机种子 seed', type: 'number', help: '控制数据打乱和随机增强，配合 deterministic 提高复现性。', range: '≥ 0' },
+      { id: 'deterministic', label: '确定性训练 deterministic', type: 'boolean', help: '尽量使用确定性算法，便于复现实验；可能略微降低速度。' },
+      { id: 'save_period', label: '定期保存 save_period', type: 'number', help: '每隔 N 轮额外保存检查点；-1 表示只采用默认保存策略。', range: '-1 或正整数' },
+      { id: 'plots', label: '生成训练图表 plots', type: 'boolean', help: '生成损失曲线、PR 曲线和样本预测等可视化结果。' },
+    ],
+  },
+  {
+    title: '高级配置与损失权重',
+    description: '一般保持默认，只有明确实验依据时再调整。',
+    fields: [
+      { id: 'task', label: '训练任务类型 task', type: 'select', options: ['detect', 'segment', 'classify', 'pose', 'obb'], help: 'Ultralytics 任务类型；当前数据集划分主要面向 detect。' },
+      { id: 'yolo_executable', label: 'YOLO 命令或可执行文件路径', help: '本地/远程 yolo 可执行文件。填写 yolo 时，远程会自动查找匹配模型系列的 Conda 环境。' },
+      { id: 'nbs', label: '标称批量 nbs', type: 'number', help: '用于按实际 batch 缩放部分超参数的名义批量大小。', range: '> 0，官方常用默认 64' },
+      { id: 'cls', label: '分类损失权重 cls', type: 'number', step: '0.01', help: '类别预测损失的权重。类别混淆严重时可实验性调整。', range: '≥ 0' },
+      { id: 'box', label: '边框损失权重 box', type: 'number', step: '0.01', help: '边界框回归损失权重，影响定位精度。', range: '≥ 0' },
+      { id: 'dfl', label: 'DFL 损失权重 dfl', type: 'number', step: '0.01', help: '分布焦点损失权重，参与更精细的边框定位。', range: '≥ 0' },
     ],
   },
 ]
 
+const augmentationFields = ['hsv_h', 'hsv_s', 'hsv_v', 'mosaic', 'mixup', 'cutmix', 'degrees', 'translate', 'scale', 'shear', 'perspective', 'fliplr', 'flipud', 'bgr', 'copy_paste'] as const
+type AugmentationField = typeof augmentationFields[number]
+type AugmentationPreset = { name: string; description: string; values: Record<AugmentationField, number> }
+
+const augmentationPresets: AugmentationPreset[] = [
+  { name: '工业保守（推荐）', description: '固定相机、方向明确的常规工位，避免制造不符合现场规律的样本。', values: { hsv_h: 0.01, hsv_s: 0.35, hsv_v: 0.3, mosaic: 0.2, mixup: 0, cutmix: 0, degrees: 3, translate: 0.06, scale: 0.25, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
+  { name: '光线变化', description: '跨白天、夜间、曝光和灯光颜色变化，增强 HSV 并保持几何变化适中。', values: { hsv_h: 0.025, hsv_s: 0.65, hsv_v: 0.55, mosaic: 0.2, mixup: 0, cutmix: 0, degrees: 3, translate: 0.06, scale: 0.25, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
+  { name: '小目标加强', description: '目标在画面中占比较小，使用更强的 Mosaic、缩放和平移增加尺度与位置变化。', values: { hsv_h: 0.015, hsv_s: 0.5, hsv_v: 0.4, mosaic: 1, mixup: 0.05, cutmix: 0, degrees: 5, translate: 0.12, scale: 0.5, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
+  { name: '遮挡与复杂背景', description: '人员、工具或工件容易互相遮挡，增加 Mosaic、MixUp 和 CutMix。', values: { hsv_h: 0.015, hsv_s: 0.5, hsv_v: 0.4, mosaic: 0.7, mixup: 0.1, cutmix: 0.15, degrees: 5, translate: 0.1, scale: 0.4, shear: 1, perspective: 0.0002, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
+  { name: 'Ultralytics 官方默认', description: '恢复官方通用增强默认值；水平翻转可能不适合方向固定的工业场景。', values: { hsv_h: 0.015, hsv_s: 0.7, hsv_v: 0.4, mosaic: 1, mixup: 0, cutmix: 0, degrees: 0, translate: 0.1, scale: 0.5, shear: 0, perspective: 0, fliplr: 0.5, flipud: 0, bgr: 0, copy_paste: 0 } },
+  { name: '关闭可配置增强', description: '将界面可控制的增强参数全部设为 0；Ultralytics 安装 Albumentations 时仍可能有内置轻量增强。', values: Object.fromEntries(augmentationFields.map((field) => [field, 0])) as Record<AugmentationField, number> },
+]
+
 const terminalStates = new Set<YoloTrainingSession['status']>(['completed', 'stopped', 'failed'])
 
-export function YoloTrainingPanel({ values, onParameterChange, recommendation }: Props) {
-  const [profiles, setProfiles] = useState<YoloTrainingProfile[]>([])
-  const [selectedProfileId, setSelectedProfileId] = useState('')
-  const [profileName, setProfileName] = useState('')
-  const [profileDescription, setProfileDescription] = useState('')
+function automaticTrainingRunName(date = new Date()): string {
+  const twoDigits = (value: number) => String(value).padStart(2, '0')
+  return `yolo26_${twoDigits(date.getMonth() + 1)}${twoDigits(date.getDate())}_${twoDigits(date.getHours())}${twoDigits(date.getMinutes())}`
+}
+
+export function YoloTrainingPanel({ values, onParameterChange, recommendation, onCompleted }: Props) {
   const [trainingValues, setTrainingValues] = useState<YoloTrainingValues>({})
   const [profilesLoading, setProfilesLoading] = useState(true)
-  const [savingProfile, setSavingProfile] = useState(false)
+  const [augmentationPreset, setAugmentationPreset] = useState('自定义（当前参数）')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [connectionCheck, setConnectionCheck] = useState<ConnectionCheck | null>(null)
@@ -115,6 +153,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
   const [submitting, setSubmitting] = useState(false)
   const checkedCredentialIdentity = useRef('')
   const appliedRecommendation = useRef('')
+  const completedSession = useRef('')
 
   const host = String(values.parameters.remote_host || '').trim()
   const port = Number(values.parameters.remote_port || 22)
@@ -145,22 +184,11 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
     return () => { cancelled = true; window.clearInterval(timer) }
   }, [])
 
-  const applyProfile = (profile: YoloTrainingProfile) => {
-    setSelectedProfileId(profile.id)
-    setProfileName(profile.name)
-    setProfileDescription(profile.description)
-    setTrainingValues({ ...profile.values })
-    setNotice(`已加载训练场景“${profile.name}”。`)
-    setError('')
-  }
-
   useEffect(() => {
     getYoloTrainingProfiles().then((payload) => {
-      setProfiles(payload.profiles)
-      if (payload.profiles[0]) applyProfile(payload.profiles[0])
-      else setTrainingValues(payload.defaults)
+      setTrainingValues(payload.profiles[0] ? { ...payload.profiles[0].values } : payload.defaults)
     }).catch((loadError) => {
-      setError(loadError instanceof Error ? loadError.message : '训练场景加载失败')
+      setError(loadError instanceof Error ? loadError.message : '训练参数加载失败')
     }).finally(() => setProfilesLoading(false))
   }, [])
 
@@ -171,9 +199,9 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
       ...current,
       data: recommendation.data,
       project: recommendation.project,
-      ...(recommendation.runName ? { run_name: recommendation.runName } : {}),
+      run_name: '',
     }))
-    setNotice('已自动填入刚刚划分的数据集路径、训练输出目录和本次训练名称。')
+    setNotice('已自动填入刚刚划分的数据集路径和训练输出目录；训练名称将在启动时自动生成。')
     setError('')
   }, [profilesLoading, recommendation])
 
@@ -228,9 +256,25 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
     }
   }, [sessionId])
 
+  useEffect(() => {
+    if (session?.status !== 'completed' || completedSession.current === session.id) return
+    completedSession.current = session.id
+    onCompleted?.()
+  }, [onCompleted, session?.id, session?.status])
+
   const changeTrainingValue = (fieldId: string, value: string | number | boolean) => {
     setTrainingValues((current) => ({ ...current, [fieldId]: value }))
+    if (augmentationFields.includes(fieldId as AugmentationField)) setAugmentationPreset('自定义（当前参数）')
     setNotice('')
+  }
+
+  const applyAugmentationPreset = (name: string) => {
+    setAugmentationPreset(name)
+    const preset = augmentationPresets.find((item) => item.name === name)
+    if (!preset) return
+    setTrainingValues((current) => ({ ...current, ...preset.values }))
+    setNotice(`已应用数据增强策略“${preset.name}”，仍可继续微调下方参数。`)
+    setError('')
   }
 
   const browseTrainingPath = async (field: TrainingField) => {
@@ -240,67 +284,6 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
       if (paths[0]) changeTrainingValue(field.id, paths[0])
     } catch (browseError) {
       setError(browseError instanceof Error ? browseError.message : '无法打开选择窗口')
-    }
-  }
-
-  const selectProfile = (profileId: string) => {
-    const profile = profiles.find((item) => item.id === profileId)
-    if (profile) applyProfile(profile)
-  }
-
-  const createProfile = async () => {
-    setSavingProfile(true)
-    setError('')
-    try {
-      const created = await createYoloTrainingProfile({ name: profileName, description: profileDescription, values: trainingValues })
-      setProfiles((current) => [...current, created])
-      setSelectedProfileId(created.id)
-      setNotice(`训练场景“${created.name}”已保存。`)
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '训练场景保存失败')
-    } finally {
-      setSavingProfile(false)
-    }
-  }
-
-  const updateProfile = async () => {
-    if (!selectedProfileId) {
-      setError('请先选择场景，或点击“另存为新场景”。')
-      return
-    }
-    setSavingProfile(true)
-    setError('')
-    try {
-      const updated = await updateYoloTrainingProfile(selectedProfileId, { name: profileName, description: profileDescription, values: trainingValues })
-      setProfiles((current) => current.map((item) => item.id === updated.id ? updated : item))
-      setNotice(`训练场景“${updated.name}”已更新。`)
-    } catch (saveError) {
-      setError(saveError instanceof Error ? saveError.message : '训练场景更新失败')
-    } finally {
-      setSavingProfile(false)
-    }
-  }
-
-  const deleteProfile = async () => {
-    if (!selectedProfileId) return
-    if (!window.confirm(`确定删除训练场景“${profileName}”吗？`)) return
-    setSavingProfile(true)
-    setError('')
-    try {
-      await deleteYoloTrainingProfile(selectedProfileId)
-      const remaining = profiles.filter((item) => item.id !== selectedProfileId)
-      setProfiles(remaining)
-      if (remaining[0]) applyProfile(remaining[0])
-      else {
-        setSelectedProfileId('')
-        setProfileName('')
-        setProfileDescription('')
-      }
-      setNotice('训练场景已删除。')
-    } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : '训练场景删除失败')
-    } finally {
-      setSavingProfile(false)
     }
   }
 
@@ -348,8 +331,11 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
     setSubmitting(true)
     setError('')
     try {
+      const runName = String(trainingValues.run_name || '').trim() || automaticTrainingRunName()
+      const preparedTrainingValues = { ...trainingValues, run_name: runName }
+      setTrainingValues(preparedTrainingValues)
       const parameters: YoloTrainingValues = {
-        ...trainingValues,
+        ...preparedTrainingValues,
         remote_host: host,
         remote_port: port,
         remote_username: username,
@@ -365,7 +351,8 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
       setSessionId(next.id)
       const summary: YoloTrainingSummary = {
         id: next.id, remote: next.remote, model: next.model, device: next.device,
-        output: next.output, host: next.host, status: next.status, message: next.message,
+        output: next.output, host: next.host, port: next.port, username: next.username,
+        status: next.status, message: next.message,
         startedAt: next.startedAt, finishedAt: next.finishedAt, error: next.error, result: next.result,
       }
       setSessions((current) => [summary, ...current.filter((item) => item.id !== next.id)])
@@ -413,12 +400,12 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
   }
 
   const reconnect = async () => {
-    if (!sessionId) return
+    if (!sessionId || !session) return
     setSubmitting(true)
     setError('')
     try {
       setSession(await reconnectYoloTraining(sessionId, {
-        remote_host: host, remote_port: port, remote_username: username,
+        remote_host: session.host, remote_port: session.port, remote_username: session.username,
         remote_password: password, remember_password: rememberPassword,
       }))
     } catch (cause) {
@@ -456,25 +443,14 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
 
   return (
     <div className="yolo-training-workspace">
-      <section className="workspace-section training-profile-section">
-        <div className="section-title"><icons.Settings size={21} /><h2>训练场景</h2></div>
-        <p className="section-description">保存一整套训练参数，并用容易理解的场景名称复用，例如“光线变化”“小目标加强”或“快速验证”。SSH 密码不会保存在场景中。</p>
-        <div className="training-profile-grid">
-          <label><span>已保存场景</span><select value={selectedProfileId} onChange={(event) => selectProfile(event.target.value)} disabled={profilesLoading}><option value="">请选择训练场景</option>{profiles.map((profile) => <option value={profile.id} key={profile.id}>{profile.name}</option>)}</select></label>
-          <label><span>场景名称</span><input value={profileName} onChange={(event) => setProfileName(event.target.value)} placeholder="例如：光线变化" /></label>
-          <label className="profile-description"><span>适用场景说明</span><textarea value={profileDescription} onChange={(event) => setProfileDescription(event.target.value)} placeholder="说明这组参数适合什么数据、目标或训练阶段" /></label>
-        </div>
-        <div className="profile-actions">
-          <button onClick={createProfile} disabled={savingProfile || profilesLoading}><icons.Plus size={16} />另存为新场景</button>
-          <button onClick={updateProfile} disabled={savingProfile || !selectedProfileId}>更新当前场景</button>
-          <button className="danger-action" onClick={deleteProfile} disabled={savingProfile || !selectedProfileId}>删除场景</button>
-        </div>
-        {notice ? <div className="credential-notice" role="status"><icons.Check size={18} /><span>{notice}</span></div> : null}
-      </section>
-
-      {fieldGroups.map((group, index) => <details className="training-parameter-group" open={index === 0} key={group.title}>
+      {notice ? <div className="credential-notice training-parameter-notice" role="status"><icons.Check size={18} /><span>{notice}</span></div> : null}
+      {fieldGroups.map((group) => <details className="training-parameter-group" open={group.defaultOpen} key={group.title}>
         <summary><span><strong>{group.title}</strong><small>{group.description}</small></span><icons.ChevronRight size={18} /></summary>
-        <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{group.fields.map((field) => <label className="parameter-row" key={field.id}><span>{field.label}</span>{renderTrainingField(field)}</label>)}</div>
+        {group.title === '数据增强' ? <div className="augmentation-preset-panel">
+          <label><span>数据增强策略</span><span className="workspace-select"><select value={augmentationPreset} onChange={(event) => applyAugmentationPreset(event.target.value)}><option value="自定义（当前参数）">自定义（当前参数）</option>{augmentationPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}</select><icons.ChevronDown size={16} /></span></label>
+          <p>{augmentationPresets.find((preset) => preset.name === augmentationPreset)?.description || '当前参数经过手动调整；可继续修改，或重新选择一个预设策略。'}</p>
+        </div> : null}
+        <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{group.fields.map((field) => <div className="parameter-row" key={field.id}><span className="parameter-label"><span>{field.label}</span><button type="button" className="parameter-help" aria-label={`查看 ${field.label} 说明`} data-tooltip={`${field.help}${field.range ? `\n范围：${field.range}` : ''}`}><icons.CircleHelp size={15} /></button></span>{renderTrainingField(field)}</div>)}</div>
       </details>)}
 
       <section className="workspace-section training-connection-section">
@@ -507,11 +483,13 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation }:
             <icons.Play size={18} fill="currentColor" />
             {submitting ? '请稍候…' : remoteRequested ? '再开一个远程训练' : '再开一个本地训练'}
           </button>
-          {session?.status === 'disconnected' ? <button onClick={reconnect} disabled={submitting || !host || !username}>重新连接远端训练</button> : null}
+          {session?.status === 'disconnected' ? <button onClick={reconnect} disabled={submitting}>重新连接远端训练</button> : null}
           {activeSession && session?.status !== 'disconnected' ? <button className="stop-run-button" onClick={stop} disabled={submitting || session?.status === 'stopping'}><icons.X size={17} />终止选中任务</button> : null}
           {session && terminalStates.has(session.status) ? <button className="stop-run-button" onClick={deleteSelectedSession} disabled={submitting}><icons.X size={17} />删除选中任务记录</button> : null}
           <span className={`remote-status ${session?.status || (connectionReady ? 'connected' : 'idle')}`}><i />{statusLabel}</span>
-          <small>远程训练在独立 tmux 会话中运行；关闭平台不会终止，重开后可重新连接查看日志。本地训练仍随平台关闭而停止。</small>
+          <small>{session?.status === 'disconnected'
+            ? `将使用任务保存的连接信息 ${session.username}@${session.host}:${session.port}；若密码未保存，请先在上方 SSH 密码框输入。`
+            : '远程训练在独立 tmux 会话中运行；关闭平台不会终止，重开后可重新连接查看日志。本地训练仍随平台关闭而停止。'}</small>
         </div>
         {connectionError || error || session?.error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{connectionError || error || session?.error}</span></div> : null}
         <details className="run-output" open>
