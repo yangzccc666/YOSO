@@ -1,0 +1,128 @@
+name: Build desktop release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            asset: linux-x86_64
+            archive: tar
+          - os: windows-2022
+            asset: windows-x86_64
+            archive: zip
+          - os: macos-15-intel
+            asset: macos-x86_64
+            archive: mac
+          - os: macos-15
+            asset: macos-arm64
+            archive: mac
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: v26.1.0
+      ASSET_NAME: YOLO-Data-Platform-v26.1.0-${{ matrix.asset }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install packaging dependencies
+        run: python -m pip install --upgrade -r requirements-build.txt
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py"
+
+      - name: Build desktop application
+        run: python -m PyInstaller --noconfirm --clean packaging/yolo_data_platform.spec
+
+      - name: Smoke-test package on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: QT_QPA_PLATFORM=offscreen ./dist/YOLO-Data-Platform/YOLO-Data-Platform --check
+
+      - name: Smoke-test package on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./dist/YOLO-Data-Platform/YOLO-Data-Platform.exe --check
+
+      - name: Smoke-test package on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: ./dist/YOLO-Data-Platform.app/Contents/MacOS/YOLO-Data-Platform --check
+
+      - name: Create Linux archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: tar -C dist -czf "${ASSET_NAME}.tar.gz" YOLO-Data-Platform
+
+      - name: Create Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path dist/YOLO-Data-Platform -DestinationPath "${env:ASSET_NAME}.zip"
+
+      - name: Create macOS archive
+        if: matrix.archive == 'mac'
+        shell: bash
+        run: ditto -c -k --sequesterRsrc --keepParent dist/YOLO-Data-Platform.app "${ASSET_NAME}.zip"
+
+      - name: Upload packaged application
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: YOLO-Data-Platform-v26.1.0-${{ matrix.asset }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged applications
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: >-
+          gh release create "${GITHUB_REF_NAME}"
+          release-assets/*
+          --repo "${GITHUB_REPOSITORY}"
+          --title "YOLO数据处理平台 ${GITHUB_REF_NAME}"
+          --generate-notes
+          --verify-tag

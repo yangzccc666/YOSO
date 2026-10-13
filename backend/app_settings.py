@@ -11,6 +11,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from .platform_paths import platform_config_dir
+
 
 APP_DEFINITIONS: dict[str, dict[str, str]] = {
     "xanylabeling": {
@@ -25,15 +27,6 @@ APP_DEFINITIONS: dict[str, dict[str, str]] = {
     },
 }
 _ALLOWED_FIELDS = {"executable", "workingDirectory", "arguments", "condaEnvironment", "condaExecutable"}
-
-
-def platform_config_dir() -> Path:
-    override = os.environ.get("PROCESSING_VIEW_CONFIG_DIR", "").strip()
-    if override:
-        return Path(os.path.expandvars(override)).expanduser()
-    xdg = os.environ.get("XDG_CONFIG_HOME", "").strip()
-    root = Path(xdg).expanduser() if xdg else Path.home() / ".config"
-    return root / "yolo-data-platform"
 
 
 def _expand_path(value: str) -> Path:

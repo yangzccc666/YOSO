@@ -12,7 +12,8 @@ import webbrowser
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parent
+FROZEN = bool(getattr(sys, "frozen", False))
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 FRONTEND = ROOT / "frontend"
 DIST = FRONTEND / "dist"
 
@@ -20,6 +21,8 @@ DIST = FRONTEND / "dist"
 def build_frontend() -> None:
     if (DIST / "index.html").exists():
         return
+    if FROZEN:
+        raise RuntimeError("安装包缺少已构建的前端资源，请重新下载完整发行包。")
 
     npm = shutil.which("npm")
     if not npm:
@@ -52,6 +55,14 @@ def run_web() -> None:
 def main() -> None:
     os.chdir(ROOT)
     build_frontend()
+    if "--check" in sys.argv[1:]:
+        from backend.server import workspace_payload
+
+        functions = workspace_payload().get("functions", [])
+        if not functions:
+            raise RuntimeError("安装包未能加载功能目录。")
+        print(f"YOLO数据处理平台安装包检查通过：{len(functions)} 个功能。")
+        return
     if "--web" in sys.argv[1:]:
         run_web()
         return

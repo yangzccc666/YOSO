@@ -11,15 +11,15 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from .platform_paths import platform_config_dir
+
 
 class CredentialStore:
     """Encrypt credentials at rest and restrict the vault to the current user."""
 
     def __init__(self, directory: Path | None = None) -> None:
         if directory is None:
-            config_value = os.environ.get("XDG_CONFIG_HOME", "").strip()
-            config_root = Path(config_value).expanduser() if config_value else Path.home() / ".config"
-            directory = config_root / "yolo-data-platform"
+            directory = platform_config_dir()
         self.directory = directory
         self.key_file = directory / "credentials.key"
         self.data_file = directory / "ssh_credentials.json"

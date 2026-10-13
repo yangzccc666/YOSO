@@ -25,6 +25,7 @@ from .remote_yolo_dataset import (
     resolve_tested_yolo_connection,
 )
 from .task_manager import TaskCancelled
+from .platform_paths import platform_data_dir
 
 
 DEFAULT_TRAINING_VALUES: dict[str, Any] = {
@@ -690,7 +691,7 @@ class TrainingManager:
     def __init__(self, storage_file: Path | None = None) -> None:
         self._sessions: dict[str, TrainingSession] = {}
         self._lock = threading.RLock()
-        self._storage = storage_file or Path(__file__).resolve().parents[1] / "runtime" / "remote_training_sessions.json"
+        self._storage = storage_file or platform_data_dir() / "remote_training_sessions.json"
         self._load()
 
     def _save(self) -> None:

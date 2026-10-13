@@ -20,6 +20,7 @@ from .handlers import RunContext, execute, has_handler
 from .remote_inference import manager as remote_inference_manager
 from .local_pt_inference import manager as local_pt_inference_manager
 from .local_star_package import detect_plan_labels
+from .platform_paths import platform_data_dir
 from .run_history import RunHistoryStore
 from .remote_yolo_dataset import (
     forget_remote_yolo_password,
@@ -49,10 +50,11 @@ from . import negative_samples as _negative_samples  # noqa: F401
 
 
 ROOT = Path(__file__).resolve().parents[1]
-catalog = FunctionCatalog(ROOT / "runtime" / "functions.json")
-group_catalog = GroupCatalog(ROOT / "runtime" / "groups.json")
-training_profile_store = TrainingProfileStore(ROOT / "runtime" / "training_profiles.json")
-run_history = RunHistoryStore(ROOT / "runtime" / "run_history.json")
+DATA_DIR = platform_data_dir()
+catalog = FunctionCatalog(DATA_DIR / "functions.json")
+group_catalog = GroupCatalog(DATA_DIR / "groups.json")
+training_profile_store = TrainingProfileStore(DATA_DIR / "training_profiles.json")
+run_history = RunHistoryStore(DATA_DIR / "run_history.json")
 _path_chooser: Callable[[str], list[str]] | None = None
 _system_notifier: Callable[[str, str], None] | None = None
 

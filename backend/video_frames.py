@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import inspect
 import io
 import re
 from datetime import datetime
-from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -18,19 +16,9 @@ from .video_clip import parse_time
 
 
 HANDLER_ID = "video.extract_frames"
-SOURCE_SCRIPT = Path(__file__).resolve().parents[2] / "tools" / "data_processing_toolkit" / "02-video_processing" / "batch_vedio2img.py"
-
-
-@lru_cache(maxsize=1)
 def _load_source_module() -> ModuleType:
-    if not SOURCE_SCRIPT.exists():
-        raise FileNotFoundError(f"找不到视频切图脚本：{SOURCE_SCRIPT}")
-    spec = importlib.util.spec_from_file_location("processing_view_batch_video2img", SOURCE_SCRIPT)
-    if not spec or not spec.loader:
-        raise RuntimeError("无法加载视频切图脚本。")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    from . import bundled_video_frames
+    return bundled_video_frames
 
 
 def _positive_number(value: Any, label: str, default: float) -> float:

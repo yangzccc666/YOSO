@@ -10,3 +10,5 @@ venv/
 credentials.key
 ssh_credentials.json
 .DS_Store
+/build/
+/dist/

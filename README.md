@@ -4,6 +4,12 @@
 
 ## 快速启动
 
+### 下载桌面版
+
+GitHub Releases 会提供 Windows x86_64、Linux x86_64、macOS Intel 和 macOS Apple Silicon 四种安装包。下载与当前系统匹配的压缩包，解压后直接运行 `YOLO-Data-Platform`（macOS 为 `YOLO-Data-Platform.app`），无需另外安装 Python、Node.js 或项目依赖。
+
+首次发布版本为 `v26.1.0`。未签名的 Windows/macOS 程序可能触发系统安全提示；确认下载来源为本项目 Release 后，可在系统安全设置中允许本次运行。
+
 ### 通用启动方式
 
 ```bash
@@ -30,7 +36,7 @@ Linux/X11 下如果系统使用 Fcitx 或搜狗输入法，而 PySide6 未附带
 
 ### 本机设置与换电脑运行
 
-顶部右侧齿轮打开“本机设置”，可为 X-AnyLabeling、Antigravity 等外部工具分别配置启动程序、工作目录、启动参数、Conda 环境和 Conda 路径。设置默认保存在当前用户的 `~/.config/yolo-data-platform/settings.json`，不写入 Git 项目，每台电脑只需配置一次。
+顶部右侧齿轮打开“本机设置”，可为 X-AnyLabeling、Antigravity 等外部工具分别配置启动程序、工作目录、启动参数、Conda 环境和 Conda 路径。设置保存在当前系统的用户配置目录（Windows 为 `%APPDATA%/YOLODataPlatform`，macOS 为 `~/Library/Application Support/YOLODataPlatform`，Linux 为 `$XDG_CONFIG_HOME/yolo-data-platform` 或 `~/.config/yolo-data-platform`），不写入 Git 项目，每台电脑只需配置一次。
 
 可使用 `PROCESSING_VIEW_CONFIG_DIR` 指定其他本机配置目录；本地 STAR 打包也可通过 `PROCESSING_VIEW_PACKAGE_TOOL` 和 `PROCESSING_VIEW_TRT_TEMPLATE` 提供机器级默认路径。SSH 密码与历史连接同样保存在当前用户配置中，不随代码仓库同步。
 
