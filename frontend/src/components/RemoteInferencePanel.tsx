@@ -185,10 +185,15 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   }, [sessionId, storageKey])
 
   useEffect(() => {
-    if (session?.status !== 'completed' || completedSession.current === session.id) return
+    if (!session || completedSession.current === session.id) return
+    const inferenceWasExercised = session.frameCount > 0
+    const workflowRunSucceeded = session.status === 'completed'
+      || (inferenceWasExercised && session.atEnd)
+      || (inferenceWasExercised && session.status === 'stopped')
+    if (!workflowRunSucceeded) return
     completedSession.current = session.id
     onCompleted?.()
-  }, [onCompleted, session?.id, session?.status])
+  }, [onCompleted, session?.atEnd, session?.frameCount, session?.id, session?.status])
 
   useEffect(() => {
     if (!previewExpanded) return

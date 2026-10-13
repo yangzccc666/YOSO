@@ -12,6 +12,14 @@ from backend.task_manager import PlatformTaskManager
 
 
 class RunHistoryTests(unittest.TestCase):
+    def test_legacy_training_history_moves_to_standalone_training_function(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run_history.json"
+            path.write_text('[{"id":"old","functionId":"yolo_dataset_split","name":"YOLO 训练 · old","kind":"remote","status":"completed","startedAt":"","finishedAt":""}]', encoding="utf-8")
+            records = RunHistoryStore(path).list("yolo_model_training")
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["functionId"], "yolo_model_training")
+
     def test_active_training_history_is_exposed_without_entering_finished_store(self) -> None:
         session = {
             "id": "training-1", "remote": True, "model": "/models/yolo26n.pt",
@@ -30,7 +38,7 @@ class RunHistoryTests(unittest.TestCase):
 
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], "running")
-        self.assertEqual(records[0]["functionId"], "yolo_dataset_split")
+        self.assertEqual(records[0]["functionId"], "yolo_model_training")
         self.assertEqual(records[0]["logs"], ["Epoch 3/200"])
         self.assertEqual(records[0]["finishedAt"], "")
         self.assertIn("yolo26_0922_1200", records[0]["name"])
@@ -121,6 +129,25 @@ class RunHistoryTests(unittest.TestCase):
             self.assertEqual(record["logs"], ["Epoch 1/2"])
             self.assertEqual(record["status"], "completed")
             self.assertEqual(notifications, [("YOLO 模型训练 已完成", "训练完成")])
+
+    def test_manual_stop_never_shows_completion_notification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunHistoryStore(Path(directory) / "run_history.json")
+            manager = PlatformTaskManager()
+            task = manager.start("video_frames", "视频抽帧", "local")
+            manager.stop(task.id)
+            notifications: list[tuple[str, str]] = []
+            server.set_system_notifier(lambda title, message: notifications.append((title, message)))
+            try:
+                with patch.object(server, "run_history", store):
+                    # Simulate the process finishing successfully just after the
+                    # stop click. It must not be presented as an automatic finish.
+                    server.record_finished_run(task, status="completed", message="处理完成")
+                    server.record_finished_run(task, status="stopped", message="用户已终止")
+                    server.record_finished_run(task, status="failed", message="处理失败")
+            finally:
+                server.set_system_notifier(None)
+            self.assertEqual(notifications, [])
 
 
 if __name__ == "__main__":

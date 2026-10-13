@@ -22,8 +22,8 @@ from .task_manager import TaskCancelled
 
 
 HANDLER_ID = "model.package_star"
-DEFAULT_TOOL = Path("/mnt/disk2/code/gen_package/package_tool")
-DEFAULT_TEMPLATE = Path("/mnt/disk2/code/gen_package/trt.toml")
+DEFAULT_TOOL = os.environ.get("PROCESSING_VIEW_PACKAGE_TOOL", "").strip()
+DEFAULT_TEMPLATE = os.environ.get("PROCESSING_VIEW_TRT_TEMPLATE", "").strip()
 SAFE_TITLE = re.compile(r"^[^/\\\x00\r\n]+$")
 LABEL_SEPARATOR = re.compile(r"[,\uff0c\r\n]+")
 PRECISIONS = {"INT4 (0)": 0, "INT8 (1)": 1, "FP8 (2)": 2, "FP16 (3)": 3, "FP32 (4)": 4}
@@ -260,12 +260,18 @@ def _configuration(context: RunContext) -> dict[str, Any]:
     plan = context.paths.get("model_file")
     if not plan or plan.suffix.lower() != ".plan" or not plan.is_file():
         raise ValueError("请选择存在的本地 .plan 模型文件。")
-    tool = Path(str(context.parameters.get("package_tool_path") or DEFAULT_TOOL)).expanduser()
+    tool_value = str(context.parameters.get("package_tool_path") or DEFAULT_TOOL).strip()
+    if not tool_value:
+        raise ValueError("请填写当前电脑的 package_tool 路径。")
+    tool = Path(os.path.expandvars(tool_value)).expanduser()
     if not tool.is_file():
         raise ValueError(f"\u6253\u5305\u5de5\u5177\u4e0d\u5b58\u5728\uff1a{tool}")
     if not os.access(tool, os.X_OK):
         raise ValueError(f"\u6253\u5305\u5de5\u5177\u4e0d\u53ef\u6267\u884c\uff1a{tool}\u3002\u8bf7\u5148\u6dfb\u52a0\u6267\u884c\u6743\u9650\u3002")
-    template = Path(str(context.parameters.get("template_file") or DEFAULT_TEMPLATE)).expanduser()
+    template_value = str(context.parameters.get("template_file") or DEFAULT_TEMPLATE).strip()
+    if not template_value:
+        raise ValueError("请填写当前电脑的 trt.toml 模板路径。")
+    template = Path(os.path.expandvars(template_value)).expanduser()
     if not template.is_file() or template.suffix.lower() != ".toml":
         raise ValueError(f"TOML \u6a21\u677f\u4e0d\u5b58\u5728\u6216\u683c\u5f0f\u4e0d\u6b63\u786e\uff1a{template}")
     try:

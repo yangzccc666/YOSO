@@ -16,7 +16,7 @@ export function WorkflowTodoDialog({ items, onApply, onDelete, onClose }: Props)
       <div className="history-content">
         {items.length ? <WorkflowTodoPanel items={items} onApply={onApply} onDelete={onDelete} /> : <div className="workflow-todo-empty"><icons.Check size={28} /><strong>没有待处理的工作流结果</strong><span>完成前置步骤后，候选路径和参数会出现在这里。</span></div>}
       </div>
-      <footer><span>未应用的待办会一直保留；已应用的待办在目标功能成功运行后自动删除。</span><button onClick={onClose}>关闭</button></footer>
+      <footer><span>不同目标功能的待办可以连续应用；同一功能会保留当前配置，运行成功后自动解锁下一条。</span><button onClick={onClose}>关闭</button></footer>
     </section>
   </div>
 }

@@ -362,6 +362,9 @@ class RemoteInferenceManager:
                 self._credentials.set(
                     config["host"], config["port"], config["username"], config["password"]
                 )
+            self._credentials.record_connection(
+                config["host"], config["port"], config["username"]
+            )
             message = (
                 "SSH 连接成功，密码已加密保存在本机。"
                 if config["remember_password"]
@@ -391,6 +394,9 @@ class RemoteInferenceManager:
     def resolve_connection(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Resolve an SSH connection, including a password saved in the local vault."""
         return validate_connection_payload(raw, self._credentials)
+
+    def connection_history(self) -> dict[str, Any]:
+        return {"connections": self._credentials.list_connections()}
 
     def credential_status(self, raw: dict[str, Any]) -> dict[str, Any]:
         identity = validate_connection_identity(raw)

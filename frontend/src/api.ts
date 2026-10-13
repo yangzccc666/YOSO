@@ -1,4 +1,6 @@
-import type { ConnectionTestResult, FunctionDefinition, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, StarLabelDetectionResult, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
+import type { ConnectionTestResult, FunctionDefinition, PlatformSettings, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, SshConnectionProfile, StarLabelDetectionResult, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
+
+export const SSH_HISTORY_UPDATED_EVENT = 'yolo-ssh-history-updated'
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -13,6 +15,26 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 export async function getFunctions(): Promise<FunctionDefinition[]> {
   const data = await request<{ functions: FunctionDefinition[] }>('/api/functions')
   return data.functions
+}
+
+export async function launchXAnyLabeling(): Promise<{ message: string }> {
+  return request('/api/apps/xanylabeling/launch', { method: 'POST', body: '{}' })
+}
+
+export async function launchAntigravity(): Promise<{ message: string }> {
+  return request('/api/apps/antigravity/launch', { method: 'POST', body: '{}' })
+}
+
+export async function launchExternalApp(appId: string): Promise<{ message: string }> {
+  return request(`/api/apps/${encodeURIComponent(appId)}/launch`, { method: 'POST', body: '{}' })
+}
+
+export async function getPlatformSettings(): Promise<PlatformSettings> {
+  return request('/api/settings')
+}
+
+export async function savePlatformSettings(settings: PlatformSettings): Promise<PlatformSettings> {
+  return request('/api/settings', { method: 'PUT', body: JSON.stringify(settings) })
 }
 
 export async function getWorkspace(): Promise<WorkspaceData> {
@@ -129,10 +151,17 @@ export async function setLocalPTInferencePaused(id: string, paused: boolean): Pr
 }
 
 export async function testRemoteConnection(parameters: WorkingValues['parameters']): Promise<ConnectionTestResult> {
-  return request<ConnectionTestResult>('/api/remote-inference/test-connection', {
+  const result = await request<ConnectionTestResult>('/api/remote-inference/test-connection', {
     method: 'POST',
     body: JSON.stringify({ parameters }),
   })
+  window.dispatchEvent(new Event(SSH_HISTORY_UPDATED_EVENT))
+  return result
+}
+
+export async function getSshConnectionHistory(): Promise<SshConnectionProfile[]> {
+  const data = await request<{ connections: SshConnectionProfile[] }>('/api/ssh/connections')
+  return data.connections
 }
 
 export async function getRemoteCredentialStatus(parameters: WorkingValues['parameters']): Promise<RemoteCredentialStatus> {
@@ -150,10 +179,12 @@ export async function forgetRemotePassword(parameters: WorkingValues['parameters
 }
 
 export async function testYoloRemoteConnection(parameters: WorkingValues['parameters']): Promise<YoloConnectionTestResult> {
-  return request<YoloConnectionTestResult>('/api/yolo-dataset/test-connection', {
+  const result = await request<YoloConnectionTestResult>('/api/yolo-dataset/test-connection', {
     method: 'POST',
     body: JSON.stringify({ parameters }),
   })
+  window.dispatchEvent(new Event(SSH_HISTORY_UPDATED_EVENT))
+  return result
 }
 
 export async function getYoloRemoteCredentialStatus(parameters: WorkingValues['parameters']): Promise<RemoteCredentialStatus> {

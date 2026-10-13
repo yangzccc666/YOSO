@@ -27,7 +27,7 @@ from backend.groups import GroupCatalog
 from backend.handlers import RunContext, execute, has_handler, register_handler
 from backend.remote_inference import BUNDLED_INFERENCE_SCRIPT, REMEMBERED_PASSWORD_MARKER, RemoteInferenceManager, validate_connection_payload, validate_start_payload
 from backend.task_manager import PlatformTaskManager, TaskCancelled
-from backend.video_clip import COPY_MODE, _configured_range, parse_time, run_video_clip
+from backend.video_clip import COPY_MODE, _configured_range, _probe_duration, parse_time, run_video_clip
 from backend.video_frames import _priority_time_ranges, run_video_frames
 from backend.yolo_training import DEFAULT_TRAINING_VALUES, TrainingManager, TrainingProfileStore, TrainingSession, _conda_environment_for_yolo, _follow_remote_session, _remote_output_lines, _remote_training_shell, automatic_training_run_name, build_training_command, normalize_training_values, select_remote_yolo_candidate, training_task_key
 from backend.yolo_dataset_split import _dataset_folder_name, run_yolo_dataset_split
@@ -84,6 +84,12 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(remote_password["default"], "")
         self.assertTrue(remember_yolo_password["default"])
         self.assertEqual(items[2]["name"], "视频裁剪")
+        self.assertIn("split_train_test", {parameter["id"] for parameter in items[2]["parameters"]})
+        training = next(item for item in items if item["handlerId"] == "yolo.train")
+        self.assertEqual(training["name"], "YOLO 模型训练")
+        self.assertEqual(training["pathFields"], [])
+        negative_samples = next(item for item in items if item["handlerId"] == "dataset.extract_negative_samples")
+        self.assertEqual(negative_samples["name"], "提取负样本")
         self.assertEqual(items[2]["handlerId"], "video.clip")
         clip_end_time = next(parameter for parameter in items[2]["parameters"] if parameter["id"] == "range_end_time")
         self.assertEqual(clip_end_time["default"], "")
@@ -198,6 +204,23 @@ class CatalogTests(unittest.TestCase):
         self.assertNotIn("password", credential_status)
         self.assertTrue(store.delete("192.168.1.223", 22, "wel"))
         self.assertIsNone(store.get("192.168.1.223", 22, "wel"))
+
+    def test_successful_ssh_identities_are_listed_without_plaintext_passwords(self) -> None:
+        store = CredentialStore(Path(self.temp.name) / "connection-history")
+        store.set("192.168.1.223", 22, "wel", "box-secret")
+        store.record_connection("192.168.1.223", 22, "wel")
+        store.record_connection("192.168.21.5", 2222, "dell")
+        store.record_connection("192.168.1.223", 22, "wel")
+
+        connections = store.list_connections()
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(connections[0]["host"], "192.168.1.223")
+        self.assertEqual(connections[0]["username"], "wel")
+        self.assertTrue(connections[0]["passwordRemembered"])
+        self.assertFalse(connections[1]["passwordRemembered"])
+        self.assertNotIn("password", connections[0])
+        self.assertNotIn("box-secret", store.history_file.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(store.history_file.stat().st_mode), 0o600)
 
     def test_remote_connection_errors_have_actionable_messages(self) -> None:
         import paramiko
@@ -792,6 +815,40 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(any("1.000 秒 → 2.200 秒" in message for message in messages))
 
     @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for the integration test")
+    def test_video_clip_splits_selected_range_into_train_and_remainder_into_test(self) -> None:
+        source = Path(self.temp.name) / "split_source.mp4"
+        output = Path(self.temp.name) / "split_output"
+        writer = cv2.VideoWriter(str(source), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (64, 48))
+        self.assertTrue(writer.isOpened())
+        for index in range(60):
+            writer.write(np.full((48, 64, 3), index * 3, dtype=np.uint8))
+        writer.release()
+
+        result = run_video_clip(RunContext(
+            function_id="video_clip",
+            paths={"video_file": source, "output_folder": output},
+            parameters={
+                "clip_mode": "指定开始和结束时间",
+                "range_start_time": "2",
+                "range_end_time": "4",
+                "encoding_mode": "精确裁剪（重新编码）",
+                "split_train_test": True,
+            },
+            report=lambda _message: None,
+        ))
+
+        train_video = Path(result["details"][0]["trainOutput"])
+        test_video = Path(result["details"][0]["testOutput"])
+        self.assertEqual(result["successCount"], 1)
+        self.assertEqual(len(result["outputFiles"]), 2)
+        self.assertEqual(train_video.parent.name, "train")
+        self.assertEqual(test_video.parent.name, "test")
+        self.assertTrue(train_video.is_file())
+        self.assertTrue(test_video.is_file())
+        self.assertAlmostEqual(_probe_duration(train_video), 2.0, delta=0.25)
+        self.assertAlmostEqual(_probe_duration(test_video), 4.0, delta=0.35)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg is required for the integration test")
     def test_video_clip_defaults_to_stream_copy_without_size_inflation(self) -> None:
         source = Path(self.temp.name) / "copy_source.mp4"
         output = Path(self.temp.name) / "copy_clips"
@@ -1029,10 +1086,10 @@ class CatalogTests(unittest.TestCase):
             })
 
     def test_yolo_training_command_matches_reference_script_defaults(self) -> None:
-        command = build_training_command(DEFAULT_TRAINING_VALUES)
+        command = build_training_command({**DEFAULT_TRAINING_VALUES, "device": "2"})
         self.assertEqual(command[:3], ["yolo", "detect", "train"])
-        self.assertIn("data=/home/dell/yzc_ws/data/Longcheng/shentou2-gw2-state/data.yaml", command)
-        self.assertIn("model=/home/dell/yzc_ws/ultralytics/yolo26n.pt", command)
+        self.assertIn("data=data.yaml", command)
+        self.assertIn("model=yolo26n.pt", command)
         self.assertIn("epochs=200", command)
         self.assertIn("patience=30", command)
         self.assertIn("device=2", command)
@@ -1052,9 +1109,12 @@ class CatalogTests(unittest.TestCase):
     def test_yolo_training_name_is_generated_only_for_execution(self) -> None:
         self.assertEqual(DEFAULT_TRAINING_VALUES["run_name"], "")
         self.assertEqual(automatic_training_run_name(datetime(2026, 9, 23, 14, 5)), "yolo26_0923_1405")
-        self.assertRegex(normalize_training_values(DEFAULT_TRAINING_VALUES)["run_name"], r"^yolo26_\d{4}_\d{4}$")
+        self.assertEqual(DEFAULT_TRAINING_VALUES["device"], "")
+        with self.assertRaisesRegex(ValueError, "训练设备 device 不能为空"):
+            normalize_training_values(DEFAULT_TRAINING_VALUES)
+        self.assertRegex(normalize_training_values({**DEFAULT_TRAINING_VALUES, "device": "2"})["run_name"], r"^yolo26_\d{4}_\d{4}$")
         self.assertEqual(
-            normalize_training_values({**DEFAULT_TRAINING_VALUES, "run_name": "custom_run"})["run_name"],
+            normalize_training_values({**DEFAULT_TRAINING_VALUES, "run_name": "custom_run", "device": "2"})["run_name"],
             "custom_run",
         )
         with self.assertRaisesRegex(ValueError, "cache 只能是"):
@@ -1098,6 +1158,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(payload["profiles"][0]["name"], "通用训练")
         self.assertEqual(payload["defaults"]["patience"], 30)
         self.assertEqual(payload["profiles"][0]["values"]["patience"], 30)
+        self.assertEqual(payload["profiles"][0]["values"]["nbs"], 32)
         self.assertEqual(payload["profiles"][0]["values"]["run_name"], "")
         profile = store.create({
             "name": "光线变化",
@@ -1117,7 +1178,7 @@ class CatalogTests(unittest.TestCase):
 
     def test_yolo_training_runs_as_background_session(self) -> None:
         manager = TrainingManager(Path(self.temp.name) / "background_training.json")
-        parameters = {**DEFAULT_TRAINING_VALUES, "yolo_executable": "/bin/echo"}
+        parameters = {**DEFAULT_TRAINING_VALUES, "yolo_executable": "/bin/echo", "device": "0"}
         snapshot = manager.start(parameters)
         for _ in range(50):
             current = manager.get(snapshot["id"]).snapshot()

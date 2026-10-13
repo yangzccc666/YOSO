@@ -3,6 +3,7 @@ import { forgetRemotePassword, getRemoteCredentialStatus, testRemoteConnection }
 import { icons } from '../icons'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { ConnectionTestResult, PlatformTaskStatus, WorkingValues } from '../types'
+import { SshConnectionHistoryInput } from './SshConnectionHistoryInput'
 
 type Props = {
   values: WorkingValues
@@ -159,7 +160,9 @@ export function RemoteTensorRTBuildPanel(props: Props) {
     <section className="workspace-section calibration-section">
       <div className="section-title"><icons.Settings size={21} /><h2>AI 推理盒子 SSH</h2></div>
       <div className="calibration-form">
-        <label><span>设备 IP / 主机名</span><input value={host} onChange={(event) => set('host', event.target.value)} /></label>
+        <label><span>设备 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={checking || props.running} onHostChange={(value) => set('host', value)} onSelect={(profile) => {
+          set('port', profile.port); set('username', profile.username); set('remember_password', true); set('password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setNotice(profile.passwordRemembered ? '已选择历史设备，并填充保存的 SSH 密码。' : '已选择历史设备，请输入 SSH 密码。')
+        }} /></label>
         <label><span>SSH 端口</span><input type="number" value={String(parameter('port') ?? 22)} onChange={(event) => set('port', event.target.value === '' ? '' : Number(event.target.value))} /></label>
         <label><span>用户名</span><input value={username} onChange={(event) => set('username', event.target.value)} /></label>
         <label><span>SSH 密码</span><input type="password" autoComplete="current-password" value={password === REMEMBERED_PASSWORD_VALUE ? '已保存密码' : password} onFocus={() => { if (password === REMEMBERED_PASSWORD_VALUE) set('password', '') }} onChange={(event) => set('password', event.target.value)} placeholder="首次连接时输入" /></label>

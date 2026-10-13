@@ -102,6 +102,14 @@ export type RemoteCredentialStatus = {
   remembered: boolean
 }
 
+export type SshConnectionProfile = {
+  host: string
+  port: number
+  username: string
+  lastUsedAt: string
+  passwordRemembered: boolean
+}
+
 export type StarLabelDetectionResult = {
   ok: true
   labels: string[]
@@ -162,4 +170,20 @@ export type WorkspaceData = {
 export type WorkingValues = {
   paths: Record<string, string>
   parameters: Record<string, string | number | boolean>
+}
+
+export type ExternalAppSettings = {
+  id: string
+  name: string
+  description: string
+  executable: string
+  workingDirectory: string
+  arguments: string
+  condaEnvironment: string
+  condaExecutable: string
+}
+
+export type PlatformSettings = {
+  externalApps: ExternalAppSettings[]
+  configFile: string
 }

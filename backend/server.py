@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .catalog import FunctionCatalog
+from .external_apps import launch_xanylabeling, launch_antigravity
+from .app_settings import settings_store
 from .groups import GroupCatalog
 from .handlers import RunContext, execute, has_handler
 from .remote_inference import manager as remote_inference_manager
@@ -42,6 +44,8 @@ from . import yolo_dataset_split as _yolo_dataset_split  # noqa: F401 - register
 from . import remote_calib_dataset as _remote_calib_dataset  # noqa: F401 - registers built-in handler
 from . import remote_tensorrt_build as _remote_tensorrt_build  # noqa: F401 - registers built-in handler
 from . import local_star_package as _local_star_package  # noqa: F401 - registers built-in handler
+from . import auto_annotation as _auto_annotation  # noqa: F401
+from . import negative_samples as _negative_samples  # noqa: F401
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,7 +87,11 @@ def record_finished_run(
     except Exception as exc:
         # A history disk error must not turn a successful data-processing run into a failure.
         print(f"[YOLO数据处理平台] 无法保存运行历史：{exc}", file=sys.stderr)
-    if status in {"completed", "finished"}:
+    # A process may report success at the same moment the user requests a
+    # stop.  In that race the user's intent wins: keep the history result, but
+    # do not show a misleading completion notification.
+    manually_stopped = task.status == "stopping" or task.stop_event.is_set()
+    if status in {"completed", "finished"} and not manually_stopped:
         notify_system(f"{task.name} 已完成", message or "任务已成功完成。")
 
 
@@ -128,7 +136,7 @@ def active_training_history_records() -> list[dict[str, Any]]:
             state_message = "模型正在训练中。"
         records.append({
             "id": f"active-training-{session['id']}",
-            "functionId": "yolo_dataset_split",
+            "functionId": "yolo_model_training",
             "name": f"YOLO 训练 · {run_name}",
             "kind": "remote-training" if remote else "local",
             "status": "running",
@@ -249,8 +257,14 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/functions":
             self.send_json({"functions": workspace_payload()["functions"]})
             return
+        if parsed.path == "/api/settings":
+            self.send_json(settings_store.payload())
+            return
         if parsed.path == "/api/tasks/active":
             self.send_json({"active": platform_task_manager.active()})
+            return
+        if parsed.path == "/api/ssh/connections":
+            self.send_json(remote_inference_manager.connection_history())
             return
         if parsed.path == "/api/tasks/history":
             try:
@@ -347,6 +361,16 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("SSH 连接参数格式不正确。")
                 self.send_json(remote_inference_manager.test_connection(parameters))
                 return
+            if self.path == "/api/apps/xanylabeling/launch":
+                self.send_json(launch_xanylabeling())
+                return
+            if self.path == "/api/apps/antigravity/launch":
+                self.send_json(launch_antigravity())
+                return
+            if self.path.startswith("/api/apps/") and self.path.endswith("/launch"):
+                app_id = urllib.parse.unquote(self.path.strip("/").split("/")[2])
+                self.send_json(settings_store.launch(app_id))
+                return
             if self.path == "/api/remote-inference/credential-status":
                 parameters = payload.get("parameters", payload)
                 if not isinstance(parameters, dict):
@@ -387,7 +411,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 is_remote = is_remote_yolo_parameters(parameters)
                 values = normalize_training_values(parameters)
                 task = platform_task_manager.start(
-                    "yolo_dataset_split", f"YOLO 训练 · {values['run_name']} · {values['device']}", "remote-training" if is_remote else "local",
+                    "yolo_model_training", f"YOLO 训练 · {values['run_name']} · {values['device']}", "remote-training" if is_remote else "local",
                     task_key=training_task_key(parameters),
                 )
                 details: dict[str, str] = {}
@@ -617,6 +641,9 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         try:
             payload = self.read_json()
+            if self.path == "/api/settings":
+                self.send_json(settings_store.update(payload))
+                return
             if self.path.startswith("/api/groups/"):
                 group_id = self.path.rsplit("/", 1)[-1]
                 group_catalog.rename(group_id, str(payload.get("name", "")))

@@ -126,10 +126,39 @@ YOLO_DATASET_FUNCTION = {
     ],
 }
 
+YOLO_TRAINING_FUNCTION = {
+    "id": "yolo_model_training",
+    "name": "YOLO 模型训练",
+    "description": "独立配置并启动本地或 SSH 远程 YOLO 训练，支持多任务、后台 tmux、训练日志和任务管理。",
+    "handlerId": "yolo.train",
+    "pathFields": [],
+    "parameters": [
+        {"id": "remote_host", "label": "远程服务器 IP / 主机名（留空则本地运行）", "type": "text", "default": "", "options": []},
+        {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
+        {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
+    ],
+}
+
+NEGATIVE_SAMPLE_FUNCTION = {
+    "id": "extract_negative_samples",
+    "name": "提取负样本",
+    "description": "检查同名 VOC XML，将没有 object 标注的 JPG/JPEG 移动到负样本目录，并删除对应空 XML。",
+    "handlerId": "dataset.extract_negative_samples",
+    "pathFields": [
+        {"id": "source_folder", "label": "图片和 XML 输入文件夹", "mode": "directory"},
+        {"id": "negative_folder", "label": "负样本图片输出文件夹", "mode": "directory"},
+    ],
+    "parameters": [
+        {"id": "recursive", "label": "包含子文件夹", "type": "boolean", "default": False, "options": []},
+    ],
+}
+
 VIDEO_CLIP_FUNCTION = {
     "id": "video_clip",
     "name": "视频裁剪",
-    "description": "按指定时间范围批量裁剪视频，默认直接复制原编码流，不改变分辨率、码率和画质。",
+    "description": "按指定时间范围批量裁剪视频，也可将指定片段作为训练集、其余片段合并为测试集；默认直接复制原编码流。",
     "handlerId": "video.clip",
     "pathFields": [
         {"id": "video_folder", "label": "视频文件夹", "mode": "directory"},
@@ -157,6 +186,13 @@ VIDEO_CLIP_FUNCTION = {
             "default": "原画质裁剪（推荐，不重新编码）",
             "options": ["原画质裁剪（推荐，不重新编码）", "精确裁剪（重新编码）"],
         },
+        {
+            "id": "split_train_test",
+            "label": "拆分训练集和测试集（指定片段为训练集，其余为测试集）",
+            "type": "boolean",
+            "default": False,
+            "options": [],
+        },
     ],
 }
 
@@ -171,9 +207,9 @@ REMOTE_STAR_INFERENCE_FUNCTION = {
         {"id": "local_video_file", "label": "本地视频文件", "mode": "file"},
     ],
     "parameters": [
-        {"id": "host", "label": "设备 IP / 主机名", "type": "text", "default": "192.168.1.223", "options": []},
+        {"id": "host", "label": "设备 IP / 主机名", "type": "text", "default": "", "options": []},
         {"id": "port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
-        {"id": "username", "label": "SSH 用户名", "type": "text", "default": "wel", "options": []},
+        {"id": "username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
         {"id": "password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
         {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
         {"id": "python_path", "label": "远端 Python 解释器", "type": "text", "default": "python3", "options": []},
@@ -303,9 +339,9 @@ REMOTE_TENSORRT_BUILD_FUNCTION = {
         {"id": "run_benchmark", "label": "构建后执行性能测试", "type": "boolean", "default": True, "options": []},
         {"id": "keep_remote_files", "label": "保留远端后台任务状态目录", "type": "boolean", "default": True, "options": []},
         {"id": "overwrite_output", "label": "允许覆盖远端同名结果", "type": "boolean", "default": False, "options": []},
-        {"id": "host", "label": "AI 推理盒子 IP / 主机名", "type": "text", "default": "192.168.1.223", "options": []},
+        {"id": "host", "label": "AI 推理盒子 IP / 主机名", "type": "text", "default": "", "options": []},
         {"id": "port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
-        {"id": "username", "label": "SSH 用户名", "type": "text", "default": "wel", "options": []},
+        {"id": "username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
         {"id": "password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
         {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
     ],
@@ -322,8 +358,8 @@ LOCAL_STAR_PACKAGE_FUNCTION = {
     "parameters": [
         {"id": "title", "label": "打包名称 title", "type": "text", "default": "", "options": []},
         {"id": "labels", "label": "类别名称 labels", "type": "text", "default": "", "options": []},
-        {"id": "package_tool_path", "label": "package_tool 路径", "type": "text", "default": "/mnt/disk2/code/gen_package/package_tool", "options": []},
-        {"id": "template_file", "label": "trt.toml 模板路径", "type": "text", "default": "/mnt/disk2/code/gen_package/trt.toml", "options": []},
+        {"id": "package_tool_path", "label": "package_tool 路径", "type": "text", "default": "", "options": []},
+        {"id": "template_file", "label": "trt.toml 模板路径", "type": "text", "default": "", "options": []},
         {"id": "hardware_name", "label": "硬件平台", "type": "text", "default": "TensorRT", "options": []},
         {"id": "architecture", "label": "硬件架构", "type": "text", "default": "Turing", "options": []},
         {"id": "driver", "label": "驱动信息", "type": "text", "default": "CUDA12.2", "options": []},
@@ -339,7 +375,27 @@ LOCAL_STAR_PACKAGE_FUNCTION = {
     ],
 }
 
-DEFAULT_FUNCTIONS = [VIDEO_FUNCTION, YOLO_DATASET_FUNCTION, VIDEO_CLIP_FUNCTION, REMOTE_STAR_INFERENCE_FUNCTION, CALIB_DATASET_FUNCTION, LOCAL_PT_INFERENCE_FUNCTION, IMAGE_DEDUP_FUNCTION, JETSON_ONNX_EXPORT_FUNCTION, DOCKER_ONNX_QUANT_FUNCTION, REMOTE_TENSORRT_BUILD_FUNCTION, LOCAL_STAR_PACKAGE_FUNCTION]
+AUTO_ANNOTATE_FUNCTION = {
+    "id": "auto_annotation", "name": "模型自动标注", "handlerId": "dataset.auto_annotate",
+    "description": "使用本机 Ultralytics 检测 PT 模型生成同名 VOC XML，保存于原图片旁；类别名读取模型，原图片保持不变。自动标注后请人工复核。",
+    "pathFields": [
+        {"id": "image_folder", "label": "待标注图片文件夹", "mode": "directory"},
+        {"id": "weights_file", "label": "训练后的 PT 检测模型", "mode": "file"},
+    ],
+    "parameters": [
+        {"id": "conf", "label": "置信度阈值（0–1）", "type": "number", "default": 0.5},
+        {"id": "iou", "label": "重叠框抑制 IoU 阈值（0–1）", "type": "number", "default": 0.7},
+        {"id": "imgsz", "label": "推理尺寸（32 的倍数）", "type": "number", "default": 640},
+        {"id": "device", "label": "设备（留空自动；cpu 或 GPU 编号如 0）", "type": "text", "default": ""},
+        {"id": "classes", "label": "仅标注类别编号（逗号分隔；留空全部）", "type": "text", "default": ""},
+        {"id": "recursive", "label": "包含子文件夹", "type": "boolean", "default": True},
+        {"id": "existing", "label": "已有 XML", "type": "select", "default": "跳过", "options": ["跳过", "备份后覆盖"]},
+        {"id": "empty_xml", "label": "没有目标时生成空 XML（待人工确认的负样本）", "type": "boolean", "default": True},
+        {"id": "python_path", "label": "Python 路径（留空自动使用本机 yolo26 环境）", "type": "text", "default": ""},
+    ],
+}
+
+DEFAULT_FUNCTIONS = [VIDEO_FUNCTION, YOLO_DATASET_FUNCTION, VIDEO_CLIP_FUNCTION, REMOTE_STAR_INFERENCE_FUNCTION, CALIB_DATASET_FUNCTION, LOCAL_PT_INFERENCE_FUNCTION, IMAGE_DEDUP_FUNCTION, JETSON_ONNX_EXPORT_FUNCTION, DOCKER_ONNX_QUANT_FUNCTION, REMOTE_TENSORRT_BUILD_FUNCTION, LOCAL_STAR_PACKAGE_FUNCTION, AUTO_ANNOTATE_FUNCTION, YOLO_TRAINING_FUNCTION, NEGATIVE_SAMPLE_FUNCTION]
 
 
 class FunctionCatalog:
@@ -403,6 +459,7 @@ class FunctionCatalog:
             if isinstance(content, list):
                 migration_marker = self.storage_file.with_name(self.storage_file.name + ".local-pt-v1")
                 clip_migration_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1")
+                clip_split_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2")
                 dedup_migration_marker = self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1")
                 quant_migration_marker = self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1")
                 export_migration_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1")
@@ -420,7 +477,22 @@ class FunctionCatalog:
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
+                yolo_training_function_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1")
+                negative_sample_marker = self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1")
                 changed = False
+                annotation_marker = self.storage_file.with_name(self.storage_file.name + ".auto-annotation-v1")
+                if not yolo_training_function_marker.exists():
+                    if not any(isinstance(item, dict) and item.get("id") == YOLO_TRAINING_FUNCTION["id"] for item in content):
+                        content.append(deepcopy(YOLO_TRAINING_FUNCTION))
+                        changed = True
+                if not negative_sample_marker.exists():
+                    if not any(isinstance(item, dict) and item.get("id") == NEGATIVE_SAMPLE_FUNCTION["id"] for item in content):
+                        content.append(deepcopy(NEGATIVE_SAMPLE_FUNCTION))
+                        changed = True
+                if not annotation_marker.exists():
+                    if not any(isinstance(item, dict) and item.get("id") == AUTO_ANNOTATE_FUNCTION["id"] for item in content):
+                        content.append(deepcopy(AUTO_ANNOTATE_FUNCTION))
+                        changed = True
                 if not migration_marker.exists() and not any(isinstance(item, dict) and item.get("id") == LOCAL_PT_INFERENCE_FUNCTION["id"] for item in content):
                     content.append(deepcopy(LOCAL_PT_INFERENCE_FUNCTION))
                     changed = True
@@ -503,10 +575,25 @@ class FunctionCatalog:
                     if (not clip_migration_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_CLIP_FUNCTION["id"]):
                         item["description"] = VIDEO_CLIP_FUNCTION["description"]
+                        source_encoding = next(
+                            parameter for parameter in VIDEO_CLIP_FUNCTION["parameters"]
+                            if parameter["id"] == "encoding_mode"
+                        )
                         for parameter in item.get("parameters", []):
                             if isinstance(parameter, dict) and parameter.get("id") == "encoding_mode":
-                                parameter.update(deepcopy(VIDEO_CLIP_FUNCTION["parameters"][-1]))
+                                parameter.update(deepcopy(source_encoding))
                                 changed = True
+                    if (not clip_split_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_CLIP_FUNCTION["id"]):
+                        item["description"] = VIDEO_CLIP_FUNCTION["description"]
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(parameter, dict) and parameter.get("id") == "split_train_test" for parameter in parameters):
+                            source_split = next(
+                                parameter for parameter in VIDEO_CLIP_FUNCTION["parameters"]
+                                if parameter["id"] == "split_train_test"
+                            )
+                            parameters.append(deepcopy(source_split))
+                            changed = True
                     if (not calib_priority_marker.exists() and isinstance(item, dict)
                             and item.get("id") == CALIB_DATASET_FUNCTION["id"]):
                         item["description"] = CALIB_DATASET_FUNCTION["description"]
@@ -602,6 +689,8 @@ class FunctionCatalog:
                     migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not clip_migration_marker.exists():
                     clip_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not clip_split_marker.exists():
+                    clip_split_marker.write_text("migrated\n", encoding="utf-8")
                 if not dedup_migration_marker.exists():
                     dedup_migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not quant_migration_marker.exists():
@@ -636,7 +725,12 @@ class FunctionCatalog:
                     realtime_playback_marker.write_text("migrated\n", encoding="utf-8")
                 if not yolo_dataset_timestamp_marker.exists():
                     yolo_dataset_timestamp_marker.write_text("migrated\n", encoding="utf-8")
+                if not yolo_training_function_marker.exists():
+                    yolo_training_function_marker.write_text("migrated\n", encoding="utf-8")
+                if not negative_sample_marker.exists():
+                    negative_sample_marker.write_text("migrated\n", encoding="utf-8")
                 items = [self._normalize(item) for item in content if isinstance(item, dict)]
+                annotation_marker.write_text("migrated\n", encoding="utf-8")
                 return items
         except (OSError, json.JSONDecodeError):
             pass
@@ -647,8 +741,12 @@ class FunctionCatalog:
         temporary = self.storage_file.with_suffix(".tmp")
         temporary.write_text(json.dumps(self._items, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.storage_file)
+        self.storage_file.with_name(self.storage_file.name + ".auto-annotation-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".local-pt-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1").write_text("migrated\n", encoding="utf-8")

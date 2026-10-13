@@ -36,7 +36,9 @@ export function loadWorkflowTodos(): WorkflowTodo[] {
         id: String(candidate.id),
         sourceFunctionId: String(candidate.sourceFunctionId || ''),
         sourceName: String(candidate.sourceName || '上一步功能'),
-        targetHandlerId: String(candidate.targetHandlerId),
+        targetHandlerId: candidate.payload.training && candidate.targetHandlerId === 'yolo.split_dataset'
+          ? 'yolo.train'
+          : String(candidate.targetHandlerId),
         title: String(candidate.title || '待应用的工作流结果'),
         description: String(candidate.description || ''),
         createdAt: String(candidate.createdAt || new Date().toISOString()),

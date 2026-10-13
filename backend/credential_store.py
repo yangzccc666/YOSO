@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -22,6 +23,7 @@ class CredentialStore:
         self.directory = directory
         self.key_file = directory / "credentials.key"
         self.data_file = directory / "ssh_credentials.json"
+        self.history_file = directory / "ssh_connection_history.json"
         self._lock = threading.RLock()
 
     @staticmethod
@@ -101,3 +103,64 @@ class CredentialStore:
             if removed:
                 self._save(entries)
             return removed
+
+    def _load_history(self) -> list[dict[str, object]]:
+        if not self.history_file.is_file():
+            return []
+        try:
+            content = json.loads(self.history_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(content, list):
+            return []
+        records: list[dict[str, object]] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            host = str(item.get("host", "")).strip()
+            username = str(item.get("username", "")).strip()
+            try:
+                port = int(item.get("port", 22))
+            except (TypeError, ValueError):
+                continue
+            if host and username and 1 <= port <= 65535:
+                records.append({
+                    "host": host,
+                    "port": port,
+                    "username": username,
+                    "lastUsedAt": str(item.get("lastUsedAt", "")),
+                })
+        return records
+
+    def _save_history(self, records: list[dict[str, object]]) -> None:
+        self._ensure_directory()
+        temporary = self.history_file.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.history_file)
+        os.chmod(self.history_file, 0o600)
+
+    def record_connection(self, host: str, port: int, username: str) -> None:
+        """Remember a successfully tested SSH identity without storing a plaintext password."""
+        with self._lock:
+            identity = self._entry_id(host, port, username)
+            records = [
+                item for item in self._load_history()
+                if self._entry_id(str(item["host"]), int(item["port"]), str(item["username"])) != identity
+            ]
+            records.insert(0, {
+                "host": host,
+                "port": port,
+                "username": username,
+                "lastUsedAt": datetime.now().isoformat(timespec="seconds"),
+            })
+            self._save_history(records[:20])
+
+    def list_connections(self) -> list[dict[str, object]]:
+        with self._lock:
+            return [{
+                **item,
+                "passwordRemembered": self.get(
+                    str(item["host"]), int(item["port"]), str(item["username"])
+                ) is not None,
+            } for item in self._load_history()]

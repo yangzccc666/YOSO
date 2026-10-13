@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -160,9 +161,9 @@ def _time_token(seconds: float) -> str:
     return f"{token}_{millis:03d}" if millis else token
 
 
-def _unique_output_file(parent: Path, video: Path, start: float, end: float, suffix: str) -> Path:
+def _unique_output_file(parent: Path, video: Path, start: float, end: float, suffix: str, label: str = "clip") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"{video.stem}_clip_{_time_token(start)}-{_time_token(end)}_{timestamp}"
+    base = f"{video.stem}_{label}_{_time_token(start)}-{_time_token(end)}_{timestamp}"
     candidate = parent / f"{base}{suffix}"
     index = 2
     while candidate.exists():
@@ -216,10 +217,11 @@ def _clip_one(
     end: float,
     encoding_mode: str,
     context: RunContext,
+    label: str = "clip",
 ) -> Path:
     precise = encoding_mode == PRECISE_MODE
     suffix = ".mp4" if precise else video.suffix.lower()
-    output = _unique_output_file(output_parent, video, start, end, suffix)
+    output = _unique_output_file(output_parent, video, start, end, suffix, label)
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
     duration = end - start
 
@@ -299,6 +301,44 @@ def _clip_one(
     return output
 
 
+def _concat_clips(
+    ffmpeg: str,
+    clips: list[Path],
+    output: Path,
+    context: RunContext,
+) -> Path:
+    """Join compatible clips without another video re-encode."""
+    if not clips:
+        raise ValueError("指定训练片段覆盖了整个视频，没有剩余内容可生成测试集视频。")
+    if len(clips) == 1:
+        clips[0].replace(output)
+        return output
+    temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
+    with tempfile.NamedTemporaryFile("w", suffix=".ffconcat", encoding="utf-8", delete=False) as listing:
+        list_path = Path(listing.name)
+        for clip in clips:
+            escaped = str(clip.resolve()).replace("'", "'\\''")
+            listing.write(f"file '{escaped}'\n")
+    try:
+        completed = _run_process([
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(list_path),
+            "-map", "0", "-c", "copy", "-avoid_negative_ts", "make_zero",
+            str(temporary),
+        ], context)
+        if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 0:
+            detail = completed.stderr.strip().splitlines()
+            raise RuntimeError(f"测试集片段合并失败：{detail[-1] if detail else 'FFmpeg 未生成结果文件'}")
+        temporary.replace(output)
+        return output
+    except TaskCancelled:
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+        list_path.unlink(missing_ok=True)
+
+
 def run_video_clip(context: RunContext) -> dict[str, Any]:
     videos = _resolve_videos(context)
     ffmpeg = _find_ffmpeg()
@@ -306,6 +346,7 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
     encoding_mode = LEGACY_ENCODING_MODES.get(encoding_mode, encoding_mode)
     if encoding_mode not in ENCODING_MODES:
         raise ValueError("请选择有效的裁剪处理方式。")
+    split_train_test = bool(context.parameters.get("split_train_test", False))
 
     output_root = context.paths.get("output_folder")
     if output_root:
@@ -313,13 +354,18 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         output_root.mkdir(parents=True, exist_ok=True)
 
     context.report(f"找到 {len(videos)} 个视频，处理方式：{encoding_mode}")
+    if split_train_test:
+        context.report("已开启训练集/测试集拆分：指定时间段输出到 train，其余片段合并后输出到 test。")
     if encoding_mode == COPY_MODE:
         context.report("将直接复制原视频编码流，不改变分辨率、码率和画质；裁剪起点会对齐到附近的关键帧。")
     outputs: list[Path] = []
     details: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
+    successful_videos = 0
 
     for index, video in enumerate(videos, start=1):
+        created_for_video: list[Path] = []
+        staging_dir: Path | None = None
         try:
             context.check_cancelled()
             video_duration = _probe_duration(video, context)
@@ -330,15 +376,46 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 f"[{index}/{len(videos)}] 正在裁剪 {video.name}："
                 f"{start:.3f} 秒 → {end:.3f} 秒（{end - start:.3f} 秒）"
             )
-            output_parent = output_root or video.parent
-            output_parent.mkdir(parents=True, exist_ok=True)
-            output = _clip_one(ffmpeg, video, output_parent, start, end, encoding_mode, context)
+            base_output_parent = output_root or video.parent
+            if split_train_test:
+                train_parent = base_output_parent / "train"
+                test_parent = base_output_parent / "test"
+                train_parent.mkdir(parents=True, exist_ok=True)
+                test_parent.mkdir(parents=True, exist_ok=True)
+                output = _clip_one(ffmpeg, video, train_parent, start, end, encoding_mode, context, "train")
+                created_for_video.append(output)
+                suffix = ".mp4" if encoding_mode == PRECISE_MODE else video.suffix.lower()
+                test_output = _unique_output_file(test_parent, video, 0, video_duration, suffix, "test")
+                remaining_ranges = [
+                    (part_start, part_end)
+                    for part_start, part_end in ((0.0, start), (end, video_duration))
+                    if part_end - part_start > 0.01
+                ]
+                if not remaining_ranges:
+                    raise ValueError("指定训练片段覆盖了整个视频，没有剩余内容可生成测试集视频。")
+                staging_dir = Path(tempfile.mkdtemp(prefix=".video_split_parts_", dir=test_parent))
+                parts = [
+                    _clip_one(ffmpeg, video, staging_dir, part_start, part_end, encoding_mode, context, f"part{part_index}")
+                    for part_index, (part_start, part_end) in enumerate(remaining_ranges, 1)
+                ]
+                context.report(f"[{index}/{len(videos)}] 正在合并 {len(parts)} 个剩余片段为测试集视频")
+                _concat_clips(ffmpeg, parts, test_output, context)
+                created_for_video.append(test_output)
+                output_group = [output, test_output]
+            else:
+                base_output_parent.mkdir(parents=True, exist_ok=True)
+                output = _clip_one(ffmpeg, video, base_output_parent, start, end, encoding_mode, context)
+                created_for_video.append(output)
+                output_group = [output]
             source_size = video.stat().st_size
-            output_size = output.stat().st_size
-            outputs.append(output)
+            output_size = sum(path.stat().st_size for path in output_group)
+            outputs.extend(output_group)
+            successful_videos += 1
             details.append({
                 "video": str(video),
                 "output": str(output),
+                "trainOutput": str(output) if split_train_test else None,
+                "testOutput": str(output_group[1]) if split_train_test else None,
                 "startSec": start,
                 "endSec": end,
                 "durationSec": end - start,
@@ -348,27 +425,37 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 "outputSizeBytes": output_size,
             })
             context.report(
-                f"[{index}/{len(videos)}] 完成：{output.name}，"
-                f"文件大小 {source_size / 1024 / 1024:.1f} MB → {output_size / 1024 / 1024:.1f} MB"
+                f"[{index}/{len(videos)}] 完成："
+                f"{'训练集与测试集各 1 个视频' if split_train_test else output.name}，"
+                f"源文件 {source_size / 1024 / 1024:.1f} MB，输出合计 {output_size / 1024 / 1024:.1f} MB"
             )
         except TaskCancelled:
+            for path in created_for_video:
+                path.unlink(missing_ok=True)
             raise
         except (ValueError, RuntimeError) as exc:
+            for path in created_for_video:
+                path.unlink(missing_ok=True)
             failures.append({"video": str(video), "error": str(exc)})
             context.report(f"[{index}/{len(videos)}] 跳过 {video.name}：{exc}")
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
     if not outputs:
         reason = failures[0]["error"] if failures else "没有生成结果"
         raise RuntimeError(f"所有视频均未成功裁剪：{reason}")
 
     output_folders = list(dict.fromkeys(str(path.parent) for path in outputs))
-    message = f"视频裁剪完成：成功 {len(outputs)} 个"
+    message = f"视频裁剪完成：成功处理 {successful_videos} 个视频"
+    if split_train_test:
+        message += f"，生成训练集和测试集视频共 {len(outputs)} 个"
     if failures:
         message += f"，跳过 {len(failures)} 个"
     return {
         "message": message + "。",
         "videoCount": len(videos),
-        "successCount": len(outputs),
+        "successCount": successful_videos,
         "failedCount": len(failures),
         "outputFiles": [str(path) for path in outputs],
         "outputFolders": output_folders,

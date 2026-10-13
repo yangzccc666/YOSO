@@ -24,7 +24,12 @@ class RunHistoryStore:
         data = json.loads(self.path.read_text(encoding="utf-8"))
         if not isinstance(data, list):
             raise ValueError("运行历史文件格式不正确。")
-        return [record for record in data if isinstance(record, dict)]
+        records = [record for record in data if isinstance(record, dict)]
+        for record in records:
+            if (record.get("functionId") == "yolo_dataset_split"
+                    and str(record.get("name", "")).startswith("YOLO 训练")):
+                record["functionId"] = "yolo_model_training"
+        return records
 
     def _limit_by_function(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
         counts: dict[str, int] = {}

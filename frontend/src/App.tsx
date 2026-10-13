@@ -6,7 +6,10 @@ import { FunctionSidebar } from './components/FunctionSidebar'
 import { FunctionWorkspace } from './components/FunctionWorkspace'
 import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { WorkflowTodoDialog } from './components/WorkflowTodoDialog'
+import { PlatformSettingsDialog } from './components/PlatformSettingsDialog'
 import { icons } from './icons'
+import { ExternalToolsMenu } from './components/ExternalToolsMenu'
+import { launchExternalApp } from './api'
 import { parseStarModels, upsertStarModel } from './remoteStarModels'
 import { createWorkflowTodo, loadWorkflowTodos, saveWorkflowTodos } from './workflowTodos'
 import type { FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
@@ -195,6 +198,33 @@ export default function App() {
   const [activeTasks, setActiveTasks] = useState<PlatformTaskStatus[]>([])
   const [notice, setNotice] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [launchingEditor, setLaunchingEditor] = useState(false)
+  const [launchingAntigravity, setLaunchingAntigravity] = useState(false)
+  const openAntigravity = async () => {
+    if (launchingAntigravity) return
+    setLaunchingAntigravity(true)
+    try {
+      const result = await launchExternalApp('antigravity')
+      setNotice(result.message)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Antigravity 启动失败')
+    } finally {
+      setLaunchingAntigravity(false)
+    }
+  }
+  const openAnnotationEditor = async () => {
+    if (launchingEditor) return
+    setLaunchingEditor(true)
+    try {
+      const result = await launchExternalApp('xanylabeling')
+      setNotice(result.message)
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'X-AnyLabeling 启动失败')
+    } finally {
+      setLaunchingEditor(false)
+    }
+  }
   const [workflowOpen, setWorkflowOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed)
   const [yoloTrainingRecommendation, setYoloTrainingRecommendation] = useState<YoloTrainingRecommendation | null>(null)
@@ -387,13 +417,13 @@ export default function App() {
   const deleteWorkflowTodo = (id: string) => updateWorkflowTodos((current) => current.filter((item) => item.id !== id))
 
   const completeWorkflowTarget = (handlerId: string) => {
-    if (handlerId === 'yolo.split_dataset') setYoloTrainingRecommendation(null)
+    if (handlerId === 'yolo.train') setYoloTrainingRecommendation(null)
     updateWorkflowTodos((current) => current.filter((todo) => !(todo.targetHandlerId === handlerId && todo.status === 'applied')))
   }
 
   const applyWorkflowTodo = (todo: WorkflowTodo) => {
     if (workflowTodos.some((item) => item.targetHandlerId === todo.targetHandlerId && item.status === 'applied' && item.id !== todo.id)) {
-      setNotice('请先运行当前已应用的工作流待办，或将它删除后再应用下一条。')
+      setNotice('这个目标功能已有一条待办等待运行。请先运行该功能；成功后会自动删除已应用待办并解锁下一条。')
       return
     }
     const target = functions.find((item) => item.handlerId === todo.targetHandlerId)
@@ -446,7 +476,7 @@ export default function App() {
       try { localStorage.setItem(storageKey(target.id), JSON.stringify(withoutSecrets(target, next))) } catch { /* keep current session state */ }
     }
     updateWorkflowTodos((current) => current.map((item) => item.id === todo.id ? { ...item, status: 'applied' } : item))
-    setNotice(`已应用待办“${todo.title}”。本功能成功运行后会自动清理该待办。`)
+    setNotice(`已应用待办“${todo.title}”。你可以继续应用其他目标功能的待办；当前目标功能运行成功后会自动清理此待办。`)
   }
 
   const applyWorkflowTodoFromDialog = (todo: WorkflowTodo) => {
@@ -475,7 +505,7 @@ export default function App() {
       if (item.handlerId === 'yolo.split_dataset' && trainingDefaults && typeof trainingDefaults === 'object') {
         const candidate = trainingDefaults as Record<string, unknown>
         if (typeof candidate.data === 'string' && typeof candidate.project === 'string') {
-          enqueueWorkflowTodo(item, 'yolo.split_dataset', '使用本次数据集开始模型训练', `data=${candidate.data}；project=${candidate.project}；name=运行时自动生成`, {
+          enqueueWorkflowTodo(item, 'yolo.train', '使用本次数据集开始模型训练', `data=${candidate.data}；project=${candidate.project}；name=运行时自动生成`, {
             training: { data: candidate.data, project: candidate.project },
           })
           lines.push('', '已加入工作流待办：模型训练参数。当前训练配置没有被覆盖。')
@@ -536,6 +566,18 @@ export default function App() {
     }
   }
 
+  const openRunningTask = (task: PlatformTaskStatus, menu: HTMLDetailsElement | null) => {
+    const target = functions.find((item) => item.id === task.functionId)
+      || (task.name.startsWith('YOLO 训练') ? functions.find((item) => item.handlerId === 'yolo.train') : undefined)
+    if (!target) {
+      setNotice(`未找到任务“${task.name}”对应的功能，可能已被删除。`)
+      return
+    }
+    setSelectedId(target.id)
+    menu?.removeAttribute('open')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
   const toggleSidebar = () => {
     setSidebarCollapsed((current) => {
       const next = !current
@@ -547,12 +589,17 @@ export default function App() {
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <header className="topbar">
-        <div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
+        <div className="top-left"><div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
+          <ExternalToolsMenu tools={[
+            { id: 'xanylabeling', name: 'X-AnyLabeling', description: '图片标注与人工校正', busy: launchingEditor, onLaunch: () => void openAnnotationEditor() },
+            { id: 'antigravity', name: 'Antigravity', description: '打开本地开发工具', busy: launchingAntigravity, onLaunch: () => void openAntigravity() },
+          ]} />
+        </div>
         <div className="top-actions">
           <button className="history-trigger workflow-trigger" onClick={() => setWorkflowOpen(true)} aria-label={`工作流待办 ${workflowTodos.length} 条`}><icons.FolderInput size={17} /><span>待办 {workflowTodos.length}</span></button>
           <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="全局运行历史"><icons.Clock3 size={17} /><span>运行历史</span></button>
-          {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><span><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></span><button onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
-          <span className="local-status"><i />本地运行</span><button aria-label="设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
+          {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><button className="task-overview-link" onClick={(event) => openRunningTask(task, event.currentTarget.closest('details'))} title={`转到 ${task.name}`}><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></button><button className="task-overview-stop" onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
+          <span className="local-status"><i />本地运行</span><button onClick={() => setSettingsOpen(true)} aria-label="本机设置" title="本机设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
         </div>
       </header>
       <FunctionSidebar
@@ -595,6 +642,7 @@ export default function App() {
       <GroupDialog group={groupDraft} onClose={() => setGroupDraft(undefined)} onSave={saveGroup} />
       {historyOpen ? <RunHistoryDialog onClose={closeHistory} /> : null}
       {workflowOpen ? <WorkflowTodoDialog items={workflowTodos} onApply={applyWorkflowTodoFromDialog} onDelete={deleteWorkflowTodo} onClose={() => setWorkflowOpen(false)} /> : null}
+      <PlatformSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} onSaved={setNotice} />
       {notice ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div> : null}
     </div>
   )

@@ -209,6 +209,8 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             popup = QMessageBox(QMessageBox.Icon.Information, title, message, parent=window)
             popup.setModal(False)
             popup.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+            popup.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
+            popup.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
             popup.setStandardButtons(QMessageBox.StandardButton.NoButton)
             self._fallbacks.add(popup)
             popup.finished.connect(lambda _result, item=popup: self._fallbacks.discard(item))
@@ -359,8 +361,15 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             if time.monotonic() - self._last_change < 0.8:
                 return
 
-            active_task = server_module.platform_task_manager.active()
-            if active_task:
+            active_tasks = server_module.platform_task_manager.active()
+            # Remote training is detached into its own tmux session and is
+            # restored from the persistent training-session store after a
+            # backend refresh. It must not block unrelated platform updates.
+            blocking_tasks = [
+                task for task in active_tasks
+                if task.get("kind") != "remote-training"
+            ]
+            if blocking_tasks:
                 if not self._waiting_logged:
                     print("检测到功能更新，当前任务结束后自动生效。", flush=True)
                     self._waiting_logged = True

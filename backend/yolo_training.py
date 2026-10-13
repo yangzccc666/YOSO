@@ -30,16 +30,16 @@ from .task_manager import TaskCancelled
 DEFAULT_TRAINING_VALUES: dict[str, Any] = {
     "yolo_executable": "yolo",
     "task": "detect",
-    "data": "/home/dell/yzc_ws/data/Longcheng/shentou2-gw2-state/data.yaml",
-    "model": "/home/dell/yzc_ws/ultralytics/yolo26n.pt",
+    "data": "data.yaml",
+    "model": "yolo26n.pt",
     "epochs": 200,
     "patience": 30,
     "imgsz": 640,
     "batch": 8,
-    "nbs": 128,
+    "nbs": 32,
     "workers": 12,
-    "device": "2",
-    "project": "/home/dell/yzc_ws/data/Longcheng/shentou2-gw2-state",
+    "device": "",
+    "project": "runs",
     "run_name": "",
     "seed": 0,
     "deterministic": True,
@@ -171,10 +171,13 @@ def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = 
     values["run_name"] = str(values.get("run_name", "")).strip()
     if generate_run_name and not values["run_name"]:
         values["run_name"] = automatic_training_run_name()
-    for key in ("yolo_executable", "task", "data", "model", "device", "project", "optimizer"):
+    for key in ("yolo_executable", "task", "data", "model", "project", "optimizer"):
         values[key] = str(values[key]).strip()
-        if not values[key]:
+        if not values[key] and (generate_run_name or key not in {"data", "model", "project"}):
             raise ValueError(f"训练参数 {key} 不能为空。")
+    values["device"] = str(values.get("device", "")).strip()
+    if generate_run_name and not values["device"]:
+        raise ValueError("训练设备 device 不能为空，请为本次训练手动填写 GPU 编号或 cpu。")
     if values["task"] not in {"detect", "segment", "classify", "pose", "obb"}:
         raise ValueError("训练任务类型只能是 detect、segment、classify、pose 或 obb。")
     return values
@@ -208,6 +211,19 @@ class TrainingProfileStore:
         self.storage_file = storage_file
         self._lock = threading.RLock()
         self._profiles = self._load()
+        migration_marker = storage_file.with_name(storage_file.name + ".nbs-32-v1")
+        if not migration_marker.exists():
+            changed = False
+            for profile in self._profiles:
+                if profile.get("id") == "general-training" and profile.get("values", {}).get("nbs") == 128:
+                    profile["values"]["nbs"] = 32
+                    profile["updatedAt"] = datetime.now().isoformat(timespec="seconds")
+                    changed = True
+            if changed:
+                self._save()
+            else:
+                storage_file.parent.mkdir(parents=True, exist_ok=True)
+            migration_marker.write_text("migrated\n", encoding="utf-8")
 
     @staticmethod
     def _default_profile() -> dict[str, Any]:

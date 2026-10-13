@@ -18,13 +18,16 @@ DEFAULT_GROUPS = [
 ]
 
 DEFAULT_ASSIGNMENTS = {
+    "auto_annotation": {"groupId": "dataset_processing", "order": 6},
     "video_frames": {"groupId": "video_processing", "order": 0},
     "video_clip": {"groupId": "video_processing", "order": 1},
     "yolo_dataset_split": {"groupId": "dataset_processing", "order": 0},
-    "quant_calibration_dataset": {"groupId": "dataset_processing", "order": 1},
-    "image_dedup": {"groupId": "dataset_processing", "order": 2},
-    "jetson_onnx_export": {"groupId": "dataset_processing", "order": 3},
-    "docker_onnx_quant": {"groupId": "dataset_processing", "order": 4},
+    "yolo_model_training": {"groupId": "dataset_processing", "order": 1},
+    "extract_negative_samples": {"groupId": "dataset_processing", "order": 2},
+    "quant_calibration_dataset": {"groupId": "dataset_processing", "order": 3},
+    "image_dedup": {"groupId": "dataset_processing", "order": 4},
+    "jetson_onnx_export": {"groupId": "dataset_processing", "order": 5},
+    "docker_onnx_quant": {"groupId": "dataset_processing", "order": 7},
     "remote_tensorrt_build": {"groupId": "ai_inference", "order": 0},
     "remote_star_inference": {"groupId": "ai_inference", "order": 1},
     "local_pt_inference": {"groupId": "ai_inference", "order": 2},

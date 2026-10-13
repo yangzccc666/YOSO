@@ -43,7 +43,7 @@ class RemoteTensorRTBuildTests(unittest.TestCase):
         self.assertTrue(has_handler(item["handlerId"]))
         defaults = {field["id"]: field["default"] for field in item["parameters"]}
         self.assertEqual(defaults["trtexec_path"], DEFAULT_TRTEXEC)
-        self.assertEqual(defaults["host"], "192.168.1.223")
+        self.assertEqual(defaults["host"], "")
         self.assertTrue(defaults["remember_password"])
         self.assertEqual(item["pathFields"], [])
         self.assertNotIn("output_filename", defaults)

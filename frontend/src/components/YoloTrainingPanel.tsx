@@ -15,6 +15,7 @@ import {
 import { icons } from '../icons'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { WorkingValues, YoloConnectionTestResult, YoloTrainingRecommendation, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from '../types'
+import { SshConnectionHistoryInput } from './SshConnectionHistoryInput'
 
 type Props = {
   values: WorkingValues
@@ -53,7 +54,7 @@ const fieldGroups: Array<{ title: string; description: string; defaultOpen?: boo
       { id: 'patience', label: '早停等待 patience', type: 'number', help: '验证指标连续多少轮没有改善后停止；0 表示关闭早停。', range: '≥ 0，常用 30–100' },
       { id: 'imgsz', label: '输入尺寸 imgsz', type: 'number', help: '训练输入图像尺寸。更大有利于小目标，但显存和训练时间明显增加。', range: '通常为 32 的倍数，如 640、960、1280' },
       { id: 'batch', label: '批量大小 batch', type: 'number', step: 'any', help: '每批图像数；-1 自动估算，0–1 可表示显存占用比例，正整数为固定批量。', range: '-1、0–1 或正整数' },
-      { id: 'device', label: '训练设备 device', help: 'GPU 编号或列表，例如 0、0,1；也可填写 cpu。多任务训练时应合理分配 GPU。' },
+      { id: 'device', label: '训练设备 device', help: '本项每次训练都必须手动填写，不保留默认值。填写 GPU 编号或列表，例如 0、0,1；也可填写 cpu。' },
       { id: 'workers', label: '数据线程 workers', type: 'number', help: '每个训练进程的数据加载线程数。过高可能占满 CPU 或共享内存。', range: '≥ 0，常用 4–16' },
       { id: 'project', label: '训练输出目录 project', browse: 'directory', help: '训练结果的父目录；最终结果保存在 project/name 下。' },
       { id: 'run_name', label: '本次训练名称 name', help: '本次实验子目录名。留空时平台自动生成 yolo26_日期_时间。' },
@@ -134,6 +135,42 @@ const augmentationPresets: AugmentationPreset[] = [
 
 const terminalStates = new Set<YoloTrainingSession['status']>(['completed', 'stopped', 'failed'])
 
+const trainingFields = fieldGroups.flatMap((group) => group.fields)
+
+function importedTrainingValues(raw: unknown): YoloTrainingValues {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('配置文件根节点必须是 JSON 对象。')
+  const document = raw as Record<string, unknown>
+  const rawParameters = document.parameters ?? document.values ?? document
+  if (!rawParameters || typeof rawParameters !== 'object' || Array.isArray(rawParameters)) throw new Error('配置文件中没有找到 parameters 参数对象。')
+  const parameters = rawParameters as Record<string, unknown>
+  const imported: YoloTrainingValues = {}
+  for (const field of trainingFields) {
+    if (!(field.id in parameters)) continue
+    const candidate = parameters[field.id]
+    const rawValue = candidate && typeof candidate === 'object' && !Array.isArray(candidate) && 'value' in candidate
+      ? (candidate as { value: unknown }).value
+      : candidate
+    if (field.type === 'number') {
+      const value = typeof rawValue === 'number' ? rawValue : Number(rawValue)
+      if (!Number.isFinite(value)) throw new Error(`参数 ${field.id} 必须是数字。`)
+      imported[field.id] = value
+    } else if (field.type === 'boolean') {
+      if (typeof rawValue === 'boolean') imported[field.id] = rawValue
+      else if (String(rawValue).toLowerCase() === 'true') imported[field.id] = true
+      else if (String(rawValue).toLowerCase() === 'false') imported[field.id] = false
+      else throw new Error(`参数 ${field.id} 必须是 true 或 false。`)
+    } else {
+      const value = String(rawValue ?? '')
+      if (field.type === 'select' && field.options && !field.options.includes(value)) {
+        throw new Error(`参数 ${field.id} 的值“${value}”不在允许选项中。`)
+      }
+      imported[field.id] = value
+    }
+  }
+  if (!Object.keys(imported).length) throw new Error('没有识别到可导入的 YOLO 训练参数。')
+  return imported
+}
+
 function automaticTrainingRunName(date = new Date()): string {
   const twoDigits = (value: number) => String(value).padStart(2, '0')
   return `yolo26_${twoDigits(date.getMonth() + 1)}${twoDigits(date.getDate())}_${twoDigits(date.getHours())}${twoDigits(date.getMinutes())}`
@@ -154,6 +191,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
   const checkedCredentialIdentity = useRef('')
   const appliedRecommendation = useRef('')
   const completedSession = useRef('')
+  const configImportInput = useRef<HTMLInputElement>(null)
 
   const host = String(values.parameters.remote_host || '').trim()
   const port = Number(values.parameters.remote_port || 22)
@@ -186,7 +224,8 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
 
   useEffect(() => {
     getYoloTrainingProfiles().then((payload) => {
-      setTrainingValues(payload.profiles[0] ? { ...payload.profiles[0].values } : payload.defaults)
+      const initialValues = payload.profiles[0] ? payload.profiles[0].values : payload.defaults
+      setTrainingValues({ ...initialValues, device: '' })
     }).catch((loadError) => {
       setError(loadError instanceof Error ? loadError.message : '训练参数加载失败')
     }).finally(() => setProfilesLoading(false))
@@ -277,6 +316,56 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
     setError('')
   }
 
+  const exportTrainingParameters = () => {
+    const parameterReference = Object.fromEntries(trainingFields.map((field) => [field.id, {
+      label: field.label,
+      type: field.type || 'text',
+      description: field.help,
+      range: field.range || '',
+      options: field.options || [],
+    }]))
+    const exportPayload = {
+      format: 'yolo-training-parameters',
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      aiInstructions: [
+        '请根据具体训练场景调整 parameters 中的值。',
+        '不要修改参数名，不要删除 format 和 version。',
+        '修改后仅返回合法 JSON，平台会校验字段类型和下拉选项。',
+      ],
+      parameters: Object.fromEntries(trainingFields.map((field) => [field.id, trainingValues[field.id] ?? ''])),
+      parameterReference,
+    }
+    const blob = new Blob([`${JSON.stringify(exportPayload, null, 2)}\n`], { type: 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, '')
+    link.href = url
+    link.download = `yolo_training_parameters_${timestamp}.json`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    setNotice('训练参数已导出为 JSON，可交给 AI 按场景修改后再导入。')
+    setError('')
+  }
+
+  const importTrainingParameters = async (file: File) => {
+    try {
+      const text = await file.text()
+      const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
+      const imported = importedTrainingValues(JSON.parse(cleaned))
+      setTrainingValues((current) => ({ ...current, ...imported }))
+      setAugmentationPreset('自定义（当前参数）')
+      setNotice(`已从 ${file.name} 导入 ${Object.keys(imported).length} 个训练参数，请确认后再开始训练。`)
+      setError('')
+    } catch (cause) {
+      setError(cause instanceof Error ? `训练参数导入失败：${cause.message}` : '训练参数导入失败。')
+    } finally {
+      if (configImportInput.current) configImportInput.current.value = ''
+    }
+  }
+
   const browseTrainingPath = async (field: TrainingField) => {
     if (!field.browse || remoteRequested) return
     try {
@@ -324,6 +413,10 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
   }
 
   const start = async () => {
+    if (!String(trainingValues.device || '').trim()) {
+      setError('请先填写本次训练使用的设备 device，例如 0、1、0,1 或 cpu。')
+      return
+    }
     if (remoteRequested && (!connectionReady || !currentConnectionCheck?.result)) {
       setError('请先测试 SSH 连接，连接成功后再开始远程模型训练。')
       return
@@ -356,6 +449,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
         startedAt: next.startedAt, finishedAt: next.finishedAt, error: next.error, result: next.result,
       }
       setSessions((current) => [summary, ...current.filter((item) => item.id !== next.id)])
+      setTrainingValues((current) => ({ ...current, device: '' }))
       if (remoteRequested) onParameterChange('remote_password', rememberPassword ? REMEMBERED_PASSWORD_VALUE : '')
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : '训练启动失败')
@@ -430,7 +524,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
     if (field.type === 'select') {
       return <span className="workspace-select"><select value={String(value)} onChange={(event) => changeTrainingValue(field.id, event.target.value)}>{field.options?.map((option) => <option value={option} key={option}>{option}</option>)}</select><icons.ChevronDown size={16} /></span>
     }
-    const input = <input type={field.type === 'number' ? 'number' : 'text'} step={field.step} value={String(value)} onChange={(event) => changeTrainingValue(field.id, field.type === 'number' && event.target.value !== '' ? Number(event.target.value) : event.target.value)} />
+    const input = <input type={field.type === 'number' ? 'number' : 'text'} step={field.step} value={String(value)} placeholder={field.id === 'device' ? '必填，例如 0、1、0,1 或 cpu' : undefined} onChange={(event) => changeTrainingValue(field.id, field.type === 'number' && event.target.value !== '' ? Number(event.target.value) : event.target.value)} />
     if (!field.browse) return input
     return <span className="training-path-input">{input}<button onClick={() => browseTrainingPath(field)} disabled={remoteRequested}>{remoteRequested ? '远程路径' : '浏览'}</button></span>
   }
@@ -449,6 +543,11 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
         {group.title === '数据增强' ? <div className="augmentation-preset-panel">
           <label><span>数据增强策略</span><span className="workspace-select"><select value={augmentationPreset} onChange={(event) => applyAugmentationPreset(event.target.value)}><option value="自定义（当前参数）">自定义（当前参数）</option>{augmentationPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}</select><icons.ChevronDown size={16} /></span></label>
           <p>{augmentationPresets.find((preset) => preset.name === augmentationPreset)?.description || '当前参数经过手动调整；可继续修改，或重新选择一个预设策略。'}</p>
+          <div className="training-config-transfer">
+            <button type="button" onClick={exportTrainingParameters}><icons.Download size={16} />导出全部训练参数</button>
+            <button type="button" onClick={() => configImportInput.current?.click()}><icons.Upload size={16} />导入 AI 参数文件</button>
+            <input ref={configImportInput} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void importTrainingParameters(file) }} />
+          </div>
         </div> : null}
         <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{group.fields.map((field) => <div className="parameter-row" key={field.id}><span className="parameter-label"><span>{field.label}</span><button type="button" className="parameter-help" aria-label={`查看 ${field.label} 说明`} data-tooltip={`${field.help}${field.range ? `\n范围：${field.range}` : ''}`}><icons.CircleHelp size={15} /></button></span>{renderTrainingField(field)}</div>)}</div>
       </details>)}
@@ -457,7 +556,9 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
         <div className="section-title"><icons.Code2 size={21} /><h2>训练位置与 SSH</h2></div>
         <p className="section-description">服务器信息全部留空时在本机执行；填写 IP 和用户名后在远程服务器执行。远程模式需要先测试连接。</p>
         <div className="training-connection-grid">
-          <label><span>服务器 IP / 主机名</span><input value={host} onChange={(event) => onParameterChange('remote_host', event.target.value)} placeholder="留空则本地训练" /></label>
+          <label><span>服务器 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={testingConnection || submitting} placeholder="留空则本地训练；也可选择历史服务器" onHostChange={(value) => onParameterChange('remote_host', value)} onSelect={(profile) => {
+            onParameterChange('remote_port', profile.port); onParameterChange('remote_username', profile.username); onParameterChange('remember_password', true); onParameterChange('remote_password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setCredentialNotice(profile.passwordRemembered ? '已选择历史服务器，并填充保存的 SSH 密码。' : '已选择历史服务器，请输入 SSH 密码。')
+          }} /></label>
           <label><span>SSH 端口</span><input type="number" value={port} onChange={(event) => onParameterChange('remote_port', Number(event.target.value))} /></label>
           <label><span>SSH 用户名</span><input value={username} onChange={(event) => onParameterChange('remote_username', event.target.value)} /></label>
           <label><span>SSH 密码</span><input type="password" autoComplete="current-password" value={displayedPassword} onFocus={() => { if (password === REMEMBERED_PASSWORD_VALUE) onParameterChange('remote_password', '') }} onChange={(event) => onParameterChange('remote_password', event.target.value)} placeholder="首次连接或未保存时输入" /></label>
