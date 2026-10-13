@@ -8,6 +8,8 @@
 
 GitHub Releases 会提供 Windows x86_64、Linux x86_64、macOS Intel 和 macOS Apple Silicon 四种安装包。下载与当前系统匹配的压缩包，解压后直接运行 `YOLO-Data-Platform`（macOS 为 `YOLO-Data-Platform.app`），无需另外安装 Python、Node.js 或项目依赖。
 
+Conda 不是平台启动的必需条件，也不会打进发行包。只有在使用依赖用户现有 AI 环境的功能（例如本地 PT 推理、ONNX 导出或启动 X-AnyLabeling）时，才由用户自行安装并在“本机设置”中选择对应环境。
+
 首次发布版本为 `v26.1.0`。未签名的 Windows/macOS 程序可能触发系统安全提示；确认下载来源为本项目 Release 后，可在系统安全设置中允许本次运行。
 
 ### 通用启动方式
