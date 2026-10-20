@@ -28,11 +28,16 @@ from .task_manager import TaskCancelled
 from .platform_paths import platform_data_dir
 
 
+REMOTE_ULTRALYTICS_SOURCE = "/home/dell/lqy/lqy/code/ultralytics"
+REMOTE_YOLO26_MODEL = f"{REMOTE_ULTRALYTICS_SOURCE}/yolo26n.pt"
+
+
 DEFAULT_TRAINING_VALUES: dict[str, Any] = {
     "yolo_executable": "yolo",
+    "ultralytics_source": REMOTE_ULTRALYTICS_SOURCE,
     "task": "detect",
     "data": "data.yaml",
-    "model": "yolo26n.pt",
+    "model": REMOTE_YOLO26_MODEL,
     "epochs": 200,
     "patience": 30,
     "imgsz": 640,
@@ -81,13 +86,8 @@ DEFAULT_TRAINING_VALUES: dict[str, Any] = {
 }
 
 TRAIN_ARGUMENT_ORDER = [
-    "data", "model", "epochs", "patience", "imgsz", "batch", "nbs", "workers",
-    "device", "project", "run_name", "seed", "deterministic", "amp", "cache", "rect",
-    "close_mosaic", "save_period", "plots", "mosaic", "mixup", "cutmix", "copy_paste",
-    "hsv_h", "hsv_s", "hsv_v", "bgr", "degrees",
-    "translate", "scale", "shear", "perspective", "fliplr", "flipud", "cls", "box",
-    "dfl", "cos_lr", "lr0", "lrf", "warmup_epochs", "multi_scale", "weight_decay",
-    "momentum", "warmup_momentum", "warmup_bias_lr", "optimizer",
+    "data", "model", "epochs", "patience", "imgsz", "batch", "workers",
+    "device", "project", "run_name",
 ]
 
 INTEGER_RANGES = {
@@ -148,6 +148,11 @@ def automatic_training_run_name(now: datetime | None = None) -> str:
 
 def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = True) -> dict[str, Any]:
     values = {**DEFAULT_TRAINING_VALUES, **{key: raw[key] for key in DEFAULT_TRAINING_VALUES if key in raw}}
+    # This streamlined workflow deliberately pins the source checkout and
+    # pretrained model so saved legacy profiles cannot silently switch them.
+    values["ultralytics_source"] = REMOTE_ULTRALYTICS_SOURCE
+    values["model"] = REMOTE_YOLO26_MODEL
+    values["task"] = "detect"
     for key, bounds in INTEGER_RANGES.items():
         values[key] = _number(values[key], key, *bounds, integer=True)
     for key, bounds in FLOAT_RANGES.items():
@@ -172,7 +177,7 @@ def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = 
     values["run_name"] = str(values.get("run_name", "")).strip()
     if generate_run_name and not values["run_name"]:
         values["run_name"] = automatic_training_run_name()
-    for key in ("yolo_executable", "task", "data", "model", "project", "optimizer"):
+    for key in ("yolo_executable", "ultralytics_source", "task", "data", "model", "project", "optimizer"):
         values[key] = str(values[key]).strip()
         if not values[key] and (generate_run_name or key not in {"data", "model", "project"}):
             raise ValueError(f"训练参数 {key} 不能为空。")
@@ -479,6 +484,16 @@ def _resolve_remote_yolo_executable(
 
 
 def _check_remote_training_paths(client: Any, values: dict[str, Any]) -> None:
+    source_path = str(values["ultralytics_source"])
+    source_check = (
+        f"test -d {shlex.quote(source_path)} && "
+        f"test -f {shlex.quote(str(Path(source_path) / 'pyproject.toml'))} && "
+        f"test -f {shlex.quote(str(Path(source_path) / 'ultralytics' / '__init__.py'))}"
+    )
+    status, _output, _error = _remote_capture(client, source_check)
+    if status != 0:
+        raise ValueError(f"远程 Ultralytics 源码目录不存在或结构不完整：{source_path}")
+
     data_path = str(values["data"])
     status, _output, _error = _remote_capture(client, f"test -f {shlex.quote(data_path)}")
     if status != 0:
@@ -510,7 +525,9 @@ def _conda_environment_for_yolo(executable: str) -> tuple[str, str] | None:
     return f"{match.group(1)}/etc/profile.d/conda.sh", match.group(2)
 
 
-def _remote_training_shell(command: list[str], token: str) -> tuple[str, str | None]:
+def _remote_training_shell(
+    command: list[str], token: str, source_dir: str | None = None
+) -> tuple[str, str | None]:
     executable = command[0]
     conda_environment = _conda_environment_for_yolo(executable)
     launch = f"exec -a {shlex.quote(token)} " + " ".join(shlex.quote(part) for part in command)
@@ -522,8 +539,13 @@ def _remote_training_shell(command: list[str], token: str) -> tuple[str, str | N
             f"source {shlex.quote(conda_script)}",
             f"conda activate {shlex.quote(environment_name)}",
         ))
+    if source_dir:
+        pieces.extend((
+            f"cd {shlex.quote(source_dir)}",
+            f"export PYTHONPATH={shlex.quote(source_dir)}${{PYTHONPATH:+:$PYTHONPATH}}",
+        ))
     model_argument = next((part.removeprefix("model=") for part in command if part.startswith("model=")), "")
-    if model_argument.startswith("/"):
+    if not source_dir and model_argument.startswith("/"):
         pieces.append(f"cd {shlex.quote(str(Path(model_argument).parent))}")
     pieces.append(launch)
     return "bash -lc " + shlex.quote(" && ".join(pieces)), environment_name
@@ -611,9 +633,12 @@ def _run_remote(context: RunContext, values: dict[str, Any]) -> dict[str, Any]:
         _validate_remote_model_archive(client, values)
         context.report("远程环境检查完成：data.yaml 与训练输出目录可用，模型参数已通过检查。")
         command = build_training_command(values)
-        remote_command, conda_environment = _remote_training_shell(command, token)
+        remote_command, conda_environment = _remote_training_shell(
+            command, token, str(values["ultralytics_source"])
+        )
         if conda_environment:
             context.report(f"已激活远程 Conda 环境：{conda_environment}")
+        context.report(f"远程训练源码：{values['ultralytics_source']}")
         context.report(f"远程训练命令：{shlex.join(command)}")
         status, _, _ = _remote_capture(client, "command -v tmux")
         if status:
@@ -792,8 +817,9 @@ class TrainingManager:
     def start(self, parameters: dict[str, Any], on_finished: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         values = normalize_training_values(parameters)
         remote = is_remote_yolo_parameters(parameters)
-        if remote:
-            resolve_tested_yolo_connection(parameters, "开始远程模型训练")["password"] = ""
+        if not remote:
+            raise ValueError("当前模型训练流程固定使用远程服务器，请填写并测试 SSH 连接。")
+        resolve_tested_yolo_connection(parameters, "开始远程模型训练")["password"] = ""
         session = TrainingSession(
             id=uuid.uuid4().hex[:16], remote=remote,
             model=str(values["model"]), device=str(values["device"]),

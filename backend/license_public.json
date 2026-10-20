@@ -1,0 +1,11 @@
+{
+  "publicKey": "T2GLKvZfdU_QexpsWTrPZsUEF9Xl0HbsYvi7NNM9Yl0",
+  "revocations": {
+    "payload": {
+      "ids": [
+        "0af6539254a0e73652e58a62"
+      ]
+    },
+    "signature": "zErKz3yVHHxbKf1kx06v1T4MheQIKzSUg9K2o1EPfyvx14riGCd_4c1y43HDQyh3WJlFCms2eO2NdRjIuqbzCg"
+  }
+}

@@ -22,12 +22,19 @@ class JetsonOnnxExportTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def _context(self, **parameters: object) -> RunContext:
+    def _context(
+        self,
+        *,
+        weights: Path | str | None = None,
+        notify=None,
+        **parameters: object,
+    ) -> RunContext:
         return RunContext(
             function_id="jetson_onnx_export",
-            paths={"weights_file": self.weights, "output_folder": self.root},
+            paths={"weights_file": Path(weights or self.weights), "output_folder": self.root},
             parameters={"python_path": str(self.python), **parameters},
             report=lambda _message: None,
+            notify=notify,
         )
 
     def test_catalog_defaults_are_jetson_static_export(self) -> None:
@@ -39,6 +46,8 @@ class JetsonOnnxExportTests(unittest.TestCase):
         self.assertEqual(defaults["target_platform"], "Jetson / TensorRT（NCHW）")
         self.assertEqual(defaults["imgsz"], 640)
         self.assertEqual(defaults["opset"], 12)
+        weight_field = next(field for field in item["pathFields"] if field["id"] == "weights_file")
+        self.assertIn("每行一个", weight_field["label"])
 
     def test_configuration_generates_cut_name_and_validates_imgsz(self) -> None:
         config = _configuration(self._context())
@@ -59,6 +68,62 @@ class JetsonOnnxExportTests(unittest.TestCase):
         self.assertEqual(result["onnxQuantDefaults"], {"inputOnnx": str(output)})
         self.assertEqual(output.read_bytes(), b"valid-onnx")
         self.assertEqual(self.weights.read_bytes(), b"weights")
+
+    def test_handler_exports_multiple_weights_and_returns_quantization_todos(self) -> None:
+        second = self.root / "second.pt"
+        second.write_bytes(b"second-weights")
+        notifications: list[tuple[str, str]] = []
+
+        def fake_run(command: list[str], _context: RunContext) -> None:
+            output = Path(command[command.index("--output") + 1])
+            output.write_bytes(b"valid-onnx")
+
+        context = self._context(
+            weights=f"{self.weights}\n{second}",
+            notify=lambda title, message: notifications.append((title, message)),
+        )
+        with patch("backend.jetson_onnx_export._run_process", side_effect=fake_run):
+            result = run_jetson_onnx_export(context)
+
+        expected = [str(self.root / "best_cut.onnx"), str(self.root / "second_cut.onnx")]
+        self.assertEqual(result["outputOnnxList"], expected)
+        self.assertEqual(result["outputFiles"], expected)
+        self.assertEqual(
+            result["onnxQuantDefaultsList"],
+            [{"inputOnnx": output} for output in expected],
+        )
+        self.assertEqual(len(notifications), 2)
+        self.assertTrue(all(Path(output).read_bytes() == b"valid-onnx" for output in expected))
+
+    def test_batch_export_rejects_single_model_output_name(self) -> None:
+        second = self.root / "second.pt"
+        second.write_bytes(b"weights")
+        with self.assertRaisesRegex(ValueError, "批量导出时"):
+            run_jetson_onnx_export(self._context(
+                weights=f"{self.weights}\n{second}", output_filename="fixed.onnx"
+            ))
+
+    def test_batch_export_keeps_successes_when_one_model_fails(self) -> None:
+        second = self.root / "second.pt"
+        second.write_bytes(b"second-weights")
+        calls = 0
+
+        def fake_run(command: list[str], _context: RunContext) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated failure")
+            output = Path(command[command.index("--output") + 1])
+            output.write_bytes(b"valid-onnx")
+
+        with patch("backend.jetson_onnx_export._run_process", side_effect=fake_run):
+            result = run_jetson_onnx_export(self._context(weights=f"{self.weights}\n{second}"))
+
+        self.assertEqual(result["outputOnnxList"], [str(self.root / "second_cut.onnx")])
+        self.assertEqual(len(result["failedFiles"]), 1)
+        self.assertIn("成功 1 个，失败 1 个", result["message"])
+        self.assertFalse((self.root / "best_cut.onnx").exists())
+        self.assertTrue((self.root / "second_cut.onnx").exists())
 
     def test_yolov5_requires_repository_and_uses_its_export_script(self) -> None:
         with self.assertRaisesRegex(ValueError, "源码仓库目录"):

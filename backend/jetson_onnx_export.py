@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import queue
@@ -51,14 +52,48 @@ def _resolve_python(raw: Any) -> Path:
     return path.resolve()
 
 
-def _configuration(context: RunContext) -> dict[str, Any]:
-    weights = context.paths.get("weights_file")
-    if not weights or weights.suffix.lower() != ".pt" or not weights.is_file():
-        raise ValueError("请选择存在的本地 PT 权重文件。")
+def _weight_paths(context: RunContext) -> list[Path]:
+    raw = str(context.paths.get("weights_file") or "").strip()
+    if not raw:
+        raise ValueError("请选择至少一个存在的本地 PT 权重文件。")
+    try:
+        candidates = json.loads(raw) if raw.startswith("[") else raw.splitlines()
+    except json.JSONDecodeError as exc:
+        raise ValueError("PT 权重路径格式不正确，请每行填写一个文件路径。") from exc
+    if not isinstance(candidates, list):
+        raise ValueError("PT 权重路径格式不正确，请每行填写一个文件路径。")
+    weights: list[Path] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(candidates, start=1):
+        text = str(candidate).strip()
+        if not text:
+            continue
+        path = Path(text).expanduser()
+        if path.suffix.lower() != ".pt" or not path.is_file():
+            raise ValueError(f"第 {index} 个 PT 权重文件不存在或格式不正确：{path}")
+        resolved = path.resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            weights.append(resolved)
+    if not weights:
+        raise ValueError("请选择至少一个存在的本地 PT 权重文件。")
+    return weights
+
+
+def _configuration(
+    context: RunContext, weights: Path | None = None, total_weights: int | None = None
+) -> dict[str, Any]:
+    all_weights = _weight_paths(context) if weights is None else [weights]
+    weights = all_weights[0]
+    total_weights = total_weights or len(all_weights)
     output_folder = context.paths.get("output_folder") or weights.parent
     if not output_folder.is_dir():
         raise ValueError("输出文件夹不存在。")
-    output_name = str(context.parameters.get("output_filename", "")).strip() or f"{weights.stem}_cut.onnx"
+    requested_output_name = str(context.parameters.get("output_filename", "")).strip()
+    if total_weights > 1 and requested_output_name:
+        raise ValueError("批量导出时请将“单模型输出文件名”留空，平台会分别按 PT 文件名生成 ONNX。")
+    output_name = requested_output_name or f"{weights.stem}_cut.onnx"
     if Path(output_name).name != output_name or not output_name.lower().endswith(".onnx"):
         raise ValueError("输出文件名只能填写一个以 .onnx 结尾的文件名。")
     output = (output_folder / output_name).resolve()
@@ -155,14 +190,7 @@ def _run_process(command: list[str], context: RunContext) -> None:
         raise
 
 
-def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
-    config = _configuration(context)
-    context.report(f"使用 YOLO 环境：{config['python']}")
-    context.report(
-        f"输入权重：{config['weights']}\n输出 ONNX：{config['output']}\n"
-        f"模型版本：{config['model_family']}；任务：{config['task_name']}；平台：{config['platform_name']}；"
-        f"imgsz={config['imgsz']}；opset={config['opset']}"
-    )
+def _export_one(config: dict[str, Any], context: RunContext) -> None:
     context.check_cancelled()
     with tempfile.TemporaryDirectory(prefix=".processing-view-export-", dir=config["output"].parent) as temporary:
         work = Path(temporary)
@@ -195,20 +223,70 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
         if not temporary_output.is_file() or temporary_output.stat().st_size == 0:
             raise RuntimeError("导出进程已结束，但没有生成有效的 ONNX 文件。")
         temporary_output.replace(config["output"])
-    size_mb = config["output"].stat().st_size / 1024 / 1024
-    context.report(f"Jetson 适配 ONNX 导出完成：{config['output']}（{size_mb:.1f} MB）")
+
+
+def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
+    weights = _weight_paths(context)
+    configs = [_configuration(context, weight, len(weights)) for weight in weights]
+    output_paths = [str(config["output"]) for config in configs]
+    if len(set(output_paths)) != len(output_paths):
+        raise ValueError("多个 PT 会生成同名 ONNX，请选择不同的输出文件夹，或调整 PT 文件名后重试。")
+    first = configs[0]
+    context.report(f"使用 YOLO 环境：{first['python']}")
+    context.report(
+        f"共 {len(configs)} 个 PT 等待导出；模型版本：{first['model_family']}；"
+        f"任务：{first['task_name']}；平台：{first['platform_name']}；"
+        f"imgsz={first['imgsz']}；opset={first['opset']}"
+    )
+    completed: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    for index, config in enumerate(configs, start=1):
+        context.check_cancelled()
+        context.report(
+            f"[{index}/{len(configs)}] 开始导出：{config['weights'].name}\n"
+            f"输入权重：{config['weights']}\n输出 ONNX：{config['output']}"
+        )
+        try:
+            _export_one(config, context)
+        except TaskCancelled:
+            raise
+        except Exception as exc:
+            message = str(exc)
+            failures.append({"weights": str(config["weights"]), "error": message})
+            context.report(f"[{index}/{len(configs)}] 导出失败：{config['weights'].name}：{message}")
+            continue
+        completed.append(config)
+        size_mb = config["output"].stat().st_size / 1024 / 1024
+        context.report(f"[{index}/{len(configs)}] 导出完成：{config['output']}（{size_mb:.1f} MB）")
+        context.send_notification(
+            "Jetson ONNX 导出完成",
+            f"{index}/{len(configs)}：{config['weights'].name} → {config['output'].name}",
+        )
+    if not completed:
+        summary = "；".join(f"{Path(item['weights']).name}：{item['error']}" for item in failures)
+        raise RuntimeError(f"全部 {len(configs)} 个 PT 均导出失败：{summary}")
+    outputs = [str(config["output"]) for config in completed]
+    folders = list(dict.fromkeys(str(config["output"].parent) for config in completed))
+    message = f"Jetson 适配 ONNX 批量导出完成：成功 {len(completed)} 个"
+    if failures:
+        message += f"，失败 {len(failures)} 个；失败项已在日志中列出"
+    message += "。"
     return {
-        "message": f"Jetson 适配 ONNX 导出完成：{config['output'].name}。",
-        "outputFiles": [str(config["output"])],
-        "outputFolders": [str(config["output"].parent)],
-        "inputWeights": str(config["weights"]),
-        "outputOnnx": str(config["output"]),
-        "taskType": config["task_name"],
-        "targetPlatform": config["platform_name"],
-        "imgsz": config["imgsz"],
-        "opset": config["opset"],
-        "modelFamily": config["model_family"],
-        "onnxQuantDefaults": {"inputOnnx": str(config["output"])},
+        "message": message,
+        "outputFiles": outputs,
+        "outputFolders": folders,
+        "inputWeights": str(completed[0]["weights"]),
+        "inputWeightsList": [str(config["weights"]) for config in completed],
+        "outputOnnx": outputs[0],
+        "outputOnnxList": outputs,
+        "failedFiles": failures,
+        "taskType": first["task_name"],
+        "targetPlatform": first["platform_name"],
+        "imgsz": first["imgsz"],
+        "opset": first["opset"],
+        "modelFamily": first["model_family"],
+        "onnxQuantDefaults": {"inputOnnx": outputs[0]},
+        "onnxQuantDefaultsList": [{"inputOnnx": output} for output in outputs],
     }
 
 

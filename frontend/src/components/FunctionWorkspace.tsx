@@ -59,6 +59,7 @@ export function FunctionWorkspace(props: Props) {
   const isRemoteStarWorkspace = item.handlerId === 'remote.star_inference'
   const isRemoteTrtWorkspace = item.handlerId === 'remote.build_tensorrt'
   const isLocalStarPackageWorkspace = item.handlerId === 'model.package_star'
+  const isJetsonOnnxExportWorkspace = item.handlerId === 'model.export_jetson_onnx'
   const currentTask = isYoloTrainingWorkspace ? undefined : props.activeTasks.find((task) => task.functionId === item.id && !task.name.startsWith('YOLO 训练 ·'))
   const visibleParameters = item.parameters.filter((field) =>
     (!field.visibleWhen
@@ -85,7 +86,7 @@ export function FunctionWorkspace(props: Props) {
       <section className="workspace-section">
         <div className="section-title"><icons.Folder size={21} /><h2>数据路径</h2></div>
         <div className="path-fields">
-          {visiblePathFields.map((field) => <label className="path-field" key={field.id}><span>{field.label}</span><div><input value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={remoteYoloPaths ? '请输入远程服务器上的绝对路径' : `请选择或粘贴${field.mode === 'file' ? '文件' : '文件夹'}路径`} /><button onClick={() => props.onBrowse(field.id, field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : undefined}>{remoteYoloPaths ? '远程路径' : '浏览'}</button></div></label>)}
+          {visiblePathFields.map((field) => <label className="path-field" key={field.id}><span>{field.label}</span><div>{isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? <textarea rows={6} value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={'/path/to/model_a.pt\n/path/to/model_b.pt'} /> : <input value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={remoteYoloPaths ? '请输入远程服务器上的绝对路径' : `请选择或粘贴${field.mode === 'file' ? '文件' : '文件夹'}路径`} />}<button onClick={() => props.onBrowse(field.id, isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? 'multiple' : field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : undefined}>{remoteYoloPaths ? '远程路径' : isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? '选择多个 PT' : '浏览'}</button></div></label>)}
           {!visiblePathFields.length ? <p className="section-empty">尚未定义数据路径，接入功能时再添加。</p> : null}
         </div>
         {!isRemoteStarWorkspace ? <button className="text-action" onClick={props.onAddPath}><icons.Plus size={17} />添加路径</button> : null}

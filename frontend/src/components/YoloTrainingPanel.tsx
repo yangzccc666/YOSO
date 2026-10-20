@@ -45,11 +45,11 @@ type ConnectionCheck = {
 const fieldGroups: Array<{ title: string; description: string; defaultOpen?: boolean; fields: TrainingField[] }> = [
   {
     title: '常用训练配置',
-    description: '最常修改的数据、模型、轮次、批量大小、尺寸、GPU 和输出位置。',
+    description: '填写远端 data.yaml，并配置轮次、批量大小、尺寸、GPU 和输出位置。训练固定使用远端源码与 yolo26n.pt。',
     defaultOpen: true,
     fields: [
       { id: 'data', label: 'data.yaml 路径', browse: 'file', help: '数据集配置文件，定义 train/val/test 路径、类别数量和类别名称。' },
-      { id: 'model', label: '预训练模型 model', help: '预训练 .pt 权重或模型 YAML。使用预训练权重通常能更快收敛。' },
+      { id: 'model', label: '预训练模型 model（固定）', help: '固定使用远端 Ultralytics 源码目录中的 yolo26n.pt，避免误选其他模型。' },
       { id: 'epochs', label: '训练轮次 epochs', type: 'number', help: '完整遍历训练集的最大次数；与 patience 共同决定实际训练时长。', range: '建议 50–500，当前工业任务默认 200' },
       { id: 'patience', label: '早停等待 patience', type: 'number', help: '验证指标连续多少轮没有改善后停止；0 表示关闭早停。', range: '≥ 0，常用 30–100' },
       { id: 'imgsz', label: '输入尺寸 imgsz', type: 'number', help: '训练输入图像尺寸。更大有利于小目标，但显存和训练时间明显增加。', range: '通常为 32 的倍数，如 640、960、1280' },
@@ -60,116 +60,10 @@ const fieldGroups: Array<{ title: string; description: string; defaultOpen?: boo
       { id: 'run_name', label: '本次训练名称 name', help: '本次实验子目录名。留空时平台自动生成 yolo26_日期_时间。' },
     ],
   },
-  {
-    title: '数据增强',
-    description: '先选择工业场景策略，再按需要微调；切换策略只修改本组增强参数。',
-    defaultOpen: true,
-    fields: [
-      { id: 'hsv_h', label: '色相扰动 hsv_h', type: 'number', step: '0.001', help: '按色轮比例随机改变色相，增强不同灯光颜色下的泛化能力。', range: '官方范围 0–1，默认 0.015' },
-      { id: 'hsv_s', label: '饱和度扰动 hsv_s', type: 'number', step: '0.01', help: '随机改变颜色饱和度，模拟颜色浓淡和成像差异。', range: '官方范围 0–1，默认 0.7' },
-      { id: 'hsv_v', label: '亮度扰动 hsv_v', type: 'number', step: '0.01', help: '随机改变明暗，是处理光线变化最直接的增强参数。', range: '官方范围 0–1，默认 0.4' },
-      { id: 'mosaic', label: '拼图概率 mosaic', type: 'number', step: '0.01', help: '把 4 张训练图组合为一张，可增加场景和尺度多样性，对小目标常有帮助。', range: '官方范围 0–1' },
-      { id: 'mixup', label: '图像混合概率 mixup', type: 'number', step: '0.01', help: '混合两张图及其标签，提高泛化但会引入视觉与标签噪声。', range: '官方范围 0–1' },
-      { id: 'cutmix', label: '区域混合概率 cutmix', type: 'number', step: '0.01', help: '将另一张图的局部区域贴入当前图，适合增强遮挡鲁棒性。', range: '官方范围 0–1；检测/分割/姿态/OBB 可用' },
-      { id: 'degrees', label: '旋转角度 degrees', type: 'number', step: '0.1', help: '在正负该角度内随机旋转。固定方向工位不宜设置过大。', range: '官方范围 0–180°' },
-      { id: 'translate', label: '平移比例 translate', type: 'number', step: '0.01', help: '按图像尺寸比例随机水平和垂直平移，有助于学习部分可见目标。', range: '官方范围 0–1' },
-      { id: 'scale', label: '缩放幅度 scale', type: 'number', step: '0.01', help: '随机缩放图像，模拟目标距离变化；数值越大尺度变化越强。', range: '官方常用范围 0–1' },
-      { id: 'shear', label: '剪切角度 shear', type: 'number', step: '0.1', help: '随机剪切图像。工业固定相机通常只需很小的值。', range: '官方范围 0–180°' },
-      { id: 'perspective', label: '透视变化 perspective', type: 'number', step: '0.0001', help: '增加透视形变；固定机位应谨慎使用，过大会扭曲工件。', range: '官方范围 0–0.001' },
-      { id: 'fliplr', label: '水平翻转概率 fliplr', type: 'number', step: '0.01', help: '水平翻转概率。左右方向具有业务含义时应设为 0。', range: '官方范围 0–1' },
-      { id: 'flipud', label: '垂直翻转概率 flipud', type: 'number', step: '0.01', help: '垂直翻转概率。多数固定工业相机建议保持 0。', range: '官方范围 0–1' },
-      { id: 'bgr', label: 'RGB/BGR 通道交换概率 bgr', type: 'number', step: '0.01', help: '按概率交换 RGB 与 BGR 通道；仅在颜色不具有明确业务含义时谨慎尝试。', range: '官方范围 0–1' },
-      { id: 'copy_paste', label: '复制粘贴概率 copy_paste', type: 'number', step: '0.01', help: '复制目标实例进行增强，官方主要支持分割和旋转框任务。', range: '官方范围 0–1；detect 通常保持 0' },
-    ],
-  },
-  {
-    title: '训练稳定性与性能',
-    description: '学习率、优化器、精度、复现、缓存和训练后期稳定策略。',
-    fields: [
-      { id: 'optimizer', label: '优化器 optimizer', type: 'select', options: ['SGD', 'Adam', 'AdamW', 'NAdam', 'RAdam', 'RMSProp', 'auto'], help: '选择权重更新算法；auto 让 Ultralytics 根据训练配置选择。' },
-      { id: 'lr0', label: '初始学习率 lr0', type: 'number', step: '0.0001', help: '训练开始时的学习率。过大会震荡，过小会收敛缓慢。', range: '通常 SGD 约 0.01，Adam 类约 0.001' },
-      { id: 'lrf', label: '最终学习率比例 lrf', type: 'number', step: '0.001', help: '最终学习率相对于 lr0 的比例。', range: '0–1' },
-      { id: 'momentum', label: '动量 momentum', type: 'number', step: '0.001', help: 'SGD 动量或 Adam beta1，帮助平滑梯度并加速收敛。', range: '0–1，官方默认 0.937' },
-      { id: 'weight_decay', label: '权重衰减 weight_decay', type: 'number', step: '0.0001', help: 'L2 正则强度，用于抑制过拟合。', range: '≥ 0，官方默认 0.0005' },
-      { id: 'cos_lr', label: '余弦学习率 cos_lr', type: 'boolean', help: '使用余弦曲线逐步降低学习率，通常适合较长训练。' },
-      { id: 'warmup_epochs', label: '预热轮次 warmup_epochs', type: 'number', step: '0.1', help: '训练开始时逐步提高学习率，降低初期不稳定。', range: '≥ 0，官方默认 3' },
-      { id: 'warmup_momentum', label: '预热初始动量 warmup_momentum', type: 'number', step: '0.01', help: '预热阶段起始动量，随后过渡到 momentum。', range: '0–1，官方默认 0.8' },
-      { id: 'warmup_bias_lr', label: '偏置预热学习率 warmup_bias_lr', type: 'number', step: '0.01', help: '预热阶段偏置参数的初始学习率。', range: '0–1，官方默认 0.1' },
-      { id: 'amp', label: '混合精度 amp', type: 'boolean', help: 'CUDA 上使用 FP16 混合精度，通常能降低显存并加速训练。发生数值异常时可关闭。' },
-      { id: 'close_mosaic', label: '最后关闭 Mosaic 轮次 close_mosaic', type: 'number', help: '最后 N 轮关闭 Mosaic，使训练末期回到自然图像分布并稳定收敛。', range: '≥ 0，官方默认 10；0 表示不关闭' },
-      { id: 'cache', label: '图像缓存 cache', type: 'select', options: ['False', 'ram', 'disk'], help: '缓存训练图像以减少读取开销。ram 最快但占内存，disk 较省内存但占磁盘。' },
-      { id: 'rect', label: '矩形训练 rect', type: 'boolean', help: '按相近宽高比分批以减少填充；可能影响随机打乱和部分增强方式。' },
-      { id: 'multi_scale', label: '多尺度训练 multi_scale', type: 'number', step: '0.01', help: '训练时随机改变 imgsz 的幅度，提高对不同输入尺度的适应性。', range: '0–1，0 表示关闭' },
-      { id: 'seed', label: '随机种子 seed', type: 'number', help: '控制数据打乱和随机增强，配合 deterministic 提高复现性。', range: '≥ 0' },
-      { id: 'deterministic', label: '确定性训练 deterministic', type: 'boolean', help: '尽量使用确定性算法，便于复现实验；可能略微降低速度。' },
-      { id: 'save_period', label: '定期保存 save_period', type: 'number', help: '每隔 N 轮额外保存检查点；-1 表示只采用默认保存策略。', range: '-1 或正整数' },
-      { id: 'plots', label: '生成训练图表 plots', type: 'boolean', help: '生成损失曲线、PR 曲线和样本预测等可视化结果。' },
-    ],
-  },
-  {
-    title: '高级配置与损失权重',
-    description: '一般保持默认，只有明确实验依据时再调整。',
-    fields: [
-      { id: 'task', label: '训练任务类型 task', type: 'select', options: ['detect', 'segment', 'classify', 'pose', 'obb'], help: 'Ultralytics 任务类型；当前数据集划分主要面向 detect。' },
-      { id: 'yolo_executable', label: 'YOLO 命令或可执行文件路径', help: '本地/远程 yolo 可执行文件。填写 yolo 时，远程会自动查找匹配模型系列的 Conda 环境。' },
-      { id: 'nbs', label: '标称批量 nbs', type: 'number', help: '用于按实际 batch 缩放部分超参数的名义批量大小。', range: '> 0，官方常用默认 64' },
-      { id: 'cls', label: '分类损失权重 cls', type: 'number', step: '0.01', help: '类别预测损失的权重。类别混淆严重时可实验性调整。', range: '≥ 0' },
-      { id: 'box', label: '边框损失权重 box', type: 'number', step: '0.01', help: '边界框回归损失权重，影响定位精度。', range: '≥ 0' },
-      { id: 'dfl', label: 'DFL 损失权重 dfl', type: 'number', step: '0.01', help: '分布焦点损失权重，参与更精细的边框定位。', range: '≥ 0' },
-    ],
-  },
-]
-
-const augmentationFields = ['hsv_h', 'hsv_s', 'hsv_v', 'mosaic', 'mixup', 'cutmix', 'degrees', 'translate', 'scale', 'shear', 'perspective', 'fliplr', 'flipud', 'bgr', 'copy_paste'] as const
-type AugmentationField = typeof augmentationFields[number]
-type AugmentationPreset = { name: string; description: string; values: Record<AugmentationField, number> }
-
-const augmentationPresets: AugmentationPreset[] = [
-  { name: '工业保守（推荐）', description: '固定相机、方向明确的常规工位，避免制造不符合现场规律的样本。', values: { hsv_h: 0.01, hsv_s: 0.35, hsv_v: 0.3, mosaic: 0.2, mixup: 0, cutmix: 0, degrees: 3, translate: 0.06, scale: 0.25, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
-  { name: '光线变化', description: '跨白天、夜间、曝光和灯光颜色变化，增强 HSV 并保持几何变化适中。', values: { hsv_h: 0.025, hsv_s: 0.65, hsv_v: 0.55, mosaic: 0.2, mixup: 0, cutmix: 0, degrees: 3, translate: 0.06, scale: 0.25, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
-  { name: '小目标加强', description: '目标在画面中占比较小，使用更强的 Mosaic、缩放和平移增加尺度与位置变化。', values: { hsv_h: 0.015, hsv_s: 0.5, hsv_v: 0.4, mosaic: 1, mixup: 0.05, cutmix: 0, degrees: 5, translate: 0.12, scale: 0.5, shear: 0, perspective: 0, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
-  { name: '遮挡与复杂背景', description: '人员、工具或工件容易互相遮挡，增加 Mosaic、MixUp 和 CutMix。', values: { hsv_h: 0.015, hsv_s: 0.5, hsv_v: 0.4, mosaic: 0.7, mixup: 0.1, cutmix: 0.15, degrees: 5, translate: 0.1, scale: 0.4, shear: 1, perspective: 0.0002, fliplr: 0, flipud: 0, bgr: 0, copy_paste: 0 } },
-  { name: 'Ultralytics 官方默认', description: '恢复官方通用增强默认值；水平翻转可能不适合方向固定的工业场景。', values: { hsv_h: 0.015, hsv_s: 0.7, hsv_v: 0.4, mosaic: 1, mixup: 0, cutmix: 0, degrees: 0, translate: 0.1, scale: 0.5, shear: 0, perspective: 0, fliplr: 0.5, flipud: 0, bgr: 0, copy_paste: 0 } },
-  { name: '关闭可配置增强', description: '将界面可控制的增强参数全部设为 0；Ultralytics 安装 Albumentations 时仍可能有内置轻量增强。', values: Object.fromEntries(augmentationFields.map((field) => [field, 0])) as Record<AugmentationField, number> },
 ]
 
 const terminalStates = new Set<YoloTrainingSession['status']>(['completed', 'stopped', 'failed'])
 
-const trainingFields = fieldGroups.flatMap((group) => group.fields)
-
-function importedTrainingValues(raw: unknown): YoloTrainingValues {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('配置文件根节点必须是 JSON 对象。')
-  const document = raw as Record<string, unknown>
-  const rawParameters = document.parameters ?? document.values ?? document
-  if (!rawParameters || typeof rawParameters !== 'object' || Array.isArray(rawParameters)) throw new Error('配置文件中没有找到 parameters 参数对象。')
-  const parameters = rawParameters as Record<string, unknown>
-  const imported: YoloTrainingValues = {}
-  for (const field of trainingFields) {
-    if (!(field.id in parameters)) continue
-    const candidate = parameters[field.id]
-    const rawValue = candidate && typeof candidate === 'object' && !Array.isArray(candidate) && 'value' in candidate
-      ? (candidate as { value: unknown }).value
-      : candidate
-    if (field.type === 'number') {
-      const value = typeof rawValue === 'number' ? rawValue : Number(rawValue)
-      if (!Number.isFinite(value)) throw new Error(`参数 ${field.id} 必须是数字。`)
-      imported[field.id] = value
-    } else if (field.type === 'boolean') {
-      if (typeof rawValue === 'boolean') imported[field.id] = rawValue
-      else if (String(rawValue).toLowerCase() === 'true') imported[field.id] = true
-      else if (String(rawValue).toLowerCase() === 'false') imported[field.id] = false
-      else throw new Error(`参数 ${field.id} 必须是 true 或 false。`)
-    } else {
-      const value = String(rawValue ?? '')
-      if (field.type === 'select' && field.options && !field.options.includes(value)) {
-        throw new Error(`参数 ${field.id} 的值“${value}”不在允许选项中。`)
-      }
-      imported[field.id] = value
-    }
-  }
-  if (!Object.keys(imported).length) throw new Error('没有识别到可导入的 YOLO 训练参数。')
-  return imported
-}
 
 function automaticTrainingRunName(date = new Date()): string {
   const twoDigits = (value: number) => String(value).padStart(2, '0')
@@ -179,7 +73,6 @@ function automaticTrainingRunName(date = new Date()): string {
 export function YoloTrainingPanel({ values, onParameterChange, recommendation, onCompleted }: Props) {
   const [trainingValues, setTrainingValues] = useState<YoloTrainingValues>({})
   const [profilesLoading, setProfilesLoading] = useState(true)
-  const [augmentationPreset, setAugmentationPreset] = useState('自定义（当前参数）')
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [connectionCheck, setConnectionCheck] = useState<ConnectionCheck | null>(null)
@@ -191,7 +84,6 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
   const checkedCredentialIdentity = useRef('')
   const appliedRecommendation = useRef('')
   const completedSession = useRef('')
-  const configImportInput = useRef<HTMLInputElement>(null)
 
   const host = String(values.parameters.remote_host || '').trim()
   const port = Number(values.parameters.remote_port || 22)
@@ -303,67 +195,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
 
   const changeTrainingValue = (fieldId: string, value: string | number | boolean) => {
     setTrainingValues((current) => ({ ...current, [fieldId]: value }))
-    if (augmentationFields.includes(fieldId as AugmentationField)) setAugmentationPreset('自定义（当前参数）')
     setNotice('')
-  }
-
-  const applyAugmentationPreset = (name: string) => {
-    setAugmentationPreset(name)
-    const preset = augmentationPresets.find((item) => item.name === name)
-    if (!preset) return
-    setTrainingValues((current) => ({ ...current, ...preset.values }))
-    setNotice(`已应用数据增强策略“${preset.name}”，仍可继续微调下方参数。`)
-    setError('')
-  }
-
-  const exportTrainingParameters = () => {
-    const parameterReference = Object.fromEntries(trainingFields.map((field) => [field.id, {
-      label: field.label,
-      type: field.type || 'text',
-      description: field.help,
-      range: field.range || '',
-      options: field.options || [],
-    }]))
-    const exportPayload = {
-      format: 'yolo-training-parameters',
-      version: 1,
-      generatedAt: new Date().toISOString(),
-      aiInstructions: [
-        '请根据具体训练场景调整 parameters 中的值。',
-        '不要修改参数名，不要删除 format 和 version。',
-        '修改后仅返回合法 JSON，平台会校验字段类型和下拉选项。',
-      ],
-      parameters: Object.fromEntries(trainingFields.map((field) => [field.id, trainingValues[field.id] ?? ''])),
-      parameterReference,
-    }
-    const blob = new Blob([`${JSON.stringify(exportPayload, null, 2)}\n`], { type: 'application/json;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, '')
-    link.href = url
-    link.download = `yolo_training_parameters_${timestamp}.json`
-    document.body.appendChild(link)
-    link.click()
-    link.remove()
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
-    setNotice('训练参数已导出为 JSON，可交给 AI 按场景修改后再导入。')
-    setError('')
-  }
-
-  const importTrainingParameters = async (file: File) => {
-    try {
-      const text = await file.text()
-      const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '')
-      const imported = importedTrainingValues(JSON.parse(cleaned))
-      setTrainingValues((current) => ({ ...current, ...imported }))
-      setAugmentationPreset('自定义（当前参数）')
-      setNotice(`已从 ${file.name} 导入 ${Object.keys(imported).length} 个训练参数，请确认后再开始训练。`)
-      setError('')
-    } catch (cause) {
-      setError(cause instanceof Error ? `训练参数导入失败：${cause.message}` : '训练参数导入失败。')
-    } finally {
-      if (configImportInput.current) configImportInput.current.value = ''
-    }
   }
 
   const browseTrainingPath = async (field: TrainingField) => {
@@ -413,11 +245,15 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
   }
 
   const start = async () => {
+    if (!host || !username) {
+      setError('当前训练流程固定在远程服务器运行，请填写服务器 IP 和 SSH 用户名。')
+      return
+    }
     if (!String(trainingValues.device || '').trim()) {
       setError('请先填写本次训练使用的设备 device，例如 0、1、0,1 或 cpu。')
       return
     }
-    if (remoteRequested && (!connectionReady || !currentConnectionCheck?.result)) {
+    if (!connectionReady || !currentConnectionCheck?.result) {
       setError('请先测试 SSH 连接，连接成功后再开始远程模型训练。')
       return
     }
@@ -524,7 +360,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
     if (field.type === 'select') {
       return <span className="workspace-select"><select value={String(value)} onChange={(event) => changeTrainingValue(field.id, event.target.value)}>{field.options?.map((option) => <option value={option} key={option}>{option}</option>)}</select><icons.ChevronDown size={16} /></span>
     }
-    const input = <input type={field.type === 'number' ? 'number' : 'text'} step={field.step} value={String(value)} placeholder={field.id === 'device' ? '必填，例如 0、1、0,1 或 cpu' : undefined} onChange={(event) => changeTrainingValue(field.id, field.type === 'number' && event.target.value !== '' ? Number(event.target.value) : event.target.value)} />
+    const input = <input type={field.type === 'number' ? 'number' : 'text'} step={field.step} value={String(value)} disabled={field.id === 'model'} placeholder={field.id === 'device' ? '必填，例如 0、1、0,1 或 cpu' : undefined} onChange={(event) => changeTrainingValue(field.id, field.type === 'number' && event.target.value !== '' ? Number(event.target.value) : event.target.value)} />
     if (!field.browse) return input
     return <span className="training-path-input">{input}<button onClick={() => browseTrainingPath(field)} disabled={remoteRequested}>{remoteRequested ? '远程路径' : '浏览'}</button></span>
   }
@@ -533,30 +369,21 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
   const connectionError = currentConnectionCheck?.state === 'failed' ? currentConnectionCheck.error : ''
   const statusLabel = session ? {
     starting: '正在准备训练', running: '训练运行中', disconnected: '等待重新连接', stopping: '正在终止', completed: '训练完成', stopped: '已停止', failed: '训练失败',
-  }[session.status] : remoteRequested ? (connectionReady ? 'SSH 连接成功' : '等待连接测试') : '本地训练'
+  }[session.status] : connectionReady ? 'SSH 连接成功' : '等待连接测试'
 
   return (
     <div className="yolo-training-workspace">
       {notice ? <div className="credential-notice training-parameter-notice" role="status"><icons.Check size={18} /><span>{notice}</span></div> : null}
       {fieldGroups.map((group) => <details className="training-parameter-group" open={group.defaultOpen} key={group.title}>
         <summary><span><strong>{group.title}</strong><small>{group.description}</small></span><icons.ChevronRight size={18} /></summary>
-        {group.title === '数据增强' ? <div className="augmentation-preset-panel">
-          <label><span>数据增强策略</span><span className="workspace-select"><select value={augmentationPreset} onChange={(event) => applyAugmentationPreset(event.target.value)}><option value="自定义（当前参数）">自定义（当前参数）</option>{augmentationPresets.map((preset) => <option value={preset.name} key={preset.name}>{preset.name}</option>)}</select><icons.ChevronDown size={16} /></span></label>
-          <p>{augmentationPresets.find((preset) => preset.name === augmentationPreset)?.description || '当前参数经过手动调整；可继续修改，或重新选择一个预设策略。'}</p>
-          <div className="training-config-transfer">
-            <button type="button" onClick={exportTrainingParameters}><icons.Download size={16} />导出全部训练参数</button>
-            <button type="button" onClick={() => configImportInput.current?.click()}><icons.Upload size={16} />导入 AI 参数文件</button>
-            <input ref={configImportInput} type="file" accept="application/json,.json" hidden onChange={(event) => { const file = event.target.files?.[0]; if (file) void importTrainingParameters(file) }} />
-          </div>
-        </div> : null}
         <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{group.fields.map((field) => <div className="parameter-row" key={field.id}><span className="parameter-label"><span>{field.label}</span><button type="button" className="parameter-help" aria-label={`查看 ${field.label} 说明`} data-tooltip={`${field.help}${field.range ? `\n范围：${field.range}` : ''}`}><icons.CircleHelp size={15} /></button></span>{renderTrainingField(field)}</div>)}</div>
       </details>)}
 
       <section className="workspace-section training-connection-section">
         <div className="section-title"><icons.Code2 size={21} /><h2>训练位置与 SSH</h2></div>
-        <p className="section-description">服务器信息全部留空时在本机执行；填写 IP 和用户名后在远程服务器执行。远程模式需要先测试连接。</p>
+        <p className="section-description">本流程固定在远程服务器执行，使用 <code>/home/dell/lqy/lqy/code/ultralytics</code> 下的源码和 <code>yolo26n.pt</code>；开始前需要测试 SSH 连接。</p>
         <div className="training-connection-grid">
-          <label><span>服务器 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={testingConnection || submitting} placeholder="留空则本地训练；也可选择历史服务器" onHostChange={(value) => onParameterChange('remote_host', value)} onSelect={(profile) => {
+          <label><span>服务器 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={testingConnection || submitting} placeholder="训练服务器，例如 192.168.21.5" onHostChange={(value) => onParameterChange('remote_host', value)} onSelect={(profile) => {
             onParameterChange('remote_port', profile.port); onParameterChange('remote_username', profile.username); onParameterChange('remember_password', true); onParameterChange('remote_password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setCredentialNotice(profile.passwordRemembered ? '已选择历史服务器，并填充保存的 SSH 密码。' : '已选择历史服务器，请输入 SSH 密码。')
           }} /></label>
           <label><span>SSH 端口</span><input type="number" value={port} onChange={(event) => onParameterChange('remote_port', Number(event.target.value))} /></label>
@@ -566,7 +393,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
         </div>
         <div className="remote-run-actions training-connection-actions">
           <button className="connection-test-button" onClick={testConnection} disabled={!remoteRequested || testingConnection || submitting}><icons.Settings size={17} />{testingConnection ? '正在连接…' : connectionReady ? '重新测试连接' : '测试 SSH 连接'}</button>
-          <span className={`remote-status ${connectionReady ? 'connected' : testingConnection ? 'connecting' : 'idle'}`}><i />{remoteRequested ? (connectionReady ? '连接成功' : '尚未测试连接') : '本地训练'}</span>
+          <span className={`remote-status ${connectionReady ? 'connected' : testingConnection ? 'connecting' : 'idle'}`}><i />{connectionReady ? '连接成功' : '尚未测试连接'}</span>
           {remoteRequested && rememberPassword ? <button className="forget-password-button" onClick={forgetPassword} disabled={submitting || testingConnection}>清除已保存密码</button> : null}
         </div>
         {connectionReady && currentConnectionCheck?.result ? <div className="connection-success" role="status"><icons.Check size={18} /><span>{currentConnectionCheck.result.message}<small>设备指纹：{currentConnectionCheck.result.fingerprint}</small></span></div> : null}
@@ -580,9 +407,9 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
           <strong>{item.output.split('/').pop() || item.id}</strong><span>{item.model.split('/').pop()} · {item.remote ? item.host : '本地'} · GPU {item.device}</span><em>{item.status === 'running' ? '训练中' : item.status === 'starting' ? '准备中' : item.status === 'disconnected' ? '待重新连接' : item.status === 'stopping' ? '终止中' : item.status === 'completed' ? '已完成' : item.status === 'failed' ? '失败' : '已停止'}</em>
         </button>)}</div> : <p className="section-empty">当前没有训练任务。</p>}
         <div className="remote-run-actions">
-          <button className="run-button" onClick={start} disabled={submitting || testingConnection || profilesLoading || (remoteRequested && !connectionReady)}>
+          <button className="run-button" onClick={start} disabled={submitting || testingConnection || profilesLoading || !connectionReady}>
             <icons.Play size={18} fill="currentColor" />
-            {submitting ? '请稍候…' : remoteRequested ? '再开一个远程训练' : '再开一个本地训练'}
+            {submitting ? '请稍候…' : '再开一个远程训练'}
           </button>
           {session?.status === 'disconnected' ? <button onClick={reconnect} disabled={submitting}>重新连接远端训练</button> : null}
           {activeSession && session?.status !== 'disconnected' ? <button className="stop-run-button" onClick={stop} disabled={submitting || session?.status === 'stopping'}><icons.X size={17} />终止选中任务</button> : null}
@@ -590,7 +417,7 @@ export function YoloTrainingPanel({ values, onParameterChange, recommendation, o
           <span className={`remote-status ${session?.status || (connectionReady ? 'connected' : 'idle')}`}><i />{statusLabel}</span>
           <small>{session?.status === 'disconnected'
             ? `将使用任务保存的连接信息 ${session.username}@${session.host}:${session.port}；若密码未保存，请先在上方 SSH 密码框输入。`
-            : '远程训练在独立 tmux 会话中运行；关闭平台不会终止，重开后可重新连接查看日志。本地训练仍随平台关闭而停止。'}</small>
+            : '远程训练在独立 tmux 会话中运行；关闭平台不会终止，重开后可重新连接查看日志。'}</small>
         </div>
         {connectionError || error || session?.error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{connectionError || error || session?.error}</span></div> : null}
         <details className="run-output" open>

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .catalog import FunctionCatalog
+from .licensing import license_store
 from .external_apps import launch_xanylabeling, launch_antigravity
 from .app_settings import settings_store
 from .groups import GroupCatalog
@@ -224,6 +225,23 @@ def open_in_system(path_value: str) -> None:
 class AppHandler(BaseHTTPRequestHandler):
     static_dir: Path
 
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        path = urllib.parse.urlparse(self.path).path
+        if path.startswith("/api/license/admin"):
+            self.close_connection = True
+            self.send_json({"error": "普通用户版不提供此接口。"}, 404)
+            return False
+        allowed = {"/api/license/status", "/api/license/activate", "/api/health"}
+        if path.startswith("/api/") and path not in allowed:
+            status = license_store.status()
+            if not status["activated"]:
+                self.close_connection = True
+                self.send_json({"error": status["message"], "code": "activation_required"}, 403)
+                return False
+        return True
+
     def log_message(self, format: str, *args: Any) -> None:
         if self.path.startswith("/api/tasks/active"):
             return
@@ -247,6 +265,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/license/status":
+            self.send_json(license_store.status())
+            return
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "name": "YOLO数据处理平台"})
             return
@@ -336,6 +357,9 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             payload = self.read_json()
+            if self.path == "/api/license/activate":
+                self.send_json(license_store.activate(str(payload.get("key", ""))))
+                return
             if self.path == "/api/groups":
                 group_catalog.create(str(payload.get("name", "")))
                 self.send_json(workspace_payload(), 201)
@@ -411,6 +435,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not isinstance(parameters, dict):
                     raise ValueError("训练参数格式不正确。")
                 is_remote = is_remote_yolo_parameters(parameters)
+                if not is_remote:
+                    raise ValueError("当前模型训练流程固定使用远程服务器，请填写并测试 SSH 连接。")
                 values = normalize_training_values(parameters)
                 task = platform_task_manager.start(
                     "yolo_model_training", f"YOLO 训练 · {values['run_name']} · {values['device']}", "remote-training" if is_remote else "local",

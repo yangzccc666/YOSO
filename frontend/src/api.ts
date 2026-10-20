@@ -8,6 +8,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json', ...options?.headers },
   })
   const data = await response.json()
+  if (data.code === 'activation_required') window.dispatchEvent(new Event('yolo-activation-required'))
   if (!response.ok) throw new Error(data.error || '请求失败')
   return data as T
 }

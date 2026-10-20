@@ -14,10 +14,10 @@ from typing import Any
 VIDEO_FUNCTION = {
     "id": "video_frames",
     "name": "视频切图",
-    "description": "批量从 MP4 视频中按固定密度、时间间隔或工序重点时间段提取 JPG 图片，并使用项目、场景和抽帧信息生成英文名称。",
+    "description": "批量从 MP4 视频中按固定密度、时间间隔或工序重点时间段提取 JPG 图片；选择文件夹时会递归查找所有层级的 MP4。",
     "handlerId": "video.extract_frames",
     "pathFields": [
-        {"id": "video_folder", "label": "视频文件夹", "mode": "directory"},
+        {"id": "video_folder", "label": "视频文件夹（递归扫描子文件夹）", "mode": "directory"},
         {"id": "video_file", "label": "单个视频（可选）", "mode": "file"},
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
@@ -129,13 +129,13 @@ YOLO_DATASET_FUNCTION = {
 YOLO_TRAINING_FUNCTION = {
     "id": "yolo_model_training",
     "name": "YOLO 模型训练",
-    "description": "独立配置并启动本地或 SSH 远程 YOLO 训练，支持多任务、后台 tmux、训练日志和任务管理。",
+    "description": "使用指定远程 Ultralytics 源码和固定 yolo26n.pt 启动训练，支持多任务、后台 tmux、训练日志和任务管理。",
     "handlerId": "yolo.train",
     "pathFields": [],
     "parameters": [
-        {"id": "remote_host", "label": "远程服务器 IP / 主机名（留空则本地运行）", "type": "text", "default": "", "options": []},
+        {"id": "remote_host", "label": "远程服务器 IP / 主机名", "type": "text", "default": "192.168.21.5", "options": []},
         {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
-        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "dell", "options": []},
         {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
         {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
     ],
@@ -306,10 +306,10 @@ DOCKER_ONNX_QUANT_FUNCTION = {
 JETSON_ONNX_EXPORT_FUNCTION = {
     "id": "jetson_onnx_export",
     "name": "Jetson ONNX 导出",
-    "description": "支持 YOLO26 切头导出和 YOLOv5 官方导出，生成 Jetson/TensorRT 可用的静态 ONNX。",
+    "description": "支持批量选择多个 PT，依次完成 YOLO26 切头或 YOLOv5 官方导出，生成 Jetson/TensorRT 可用的静态 ONNX。",
     "handlerId": "model.export_jetson_onnx",
     "pathFields": [
-        {"id": "weights_file", "label": "本机 PT 权重文件", "mode": "file"},
+        {"id": "weights_file", "label": "本机 PT 权重文件（每行一个，可批量选择）", "mode": "file"},
         {"id": "output_folder", "label": "ONNX 输出文件夹（留空则与 PT 同级）", "mode": "directory"},
     ],
     "parameters": [
@@ -318,7 +318,7 @@ JETSON_ONNX_EXPORT_FUNCTION = {
         {"id": "target_platform", "label": "目标平台", "type": "select", "default": "Jetson / TensorRT（NCHW）", "options": ["Jetson / TensorRT（NCHW）", "RKNN（NHWC）"]},
         {"id": "imgsz", "label": "输入尺寸 imgsz", "type": "number", "default": 640, "options": []},
         {"id": "opset", "label": "ONNX opset", "type": "number", "default": 12, "options": []},
-        {"id": "output_filename", "label": "输出文件名（留空自动添加 _cut）", "type": "text", "default": "", "options": []},
+        {"id": "output_filename", "label": "单模型输出文件名（批量时留空）", "type": "text", "default": "", "options": []},
         {"id": "python_path", "label": "YOLO Python（YOLO26 留空可自动查找）", "type": "text", "default": "", "options": []},
         {"id": "yolov5_repo", "label": "YOLOv5 仓库目录（应包含 export.py 和 models）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "model_family", "equals": "YOLOv5"}},
     ],
@@ -464,6 +464,7 @@ class FunctionCatalog:
                 quant_migration_marker = self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1")
                 export_migration_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1")
                 export_family_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-family-v2")
+                export_batch_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-batch-v3")
                 calib_priority_marker = self.storage_file.with_name(self.storage_file.name + ".calib-priority-v1")
                 calib_local_marker = self.storage_file.with_name(self.storage_file.name + ".calib-local-v2")
                 remote_trt_marker = self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-build-v1")
@@ -475,9 +476,11 @@ class FunctionCatalog:
                 local_star_only_marker = self.storage_file.with_name(self.storage_file.name + ".local-star-package-local-v3")
                 video_frame_naming_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1")
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
+                video_folder_recursive_marker = self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
                 yolo_training_function_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1")
+                yolo_training_remote_source_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-remote-source-v2")
                 negative_sample_marker = self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1")
                 changed = False
                 annotation_marker = self.storage_file.with_name(self.storage_file.name + ".auto-annotation-v1")
@@ -512,6 +515,36 @@ class FunctionCatalog:
                     content.append(deepcopy(LOCAL_STAR_PACKAGE_FUNCTION))
                     changed = True
                 for item in content:
+                    if (not video_folder_recursive_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_FUNCTION["id"]):
+                        item["description"] = VIDEO_FUNCTION["description"]
+                        item["pathFields"] = [
+                            deepcopy(VIDEO_FUNCTION["pathFields"][0])
+                            if isinstance(path, dict) and path.get("id") == "video_folder"
+                            else path
+                            for path in item.get("pathFields", [])
+                        ]
+                        changed = True
+                    if (not yolo_training_remote_source_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == YOLO_TRAINING_FUNCTION["id"]):
+                        item["description"] = YOLO_TRAINING_FUNCTION["description"]
+                        existing_parameters = {
+                            parameter.get("id"): parameter
+                            for parameter in item.get("parameters", [])
+                            if isinstance(parameter, dict)
+                        }
+                        item["parameters"] = [
+                            deepcopy(existing_parameters.get(parameter["id"], parameter))
+                            for parameter in YOLO_TRAINING_FUNCTION["parameters"]
+                        ]
+                        for parameter in item["parameters"]:
+                            source_parameter = next(
+                                source for source in YOLO_TRAINING_FUNCTION["parameters"]
+                                if source["id"] == parameter["id"]
+                            )
+                            if parameter["id"] in {"remote_host", "remote_username"} and not str(parameter.get("default", "")).strip():
+                                parameter.update(deepcopy(source_parameter))
+                        changed = True
                     if (not yolo_dataset_timestamp_marker.exists() and isinstance(item, dict)
                             and item.get("id") == YOLO_DATASET_FUNCTION["id"]):
                         source_parameter = next(
@@ -636,6 +669,33 @@ class FunctionCatalog:
                             for parameter in JETSON_ONNX_EXPORT_FUNCTION["parameters"]
                         ]
                         changed = True
+                    if (not export_batch_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == JETSON_ONNX_EXPORT_FUNCTION["id"]):
+                        item["description"] = JETSON_ONNX_EXPORT_FUNCTION["description"]
+                        existing_paths = {
+                            path.get("id"): path
+                            for path in item.get("pathFields", [])
+                            if isinstance(path, dict)
+                        }
+                        item["pathFields"] = [
+                            deepcopy(existing_paths.get(path["id"], path))
+                            for path in JETSON_ONNX_EXPORT_FUNCTION["pathFields"]
+                        ]
+                        for path in item["pathFields"]:
+                            source_path = next(
+                                source for source in JETSON_ONNX_EXPORT_FUNCTION["pathFields"]
+                                if source["id"] == path["id"]
+                            )
+                            path.update(deepcopy(source_path))
+                        for parameter in item.get("parameters", []):
+                            if isinstance(parameter, dict) and parameter.get("id") == "output_filename":
+                                source_parameter = next(
+                                    source for source in JETSON_ONNX_EXPORT_FUNCTION["parameters"]
+                                    if source["id"] == "output_filename"
+                                )
+                                parameter["label"] = source_parameter["label"]
+                                break
+                        changed = True
                     if (not remote_trt_launcher_marker.exists() and isinstance(item, dict)
                             and item.get("id") == REMOTE_TENSORRT_BUILD_FUNCTION["id"]):
                         item["description"] = REMOTE_TENSORRT_BUILD_FUNCTION["description"]
@@ -699,6 +759,8 @@ class FunctionCatalog:
                     export_migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not export_family_marker.exists():
                     export_family_marker.write_text("migrated\n", encoding="utf-8")
+                if not export_batch_marker.exists():
+                    export_batch_marker.write_text("migrated\n", encoding="utf-8")
                 if not calib_priority_marker.exists():
                     calib_priority_marker.write_text("migrated\n", encoding="utf-8")
                 if not calib_local_marker.exists():
@@ -721,12 +783,16 @@ class FunctionCatalog:
                     video_frame_naming_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_frame_priority_marker.exists():
                     video_frame_priority_marker.write_text("migrated\n", encoding="utf-8")
+                if not video_folder_recursive_marker.exists():
+                    video_folder_recursive_marker.write_text("migrated\n", encoding="utf-8")
                 if not realtime_playback_marker.exists():
                     realtime_playback_marker.write_text("migrated\n", encoding="utf-8")
                 if not yolo_dataset_timestamp_marker.exists():
                     yolo_dataset_timestamp_marker.write_text("migrated\n", encoding="utf-8")
                 if not yolo_training_function_marker.exists():
                     yolo_training_function_marker.write_text("migrated\n", encoding="utf-8")
+                if not yolo_training_remote_source_marker.exists():
+                    yolo_training_remote_source_marker.write_text("migrated\n", encoding="utf-8")
                 if not negative_sample_marker.exists():
                     negative_sample_marker.write_text("migrated\n", encoding="utf-8")
                 items = [self._normalize(item) for item in content if isinstance(item, dict)]
@@ -746,10 +812,12 @@ class FunctionCatalog:
         self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".yolo-training-remote-source-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-batch-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".calib-priority-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-build-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".remote-tensorrt-launcher-v2").write_text("migrated\n", encoding="utf-8")
@@ -759,6 +827,7 @@ class FunctionCatalog:
         self.storage_file.with_name(self.storage_file.name + ".local-star-package-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".local-star-package-local-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1").write_text("migrated\n", encoding="utf-8")
 

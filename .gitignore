@@ -1,4 +1,4 @@
-frontend/node_modules/
+/frontend/node_modules
 runtime/
 __pycache__/
 *.pyc
@@ -12,3 +12,12 @@ ssh_credentials.json
 .DS_Store
 /build/
 /dist/
+
+# Owner-only tools must never enter the public user edition.
+/license_admin.py
+/backend/license_issuer.py
+/frontend/src/components/LicenseAdminDialog.tsx
+private_key.json
+licenses.json
+activation.json
+license_issuer_settings.json

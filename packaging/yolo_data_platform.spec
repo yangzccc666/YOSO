@@ -7,11 +7,12 @@ from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent
 APP_NAME = "YOLO-Data-Platform"
-VERSION = "26.1.0"
+VERSION = "26.1.1"
 
 datas = [
     (str(ROOT / "frontend" / "dist"), "frontend/dist"),
     (str(ROOT / "backend" / "*.py"), "backend"),
+    (str(ROOT / "backend" / "license_public.json"), "backend"),
     (str(ROOT / "README.md"), "."),
 ]
 

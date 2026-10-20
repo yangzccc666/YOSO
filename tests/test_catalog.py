@@ -29,7 +29,7 @@ from backend.remote_inference import BUNDLED_INFERENCE_SCRIPT, REMEMBERED_PASSWO
 from backend.task_manager import PlatformTaskManager, TaskCancelled
 from backend.video_clip import COPY_MODE, _configured_range, _probe_duration, parse_time, run_video_clip
 from backend.video_frames import _priority_time_ranges, run_video_frames
-from backend.yolo_training import DEFAULT_TRAINING_VALUES, TrainingManager, TrainingProfileStore, TrainingSession, _conda_environment_for_yolo, _follow_remote_session, _remote_output_lines, _remote_training_shell, automatic_training_run_name, build_training_command, normalize_training_values, select_remote_yolo_candidate, training_task_key
+from backend.yolo_training import DEFAULT_TRAINING_VALUES, REMOTE_ULTRALYTICS_SOURCE, REMOTE_YOLO26_MODEL, TrainingManager, TrainingProfileStore, TrainingSession, _conda_environment_for_yolo, _follow_remote_session, _remote_output_lines, _remote_training_shell, automatic_training_run_name, build_training_command, normalize_training_values, select_remote_yolo_candidate, training_task_key
 from backend.yolo_dataset_split import _dataset_folder_name, run_yolo_dataset_split
 from desktop import configure_linux_input_method
 
@@ -63,6 +63,7 @@ class CatalogTests(unittest.TestCase):
         strategy = next(parameter for parameter in item["parameters"] if parameter["id"] == "limit_strategy")
         self.assertEqual(strategy["default"], "全程均匀抽取")
         self.assertEqual(items[1]["name"], "YOLO 数据集划分")
+
         self.assertEqual(items[1]["handlerId"], "yolo.split_dataset")
         task_type = next(parameter for parameter in items[1]["parameters"] if parameter["id"] == "dataset_task_type")
         self.assertEqual(task_type["default"], "目标检测")
@@ -1089,22 +1090,14 @@ class CatalogTests(unittest.TestCase):
         command = build_training_command({**DEFAULT_TRAINING_VALUES, "device": "2"})
         self.assertEqual(command[:3], ["yolo", "detect", "train"])
         self.assertIn("data=data.yaml", command)
-        self.assertIn("model=yolo26n.pt", command)
+        self.assertIn(f"model={REMOTE_YOLO26_MODEL}", command)
         self.assertIn("epochs=200", command)
         self.assertIn("patience=30", command)
         self.assertIn("device=2", command)
         self.assertTrue(any(re.fullmatch(r"name=yolo26_\d{4}_\d{4}", item) for item in command))
-        self.assertIn("cos_lr=True", command)
-        self.assertIn("optimizer=SGD", command)
-        self.assertIn("amp=True", command)
-        self.assertIn("cache=False", command)
-        self.assertIn("close_mosaic=10", command)
-        self.assertIn("hsv_h=0.015", command)
-        self.assertIn("hsv_s=0.7", command)
-        self.assertIn("hsv_v=0.4", command)
-        self.assertIn("cutmix=0.0", command)
-        self.assertIn("momentum=0.937", command)
-        self.assertEqual(len(command), 50)
+        self.assertNotIn("cos_lr=True", command)
+        self.assertNotIn("optimizer=SGD", command)
+        self.assertEqual(len(command), 13)
 
     def test_yolo_training_name_is_generated_only_for_execution(self) -> None:
         self.assertEqual(DEFAULT_TRAINING_VALUES["run_name"], "")
@@ -1151,6 +1144,14 @@ class CatalogTests(unittest.TestCase):
         buffer = bytearray(b"Epoch 1/2\rEpoch 2/2\npartial")
         self.assertEqual(_remote_output_lines(buffer), ["Epoch 1/2", "Epoch 2/2"])
         self.assertEqual(_remote_output_lines(buffer, final=True), ["partial"])
+        source_shell, _ = _remote_training_shell(
+            [executable, "detect", "train", f"model={REMOTE_YOLO26_MODEL}", "epochs=2"],
+            "yolo-training-source-test",
+            REMOTE_ULTRALYTICS_SOURCE,
+        )
+        source_launch = shlex.split(source_shell)[2]
+        self.assertIn(f"cd {REMOTE_ULTRALYTICS_SOURCE}", source_launch)
+        self.assertIn(f"PYTHONPATH={REMOTE_ULTRALYTICS_SOURCE}", source_launch)
 
     def test_yolo_training_profiles_support_named_scenario_crud(self) -> None:
         store = TrainingProfileStore(Path(self.temp.name) / "training_profiles.json")
@@ -1178,15 +1179,21 @@ class CatalogTests(unittest.TestCase):
 
     def test_yolo_training_runs_as_background_session(self) -> None:
         manager = TrainingManager(Path(self.temp.name) / "background_training.json")
-        parameters = {**DEFAULT_TRAINING_VALUES, "yolo_executable": "/bin/echo", "device": "0"}
-        snapshot = manager.start(parameters)
-        for _ in range(50):
-            current = manager.get(snapshot["id"]).snapshot()
-            if current["status"] in {"completed", "failed", "stopped"}:
-                break
-            time.sleep(0.02)
+        parameters = {
+            **DEFAULT_TRAINING_VALUES, "device": "0", "remote_host": "192.168.21.5",
+            "remote_username": "dell", "remote_password": "secret",
+        }
+        with patch("backend.yolo_training.resolve_tested_yolo_connection", return_value={"password": ""}), patch(
+            "backend.yolo_training.run_training",
+            return_value={"message": "完成", "project": "runs", "name": "test"},
+        ):
+            snapshot = manager.start(parameters)
+            for _ in range(50):
+                current = manager.get(snapshot["id"]).snapshot()
+                if current["status"] in {"completed", "failed", "stopped"}:
+                    break
+                time.sleep(0.02)
         self.assertEqual(current["status"], "completed")
-        self.assertTrue(any("detect train" in line for line in current["logs"]))
 
     def test_yolo_training_snapshot_keeps_connection_identity_for_reconnect(self) -> None:
         session = TrainingSession(
@@ -1202,7 +1209,10 @@ class CatalogTests(unittest.TestCase):
         gate = threading.Event()
         manager = TrainingManager(Path(self.temp.name) / "parallel_training.json")
         tasks = PlatformTaskManager()
-        first_values = {**DEFAULT_TRAINING_VALUES, "project": "/tmp/training-tests", "run_name": "model_a", "device": "0"}
+        first_values = {
+            **DEFAULT_TRAINING_VALUES, "project": "/tmp/training-tests", "run_name": "model_a", "device": "0",
+            "remote_host": "192.168.21.5", "remote_username": "dell", "remote_password": "secret",
+        }
         second_values = {**first_values, "run_name": "model_b", "device": "1"}
         first = tasks.start("yolo_dataset_split", "模型 A", task_key=training_task_key(first_values))
         second = tasks.start("yolo_dataset_split", "模型 B", task_key=training_task_key(second_values))
@@ -1214,7 +1224,9 @@ class CatalogTests(unittest.TestCase):
                 context.check_cancelled()
             return {"message": "完成", "project": context.parameters["project"], "name": context.parameters["run_name"]}
 
-        with patch("backend.yolo_training.run_training", side_effect=wait_for_release):
+        with patch("backend.yolo_training.resolve_tested_yolo_connection", return_value={"password": ""}), patch(
+            "backend.yolo_training.run_training", side_effect=wait_for_release
+        ):
             a = manager.start(first_values)
             b = manager.start(second_values)
             try:

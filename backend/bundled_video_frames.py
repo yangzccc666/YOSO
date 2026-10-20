@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import os
 from pathlib import Path
 from typing import Any
@@ -45,9 +44,18 @@ def parse_video_paths(inputs: str | list[str]) -> list[str]:
     for raw in values:
         path = str(raw)
         if os.path.isdir(path):
-            found = glob.glob(os.path.join(path, "*.mp4"))
+            # Treat a selected folder as a dataset root and inspect every
+            # descendant directory without following symlinks.
+            found: list[str] = []
+            for current, _directories, files in os.walk(path, followlinks=False):
+                found.extend(
+                    os.path.join(current, name)
+                    for name in files
+                    if name.lower().endswith(".mp4")
+                )
+            found.sort()
             videos.extend(found)
-            print(f"[文件夹] {path} -> 找到 {len(found)} 个视频")
+            print(f"[文件夹递归扫描] {path} -> 找到 {len(found)} 个 MP4 视频")
         elif os.path.isfile(path) and path.lower().endswith(".mp4"):
             videos.append(path)
             print(f"[文件] {path}")

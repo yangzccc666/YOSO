@@ -371,7 +371,7 @@ export default function App() {
   const browse = async (fieldId: string, mode: string) => {
     try {
       const paths = await choosePaths(mode)
-      if (paths[0]) updatePathValue(fieldId, paths[0])
+      if (paths[0]) updatePathValue(fieldId, mode === 'multiple' ? paths.join('\n') : paths[0])
     } catch (error) { setNotice(error instanceof Error ? error.message : '无法打开选择窗口') }
   }
 
@@ -512,14 +512,22 @@ export default function App() {
         }
       }
       const onnxQuantDefaults = result.result.onnxQuantDefaults
-      if (item.handlerId === 'model.export_jetson_onnx' && onnxQuantDefaults && typeof onnxQuantDefaults === 'object') {
-        const candidate = onnxQuantDefaults as Record<string, unknown>
-        if (typeof candidate.inputOnnx === 'string') {
-          enqueueWorkflowTodo(item, 'docker.quantize_onnx', '量化本次导出的 ONNX', candidate.inputOnnx, {
+      const onnxQuantDefaultsList = result.result.onnxQuantDefaultsList
+      if (item.handlerId === 'model.export_jetson_onnx') {
+        const candidates = Array.isArray(onnxQuantDefaultsList)
+          ? onnxQuantDefaultsList
+          : onnxQuantDefaults && typeof onnxQuantDefaults === 'object' ? [onnxQuantDefaults] : []
+        let queued = 0
+        candidates.forEach((rawCandidate, index) => {
+          if (!rawCandidate || typeof rawCandidate !== 'object') return
+          const candidate = rawCandidate as Record<string, unknown>
+          if (typeof candidate.inputOnnx !== 'string') return
+          enqueueWorkflowTodo(item, 'docker.quantize_onnx', candidates.length > 1 ? `量化导出的 ONNX ${index + 1}/${candidates.length}` : '量化本次导出的 ONNX', candidate.inputOnnx, {
             paths: { input_onnx: candidate.inputOnnx },
           })
-          lines.push('', '已加入工作流待办：Docker ONNX 量化。当前量化配置没有被覆盖。')
-        }
+          queued += 1
+        })
+        if (queued) lines.push('', `已加入 ${queued} 条 Docker ONNX 量化待办，当前量化配置没有被覆盖。`)
       }
       const remoteInferenceDefaults = result.result.remoteInferenceDefaults
       if (item.handlerId === 'model.package_star' && remoteInferenceDefaults && typeof remoteInferenceDefaults === 'object') {

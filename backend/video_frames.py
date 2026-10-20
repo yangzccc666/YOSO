@@ -220,7 +220,7 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         mode_message = f"每秒抽取 {target_fps:g} 张"
 
     limit_description = f"每个视频最多 {max_images} 张" if max_images is not None else "不限制图片总数"
-    context.report(f"找到 {len(videos)} 个视频，抽帧方式：{mode_message}，{limit_description}")
+    context.report(f"已递归扫描输入文件夹，共找到 {len(videos)} 个 MP4 视频；抽帧方式：{mode_message}，{limit_description}")
     context.report(f"英文命名：项目 {project_code}；场景 {scene_code}")
     context.report(
         f"有效区间：{start_time_sec:g} 秒 至 "
