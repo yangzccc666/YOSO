@@ -30,6 +30,8 @@ jobs:
             archive: mac
     runs-on: ${{ matrix.os }}
     env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
       RELEASE_VERSION: v26.1.1
       ASSET_NAME: YOLO-Data-Platform-v26.1.1-${{ matrix.asset }}
     steps:
