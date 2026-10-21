@@ -10,6 +10,7 @@ import { LocalStarPackagePanel } from './LocalStarPackagePanel'
 import { FunctionRunHistory } from './FunctionRunHistory'
 import { WorkflowTodoPanel } from './WorkflowTodoPanel'
 import { SshConnectionHistoryInput } from './SshConnectionHistoryInput'
+import { VideoFrameTasksPanel } from './VideoFrameTasksPanel'
 import type { FunctionDefinition, FunctionParameter, PlatformTaskStatus, SshConnectionProfile, WorkingValues, YoloTrainingRecommendation } from '../types'
 import type { WorkflowTodo } from '../workflowTodos'
 
@@ -35,6 +36,7 @@ type Props = {
 }
 
 function ParameterValue({ field, value, onChange, sshHistory }: { field: FunctionParameter; value: string | number | boolean; onChange: (value: string | number | boolean) => void; sshHistory?: { onSelect: (profile: SshConnectionProfile) => void } }) {
+  if (field.id === 'remove_time_ranges') return <textarea className="clip-remove-ranges" rows={5} value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder={'00:10-00:20\n01:30-02:00\n02:50-'} />
   if (sshHistory && (field.id === 'host' || field.id === 'remote_host')) return <SshConnectionHistoryInput host={String(value)} onHostChange={onChange} onSelect={sshHistory.onSelect} />
   if (field.type === 'boolean') return <label className="switch-control"><input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} /><span /><em>{value ? '开启' : '关闭'}</em></label>
   if (field.type === 'select') return <span className="workspace-select"><select value={String(value)} onChange={(event) => onChange(event.target.value)}><option value="">请选择</option>{field.options.map((option) => <option value={option} key={option}>{option}</option>)}</select><icons.ChevronDown size={16} /></span>
@@ -60,7 +62,8 @@ export function FunctionWorkspace(props: Props) {
   const isRemoteTrtWorkspace = item.handlerId === 'remote.build_tensorrt'
   const isLocalStarPackageWorkspace = item.handlerId === 'model.package_star'
   const isJetsonOnnxExportWorkspace = item.handlerId === 'model.export_jetson_onnx'
-  const currentTask = isYoloTrainingWorkspace ? undefined : props.activeTasks.find((task) => task.functionId === item.id && !task.name.startsWith('YOLO 训练 ·'))
+  const isVideoFramesWorkspace = item.handlerId === 'video.extract_frames'
+  const currentTask = isYoloTrainingWorkspace || isVideoFramesWorkspace ? undefined : props.activeTasks.find((task) => task.functionId === item.id && !task.name.startsWith('YOLO 训练 ·'))
   const visibleParameters = item.parameters.filter((field) =>
     (!field.visibleWhen
       || (field.visibleWhen.equals !== undefined && props.values.parameters[field.visibleWhen.fieldId] === field.visibleWhen.equals)
@@ -93,6 +96,7 @@ export function FunctionWorkspace(props: Props) {
       </section>
       <section className="workspace-section parameter-section">
         <div className="section-title"><icons.SlidersHorizontal size={21} /><h2>运行参数</h2></div>
+        {item.handlerId === 'video.clip' && props.values.parameters.clip_mode === '删除多个时间段并拼接剩余' ? <p className="clip-remove-hint">每行填写一个不要的时间段，支持秒数、MM:SS、HH:MM:SS，也可用分号分隔。所有时间均对应原视频；结束时间留空表示删除到结尾。重叠区间自动合并，剩余片段按原顺序拼成一个新视频，原文件不变。{props.values.parameters.encoding_mode === '精确裁剪（重新编码）' ? '精确模式会重新编码视频，并保留首条音轨。' : '当前原画质模式受关键帧限制，删除边界可能有误差；要求严格删除时请选择“精确裁剪（重新编码）”。'}</p> : null}
         {visibleParameters.length ? <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{visibleParameters.map((field) => <label className="parameter-row" key={field.id}><span>{field.label}</span><ParameterValue field={field} value={props.values.parameters[field.id] ?? field.default} onChange={(value) => props.onParameterChange(field.id, value)} sshHistory={showGenericSshHistory ? { onSelect: (profile) => {
           props.onParameterChange(`${sshPrefix}port`, profile.port)
           props.onParameterChange(`${sshPrefix}username`, profile.username)
@@ -103,7 +107,8 @@ export function FunctionWorkspace(props: Props) {
       </section>
       </> : null}
         {item.handlerId === 'remote.star_inference' ? <RemoteInferencePanel itemId={item.id} values={props.values} onParameterChange={props.onParameterChange} platformTask={currentTask || null} onCompleted={() => props.onWorkflowComplete('remote.star_inference')} /> : item.handlerId === 'local.pt_inference' ? <LocalPTInferencePanel itemId={item.id} values={props.values} platformTask={currentTask || null} /> : isRemoteTrtWorkspace ? <RemoteTensorRTBuildPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isLocalStarPackageWorkspace ? <LocalStarPackagePanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onBrowse={props.onBrowse} onPathChange={props.onPathChange} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isCalibrationWorkspace ? <RemoteCalibrationPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isYoloDatasetWorkspace ? <RemoteYoloDatasetPanel values={props.values} output={props.output} running={props.running || Boolean(currentTask)} platformTask={currentTask || null} onParameterChange={props.onParameterChange} onRun={props.onRun} /> : isYoloTrainingWorkspace ? <YoloTrainingPanel values={props.values} onParameterChange={props.onParameterChange} recommendation={props.yoloTrainingRecommendation} onCompleted={() => props.onWorkflowComplete('yolo.train')} /> : <section className="run-section">
-        <div className="run-actions"><button className="run-button" onClick={() => props.onRun()} disabled={props.running || Boolean(currentTask)}><icons.Play size={18} fill="currentColor" />{currentTask ? '正在运行' : props.running ? '正在启动' : '一键运行'}</button><span className={item.handlerReady ? 'ready' : ''}><icons.Info size={17} />{item.handlerReady ? '处理逻辑已接入' : '处理逻辑尚未接入'}</span></div>
+        <div className="run-actions"><button className="run-button" onClick={() => props.onRun()} disabled={!isVideoFramesWorkspace && (props.running || Boolean(currentTask))}><icons.Play size={18} fill="currentColor" />{isVideoFramesWorkspace ? '启动抽帧任务' : currentTask ? '正在运行' : props.running ? '正在启动' : '一键运行'}</button><span className={item.handlerReady ? 'ready' : ''}><icons.Info size={17} />{item.handlerReady ? '处理逻辑已接入' : '处理逻辑尚未接入'}</span></div>
+        {isVideoFramesWorkspace ? <VideoFrameTasksPanel tasks={props.activeTasks.filter((task) => task.functionId === item.id)} onStop={props.onStop} /> : null}
         <details className="run-output" open><summary><icons.ChevronRight size={18} />运行输出</summary><pre>{props.output || '运行后将在这里显示处理进度和结果'}</pre></details>
       </section>}
       <FunctionRunHistory key={item.id} functionId={item.id} />

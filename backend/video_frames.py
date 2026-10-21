@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-import contextlib
-import inspect
-import io
+import hashlib
+import json
 import re
+import shutil
+import threading
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
@@ -13,6 +16,8 @@ from typing import Any
 
 from .handlers import RunContext, register_handler
 from .video_clip import parse_time
+from .task_manager import TaskCancelled
+from .video_frame_resources import DEFAULT_WORKER_MEMORY, MIB, resource_pool
 
 
 HANDLER_ID = "video.extract_frames"
@@ -80,10 +85,19 @@ def _unique_output_folder(parent: Path, stem: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     candidate = parent / f"{stem}_{timestamp}"
     index = 2
-    while candidate.exists():
-        candidate = parent / f"{stem}_{timestamp}_{index}"
-        index += 1
-    return candidate
+    while True:
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        except FileExistsError:
+            candidate = parent / f"{stem}_{timestamp}_{index}"
+            index += 1
+
+
+def video_frame_task_key(function_id: str, paths: dict[str, Path], parameters: dict[str, Any]) -> str:
+    snapshot = {"paths": {key: str(path.resolve()) for key, path in paths.items()}, "parameters": parameters}
+    fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    return f"{function_id}:{fingerprint}"
 
 
 def _filename_number(value: float) -> str:
@@ -106,7 +120,7 @@ def _sampling_filename_info(
     interval_sec: float | None,
     fallback_step: int,
 ) -> tuple[str, float]:
-    capture = module.cv2.VideoCapture(str(video))
+    capture = module.open_video(str(video))
     try:
         source_fps = float(capture.get(module.cv2.CAP_PROP_FPS) or 0.0)
     finally:
@@ -173,6 +187,7 @@ def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
 
 
 def run_video_frames(context: RunContext) -> dict[str, Any]:
+    context.check_cancelled()
     module = _load_source_module()
     videos = _resolve_videos(context, module)
     output_root = context.paths.get("output_folder")
@@ -227,16 +242,35 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         f"{f'{end_time_sec:g} 秒' if end_time_sec is not None else '视频结尾'}；"
         f"{f'超过上限时采用“{limit_strategy}”' if max_images is not None else '按抽帧密度和有效时长自动计算数量'}"
     )
-    total_images = 0
-    output_folders: list[str] = []
-    details: list[dict[str, Any]] = []
+    requested_workers = _non_negative_number(context.parameters.get("parallel_workers"), "并行视频数", 0)
+    if not requested_workers.is_integer() or requested_workers > 16:
+        raise ValueError("并行视频数应为 0 到 16 之间的整数；0 表示自动。")
+    resources = resource_pool.status()
+    if resources["maxWorkers"] < 1:
+        raise ValueError(resources["warning"] or "当前内存不足，请释放资源后重试。")
+    workers = min(len(videos), int(requested_workers) or resources["recommendedWorkers"], resources["maxWorkers"])
+    if resources["warning"]:
+        context.report(f"资源提示：{resources['warning']}")
+    if requested_workers > workers and len(videos) > workers:
+        context.report(f"资源提示：设置并行数 {int(requested_workers)}，本次自动限制为 {workers}，避免占用过多 CPU 或内存。")
+    context.report(f"本批最多同时处理 {workers} 个视频；所有批次共享资源限额，资源忙时自动等待。")
 
-    for index, video in enumerate(videos, start=1):
-        context.check_cancelled()
+    stop_event = context.stop_event or threading.Event()
+    report_lock = threading.RLock()
+    def report(message: str) -> None:
+        with report_lock:
+            context.report(message)
+
+    worker_context = RunContext(context.function_id, context.paths, context.parameters, report, stop_event, context.notify)
+
+    def extract(index: int, video: Path) -> dict[str, Any]:
+        worker_context.check_cancelled()
         parent = output_root or video.parent
+        if shutil.disk_usage(parent).free < 256 * MIB:
+            raise RuntimeError(f"输出磁盘可用空间不足 256 MB：{parent}。请释放磁盘空间。")
         if mode == "工序时间段高密度":
             sampling_tag = f"priority{_filename_number(priority_fps or 25)}_bg{_filename_number(background_fps or 5)}"
-            capture = module.cv2.VideoCapture(str(video))
+            capture = module.open_video(str(video))
             try:
                 source_fps = float(capture.get(module.cv2.CAP_PROP_FPS) or 0.0)
             finally:
@@ -247,38 +281,33 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             )
         english_prefix = f"{project_code}_{scene_code}_video{index:02d}"
         output_folder = _unique_output_folder(parent, f"{english_prefix}_{sampling_tag}")
-        context.report(f"[{index}/{len(videos)}] 正在处理：{video.name}")
-
-        captured = io.StringIO()
-        original_tqdm = getattr(module, "tqdm", None)
-        def cancellable_progress(iterable: Any) -> Any:
-            for value in iterable:
-                context.check_cancelled()
-                yield value
-
-        module.tqdm = cancellable_progress
+        report(f"[{index}/{len(videos)}] 正在处理：{video}\n输出目录：{output_folder}")
+        probe = module.open_video(str(video))
         try:
-            with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-                extraction_arguments = {
-                    "vedio_path": str(video),
-                    "images_save_path": str(output_folder),
-                    "target_fps": target_fps,
-                    "interval_sec": interval_sec,
-                    "fallback_step": fallback_step,
-                    "max_images": max_images,
-                    "start_time_sec": start_time_sec,
-                    "end_time_sec": end_time_sec,
-                    "limit_strategy": limit_strategy,
-                    "priority_ranges": priority_ranges,
-                    "priority_fps": priority_fps or 25,
-                    "background_fps": background_fps or 5,
-                }
-                if "filename_prefix" in inspect.signature(module.vedio2img).parameters:
-                    extraction_arguments["filename_prefix"] = english_prefix
-                process_result = module.vedio2img(**extraction_arguments)
+            width = max(0, int(probe.get(module.cv2.CAP_PROP_FRAME_WIDTH)))
+            height = max(0, int(probe.get(module.cv2.CAP_PROP_FRAME_HEIGHT)))
         finally:
-            if original_tqdm is not None:
-                module.tqdm = original_tqdm
+            probe.release()
+        memory_estimate = max(DEFAULT_WORKER_MEMORY, width * height * 3 * 16 + 128 * MIB)
+        last_progress = 0.0
+        def progress(done: int, total: int) -> None:
+            nonlocal last_progress
+            now = time.monotonic()
+            if done == total or now - last_progress >= 1.0:
+                last_progress = now
+                report(f"[{index}/{len(videos)}] {video.name}：{done}/{total} 帧（{done / max(1, total):.0%}）")
+                if shutil.disk_usage(parent).free < 64 * MIB:
+                    raise RuntimeError("输出磁盘即将写满，已停止该视频；已生成的图片会保留。")
+        with resource_pool.acquire(worker_context, memory_estimate):
+            process_result = module.vedio2img(
+                vedio_path=str(video), images_save_path=str(output_folder),
+                target_fps=target_fps, interval_sec=interval_sec, fallback_step=fallback_step,
+                max_images=max_images, start_time_sec=start_time_sec, end_time_sec=end_time_sec,
+                limit_strategy=limit_strategy, priority_ranges=priority_ranges,
+                priority_fps=priority_fps or 25, background_fps=background_fps or 5,
+                filename_prefix=english_prefix, check_cancelled=worker_context.check_cancelled,
+                report_progress=progress,
+            )
 
         selected_frame_indices = process_result.get("selected_frame_indices", []) if process_result else []
         _ensure_informative_filenames(
@@ -287,10 +316,9 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         image_count = len(list(output_folder.glob("*.jpg"))) if output_folder.exists() else 0
         if image_count == 0:
             raise RuntimeError(f"{video.name} 没有成功生成图片，请确认视频可以正常播放。")
-        total_images += image_count
-        output_folders.append(str(output_folder))
         limit_reached = bool(process_result and process_result.get("limit_applied"))
-        details.append({
+        detail = {
+            "index": index,
             "video": str(video),
             "images": image_count,
             "maxImages": max_images,
@@ -307,20 +335,63 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             "sceneCode": scene_code,
             "englishPrefix": english_prefix,
             "output": str(output_folder),
-        })
+        }
         if max_images is None:
             limit_message = "（按抽帧密度和有效时长完成）"
         elif limit_reached:
             limit_message = "（已达到上限）"
         else:
             limit_message = "（未达到设置上限）"
-        context.report(
+        report(
             f"[{index}/{len(videos)}] 已生成 {image_count} 张图片{limit_message}；"
             f"文件名抽帧标记：{sampling_tag}"
         )
+        if process_result and process_result.get("error_count"):
+            report(f"[{index}/{len(videos)}] 提示：{process_result['error_count']} 帧读取或保存失败，已保留成功图片。")
+        return detail
+
+    completed: list[dict[str, Any]] = []
+    failures: list[dict[str, str]] = []
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="video-frames")
+    iterator = iter(enumerate(videos, start=1))
+    pending = {}
+    def submit_next() -> None:
+        item = next(iterator, None)
+        if item is not None:
+            pending[executor.submit(extract, *item)] = item
+    try:
+        for _ in range(workers):
+            submit_next()
+        while pending:
+            context.check_cancelled()
+            finished, _ = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in finished:
+                index, video = pending.pop(future)
+                try:
+                    completed.append(future.result())
+                except TaskCancelled:
+                    raise
+                except Exception as exc:
+                    failures.append({"video": str(video), "error": str(exc)})
+                    report(f"[{index}/{len(videos)}] 失败：{video}：{exc}")
+                submit_next()
+    except BaseException:
+        stop_event.set()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+    context.check_cancelled()
+    if not completed:
+        raise RuntimeError("所有视频均未成功抽帧：" + "；".join(f"{item['video']}：{item['error']}" for item in failures))
+    details = sorted(completed, key=lambda item: item["index"])
+    total_images = sum(item["images"] for item in details)
+    output_folders = [item["output"] for item in details]
+    message = f"视频切图完成：成功 {len(details)}/{len(videos)} 个视频，共生成 {total_images} 张图片。"
+    if failures:
+        message += f"失败 {len(failures)} 个，原因已在日志列出；成功结果已保留。"
 
     return {
-        "message": f"视频切图完成：处理 {len(videos)} 个视频，共生成 {total_images} 张图片。",
+        "message": message,
         "videoCount": len(videos),
         "imageCount": total_images,
         "maxImagesPerVideo": max_images,
@@ -328,6 +399,8 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         "sceneCode": scene_code,
         "outputFolders": output_folders,
         "details": details,
+        "failedVideos": failures,
+        "parallelWorkers": workers,
     }
 
 

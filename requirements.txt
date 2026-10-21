@@ -6,3 +6,4 @@ imageio-ffmpeg>=0.4.9
 paramiko>=3.4,<5
 Pillow>=9,<13
 cryptography>=41,<47
+psutil>=5.9,<8

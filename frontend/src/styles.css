@@ -14,6 +14,16 @@
 }
 
 * { box-sizing: border-box; }
+.video-frame-tasks > p { color: var(--muted); font-size: 13px; line-height: 1.7; }
+.video-resource-summary { display: flex; flex-wrap: wrap; gap: 10px 22px; padding: 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--soft); color: #42516b; font-size: 13px; }
+.video-resource-summary strong { flex-basis: 100%; color: #a66a14; line-height: 1.6; font-weight: 500; }
+.video-frame-task-list { max-height: 480px; overflow-y: auto; margin-top: 16px; }
+.video-frame-task-list article { padding: 14px; margin-bottom: 12px; border: 1px solid var(--border); border-radius: 7px; }
+.video-frame-task-list header { display: flex; justify-content: space-between; align-items: start; gap: 16px; }
+.video-frame-task-list header > div { min-width: 0; }
+.video-frame-task-list strong { font-size: 13px; overflow-wrap: anywhere; }
+.video-frame-task-list small { display: block; color: var(--muted); font-size: 11px; line-height: 1.6; margin-top: 6px; }
+.video-frame-task-list pre { max-height: 180px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--soft); padding: 10px; border-radius: 5px; font-size: 12px; line-height: 1.7; }
 .activation-page { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: var(--soft); }
 .activation-card { width: min(560px, 100%); padding: 36px; border: 1px solid var(--border); border-radius: 14px; background: white; box-shadow: 0 12px 36px #23344c10; }
 .activation-brand { display: inline-block; padding: 8px 14px; border-radius: 8px; background: var(--blue); color: white; font-weight: 750; }
@@ -154,6 +164,9 @@ button { cursor: pointer; }
 .parameter-head { height: 37px; padding: 0 14px; background: var(--soft); color: #63718a; font-size: 12px; }
 .parameter-row { min-height: 54px; padding: 6px 14px; border-top: 1px solid #e6ebf1; }
 .parameter-row > span:first-child { color: #273650; font-size: 13px; font-weight: 600; }
+.clip-remove-ranges { width: 100%; min-height: 112px; padding: 10px 13px; resize: vertical; border: 1px solid #cfd8e5; border-radius: 5px; background: #fff; color: #273650; font: inherit; font-size: 13px; line-height: 1.6; }
+.clip-remove-ranges:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(18,103,245,.08); }
+.clip-remove-hint { margin: 0 0 14px; padding: 10px 13px; border-radius: 6px; background: #f3f7fc; color: #596b84; font-size: 12px; line-height: 1.7; }
 .workspace-select { position: relative; display: block; }
 .workspace-select select { appearance: none; padding-right: 34px; }
 .workspace-select svg { position: absolute; pointer-events: none; right: 11px; top: 13px; color: #68768d; }

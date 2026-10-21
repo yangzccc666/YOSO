@@ -7,6 +7,7 @@ import mimetypes
 import os
 import subprocess
 import sys
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -270,6 +271,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "name": "YOLO数据处理平台"})
+            return
+        if parsed.path == "/api/video-frames/resources":
+            self.send_json(_video_frames.resource_pool.status())
             return
         if parsed.path == "/api/workspace":
             self.send_json(workspace_payload())
@@ -574,9 +578,19 @@ class AppHandler(BaseHTTPRequestHandler):
                     if str(value).strip()
                 }
                 messages: list[str] = []
+                run_parameters = {
+                    **{str(parameter.get("id")): parameter.get("default") for parameter in item.get("parameters", []) if parameter.get("id")},
+                    **dict(parameters),
+                }
+                is_video_frames = handler_id == _video_frames.HANDLER_ID
+                task_name = str(item["name"])
+                if is_video_frames:
+                    source = path_values.get("video_file") or path_values.get("video_folder")
+                    task_name += f" · {source.name if source else '未选择视频'} · {run_parameters.get('scene_code') or '未填写场景'}"
                 task = platform_task_manager.start(
-                    item_id, str(item["name"]),
+                    item_id, task_name,
                     "remote-build" if is_remote_trt else "remote" if is_remote_yolo or is_remote_calib else "local",
+                    task_key=_video_frames.video_frame_task_key(item_id, path_values, run_parameters) if is_video_frames else None,
                 )
                 details = {
                     str(field["label"]): str(payload.get("paths", {}).get(field["id"], ""))
@@ -603,6 +617,40 @@ class AppHandler(BaseHTTPRequestHandler):
                         normalized_onnx_files = [str(path).strip() for path in onnx_files if str(path).strip()]
                         details["ONNX 模型"] = "\n".join(normalized_onnx_files)
                         details["模型数量"] = str(len(normalized_onnx_files))
+                if is_video_frames:
+                    def background_frames() -> None:
+                        status = "failed"
+                        message = ""
+                        outputs: list[str] = []
+                        def report(message: str) -> None:
+                            messages.append(message)
+                            del messages[:-500]
+                            task.add_log(message)
+                        try:
+                            result = execute(str(handler_id), RunContext(
+                                function_id=item_id, paths=path_values, parameters=run_parameters,
+                                report=report, stop_event=task.stop_event, notify=notify_system,
+                            ))
+                            status = "completed"
+                            message = str(result.get("message", "抽帧完成。"))
+                            outputs = list(result.get("outputFolders", []))
+                        except TaskCancelled as exc:
+                            status = "stopped"
+                            message = str(exc)
+                        except Exception as exc:
+                            message = str(exc)
+                        finally:
+                            report(message)
+                            record_finished_run(task, status=status, message=message, logs=messages, details=details, outputs=outputs)
+                            platform_task_manager.finish(task.id)
+                    try:
+                        threading.Thread(target=background_frames, name=f"video-batch-{task.id}", daemon=True).start()
+                    except Exception:
+                        platform_task_manager.finish(task.id)
+                        raise
+                    self.send_json({"ok": True, "task": task.snapshot(), "messages": [f"抽帧任务已提交：{task.name}"],
+                                    "result": {"background": True, "message": "任务已在后台运行，可继续提交其他视频或查看独立任务日志。"}}, 202)
+                    return
                 status = "failed"
                 message = ""
                 outputs: list[str] = []
@@ -614,14 +662,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     result = execute(str(handler_id), RunContext(
                         function_id=item_id,
                         paths=path_values,
-                        parameters={
-                            **{
-                                str(parameter.get("id")): parameter.get("default")
-                                for parameter in item.get("parameters", [])
-                                if parameter.get("id")
-                            },
-                            **dict(payload.get("parameters", {})),
-                        },
+                        parameters=run_parameters,
                         report=report,
                         stop_event=task.stop_event,
                         notify=notify_system,

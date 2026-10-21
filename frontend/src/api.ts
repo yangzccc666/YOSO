@@ -79,6 +79,7 @@ export async function deleteFunction(itemId: string): Promise<void> {
 
 export type RunResponse = {
   ok: boolean
+  task?: PlatformTaskStatus
   result: { message?: string; outputFolders?: string[]; [key: string]: unknown }
   messages: string[]
 }

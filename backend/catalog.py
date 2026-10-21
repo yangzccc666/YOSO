@@ -24,6 +24,7 @@ VIDEO_FUNCTION = {
     "parameters": [
         {"id": "project_code", "label": "项目英文标识（如 tcl）", "type": "text", "default": "", "options": []},
         {"id": "scene_code", "label": "场景英文标识（如 line2_station3）", "type": "text", "default": "", "options": []},
+        {"id": "parallel_workers", "label": "同时处理的视频数（0 自动，1 串行，最多 16）", "type": "number", "default": 0, "options": []},
         {
             "id": "extraction_mode",
             "label": "抽帧方式",
@@ -158,7 +159,7 @@ NEGATIVE_SAMPLE_FUNCTION = {
 VIDEO_CLIP_FUNCTION = {
     "id": "video_clip",
     "name": "视频裁剪",
-    "description": "按指定时间范围批量裁剪视频，也可将指定片段作为训练集、其余片段合并为测试集；默认直接复制原编码流。",
+    "description": "按时间裁剪、拆分训练/测试集，或删除多个不要的时间段后自动拼接剩余内容；原视频不修改，默认不重新编码。",
     "handlerId": "video.clip",
     "pathFields": [
         {"id": "video_folder", "label": "视频文件夹", "mode": "directory"},
@@ -171,8 +172,9 @@ VIDEO_CLIP_FUNCTION = {
             "label": "裁剪时间方案",
             "type": "select",
             "default": "指定开始和结束时间",
-            "options": ["指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾"],
+            "options": ["指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾", "删除多个时间段并拼接剩余"],
         },
+        {"id": "remove_time_ranges", "label": "删除时间段（原视频时间轴，每行一个：开始-结束）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "删除多个时间段并拼接剩余"}},
         {"id": "range_start_time", "label": "开始时间（秒或 HH:MM:SS）", "type": "text", "default": "00:00:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始和结束时间"}},
         {"id": "range_end_time", "label": "结束时间（留空则到视频结尾）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始和结束时间"}},
         {"id": "duration_start_time", "label": "开始时间（秒或 HH:MM:SS）", "type": "text", "default": "00:00:00", "options": [], "visibleWhen": {"fieldId": "clip_mode", "equals": "指定开始时间和持续时长"}},
@@ -192,6 +194,7 @@ VIDEO_CLIP_FUNCTION = {
             "type": "boolean",
             "default": False,
             "options": [],
+            "visibleWhen": {"fieldId": "clip_mode", "notEquals": "删除多个时间段并拼接剩余"},
         },
     ],
 }
@@ -460,6 +463,7 @@ class FunctionCatalog:
                 migration_marker = self.storage_file.with_name(self.storage_file.name + ".local-pt-v1")
                 clip_migration_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1")
                 clip_split_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2")
+                clip_remove_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-remove-v3")
                 dedup_migration_marker = self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1")
                 quant_migration_marker = self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1")
                 export_migration_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1")
@@ -477,6 +481,7 @@ class FunctionCatalog:
                 video_frame_naming_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1")
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
                 video_folder_recursive_marker = self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1")
+                video_parallel_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
                 yolo_training_function_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1")
@@ -515,6 +520,12 @@ class FunctionCatalog:
                     content.append(deepcopy(LOCAL_STAR_PACKAGE_FUNCTION))
                     changed = True
                 for item in content:
+                    if (not video_parallel_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_FUNCTION["id"]):
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(parameter, dict) and parameter.get("id") == "parallel_workers" for parameter in parameters):
+                            parameters.insert(2, deepcopy(next(parameter for parameter in VIDEO_FUNCTION["parameters"] if parameter["id"] == "parallel_workers")))
+                            changed = True
                     if (not video_folder_recursive_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_FUNCTION["id"]):
                         item["description"] = VIDEO_FUNCTION["description"]
@@ -627,6 +638,22 @@ class FunctionCatalog:
                             )
                             parameters.append(deepcopy(source_split))
                             changed = True
+                    if (not clip_remove_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_CLIP_FUNCTION["id"]):
+                        item["description"] = VIDEO_CLIP_FUNCTION["description"]
+                        parameters = item.setdefault("parameters", [])
+                        for source in VIDEO_CLIP_FUNCTION["parameters"]:
+                            parameter = next((entry for entry in parameters if isinstance(entry, dict) and entry.get("id") == source["id"]), None)
+                            if source["id"] == "clip_mode":
+                                if parameter is None:
+                                    parameters.insert(0, deepcopy(source))
+                                else:
+                                    parameter["options"] = deepcopy(source["options"])
+                            elif source["id"] == "remove_time_ranges" and parameter is None:
+                                parameters.insert(1, deepcopy(source))
+                            elif source["id"] == "split_train_test" and parameter is not None:
+                                parameter["visibleWhen"] = deepcopy(source["visibleWhen"])
+                        changed = True
                     if (not calib_priority_marker.exists() and isinstance(item, dict)
                             and item.get("id") == CALIB_DATASET_FUNCTION["id"]):
                         item["description"] = CALIB_DATASET_FUNCTION["description"]
@@ -751,6 +778,8 @@ class FunctionCatalog:
                     clip_migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not clip_split_marker.exists():
                     clip_split_marker.write_text("migrated\n", encoding="utf-8")
+                if not clip_remove_marker.exists():
+                    clip_remove_marker.write_text("migrated\n", encoding="utf-8")
                 if not dedup_migration_marker.exists():
                     dedup_migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not quant_migration_marker.exists():
@@ -785,6 +814,8 @@ class FunctionCatalog:
                     video_frame_priority_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_folder_recursive_marker.exists():
                     video_folder_recursive_marker.write_text("migrated\n", encoding="utf-8")
+                if not video_parallel_marker.exists():
+                    video_parallel_marker.write_text("migrated\n", encoding="utf-8")
                 if not realtime_playback_marker.exists():
                     realtime_playback_marker.write_text("migrated\n", encoding="utf-8")
                 if not yolo_dataset_timestamp_marker.exists():
@@ -811,6 +842,7 @@ class FunctionCatalog:
         self.storage_file.with_name(self.storage_file.name + ".local-pt-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-clip-remove-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-training-remote-source-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1").write_text("migrated\n", encoding="utf-8")
@@ -828,6 +860,7 @@ class FunctionCatalog:
         self.storage_file.with_name(self.storage_file.name + ".local-star-package-local-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1").write_text("migrated\n", encoding="utf-8")
 

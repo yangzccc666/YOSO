@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,7 +17,8 @@ from .task_manager import TaskCancelled
 
 HANDLER_ID = "video.clip"
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm"}
-CLIP_MODES = {"指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾"}
+REMOVE_MODE = "删除多个时间段并拼接剩余"
+CLIP_MODES = {"指定开始和结束时间", "指定开始时间和持续时长", "跳过开头和结尾", REMOVE_MODE}
 COPY_MODE = "原画质裁剪（推荐，不重新编码）"
 PRECISE_MODE = "精确裁剪（重新编码）"
 LEGACY_ENCODING_MODES = {
@@ -51,9 +54,64 @@ def parse_time(value: Any, label: str) -> float:
                 raise ValueError
         except ValueError as exc:
             raise ValueError(f"{label}格式不正确，请输入秒数或 HH:MM:SS。") from exc
+    if not math.isfinite(seconds):
+        raise ValueError(f"{label}必须是有限的时间数值。")
     if seconds < 0:
         raise ValueError(f"{label}不能小于 0。")
     return seconds
+
+
+def parse_removal_ranges(value: Any) -> list[tuple[float, float | None]]:
+    """Read removal intervals on the original timeline, never a shifted one."""
+    rows = [row.strip() for row in re.split(r"[\n;；]+", str(value or "")) if row.strip()]
+    if not rows:
+        raise ValueError("请填写需要删除的时间段，每行一个，例如 00:10-00:20。")
+    ranges = []
+    for index, row in enumerate(rows, 1):
+        parts = re.split(r"\s*(?:-|–|—|~|～|至)\s*", row)
+        if len(parts) != 2 or not parts[0].strip():
+            raise ValueError(f"第 {index} 个删除时间段格式不正确：{row}。请填写 开始时间-结束时间。")
+        start = parse_time(parts[0].strip(), f"第 {index} 段开始时间")
+        raw_end = parts[1].strip()
+        end = None if raw_end in {"", "结尾", "末尾", "end"} else parse_time(raw_end, f"第 {index} 段结束时间")
+        if end is not None and end <= start:
+            raise ValueError(f"第 {index} 个删除时间段的结束时间必须晚于开始时间。")
+        ranges.append((start, end))
+    return ranges
+
+
+def remaining_ranges(
+    ranges: list[tuple[float, float | None]], duration: float,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]], bool]:
+    """Clamp, sort and merge deleted intervals, then compute their complement."""
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("视频时长无效。")
+    clipped = []
+    adjusted = False
+    for start, end in ranges:
+        stop = duration if end is None else min(end, duration)
+        adjusted |= start >= duration or (end is not None and end > duration)
+        if start < stop:
+            clipped.append((start, stop))
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(clipped):
+        if merged and start <= merged[-1][1] + 1e-6:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    if not merged:
+        raise ValueError("删除时间段均在视频时长之外，没有可删除的内容。")
+    kept = []
+    cursor = 0.0
+    for start, end in merged:
+        if start - cursor > 1e-6:
+            kept.append((cursor, start))
+        cursor = end
+    if duration - cursor > 1e-6:
+        kept.append((cursor, duration))
+    if not kept:
+        raise ValueError("删除时间段覆盖了整个视频，没有可保留的内容，请调整时间段。")
+    return kept, merged, adjusted
 
 
 def _find_ffmpeg() -> str:
@@ -309,7 +367,8 @@ def _concat_clips(
 ) -> Path:
     """Join compatible clips without another video re-encode."""
     if not clips:
-        raise ValueError("指定训练片段覆盖了整个视频，没有剩余内容可生成测试集视频。")
+        raise ValueError("没有可拼接的视频片段。")
+    context.check_cancelled()
     if len(clips) == 1:
         clips[0].replace(output)
         return output
@@ -328,7 +387,8 @@ def _concat_clips(
         ], context)
         if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 0:
             detail = completed.stderr.strip().splitlines()
-            raise RuntimeError(f"测试集片段合并失败：{detail[-1] if detail else 'FFmpeg 未生成结果文件'}")
+            raise RuntimeError(f"视频片段合并失败：{detail[-1] if detail else 'FFmpeg 未生成结果文件'}")
+        context.check_cancelled()
         temporary.replace(output)
         return output
     except TaskCancelled:
@@ -339,6 +399,79 @@ def _concat_clips(
         list_path.unlink(missing_ok=True)
 
 
+def _has_audio(ffmpeg: str, video: Path, context: RunContext) -> bool:
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        completed = _run_process([
+            ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=index", "-of", "csv=p=0", str(video),
+        ], context)
+        if completed.returncode != 0:
+            raise RuntimeError(f"无法检查视频音轨：{video.name}")
+        return bool(completed.stdout.strip())
+    # The bundled FFmpeg distribution need not contain an ffprobe executable.
+    completed = _run_process([ffmpeg, "-hide_banner", "-i", str(video)], context)
+    return bool(re.search(r"Stream #.*Audio:", completed.stderr))
+
+
+def _join_remaining(
+    ffmpeg: str, video: Path, parent: Path, ranges: list[tuple[float, float]],
+    duration: float, encoding_mode: str, context: RunContext,
+) -> Path:
+    precise = encoding_mode == PRECISE_MODE
+    suffix = ".mp4" if precise else video.suffix.lower()
+    output = _unique_output_file(parent, video, 0, duration, suffix, "removed_joined")
+    temporary = output.with_name(f".{output.stem}.partial{suffix}")
+    try:
+        if not precise:
+            with tempfile.TemporaryDirectory(prefix=".video_remove_parts_", dir=parent) as staging:
+                parts = []
+                for index, (start, end) in enumerate(ranges, 1):
+                    context.report(f"保留片段 {index}/{len(ranges)}：{start:.3f} 秒 → {end:.3f} 秒")
+                    parts.append(_clip_one(ffmpeg, video, Path(staging), start, end, encoding_mode, context, f"part{index}"))
+                context.report(f"正在按原始顺序拼接 {len(parts)} 个保留片段")
+                return _concat_clips(ffmpeg, parts, output, context)
+
+        # Trim and concatenate before encoding: no per-clip AAC padding or
+        # repeated encoding, which can otherwise accumulate A/V drift.
+        audio = _has_audio(ffmpeg, video, context)
+        filters = []
+        count = len(ranges)
+        filters.append(f"[0:v:0]split={count}" + "".join(f"[sv{i}]" for i in range(count)))
+        if audio:
+            filters.append(f"[0:a:0]asplit={count}" + "".join(f"[sa{i}]" for i in range(count)))
+        inputs = []
+        for index, (start, end) in enumerate(ranges):
+            context.report(f"保留片段 {index + 1}/{count}：{start:.3f} 秒 → {end:.3f} 秒")
+            filters.append(f"[sv{index}]trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS[v{index}]")
+            inputs.append(f"[v{index}]")
+            if audio:
+                filters.append(
+                    f"[sa{index}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS,"
+                    f"apad=whole_dur={end-start:.6f},atrim=duration={end-start:.6f}[a{index}]"
+                )
+                inputs.append(f"[a{index}]")
+        filters.append("".join(inputs) + f"concat=n={count}:v=1:a={int(audio)}[vout]" + ("[aout]" if audio else ""))
+        command = [
+            ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+            "-filter_complex_threads", "1", "-filter_complex", ";".join(filters), "-map", "[vout]",
+        ]
+        if audio:
+            command += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
+        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-map_metadata", "0", "-movflags", "+faststart", str(temporary)]
+        audio_note = "保留首条音轨" if audio else "原视频无音轨"
+        context.report(f"正在精确删除并拼接 {count} 个保留片段（一次编码，{audio_note}）")
+        completed = _run_process(command, context)
+        if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size <= 0:
+            lines = completed.stderr.strip().splitlines()
+            raise RuntimeError(f"删除并拼接失败：{lines[-1] if lines else 'FFmpeg 未生成结果文件'}")
+        context.check_cancelled()
+        temporary.replace(output)
+        return output
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def run_video_clip(context: RunContext) -> dict[str, Any]:
     videos = _resolve_videos(context)
     ffmpeg = _find_ffmpeg()
@@ -346,7 +479,9 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
     encoding_mode = LEGACY_ENCODING_MODES.get(encoding_mode, encoding_mode)
     if encoding_mode not in ENCODING_MODES:
         raise ValueError("请选择有效的裁剪处理方式。")
-    split_train_test = bool(context.parameters.get("split_train_test", False))
+    remove_mode = context.parameters.get("clip_mode") == REMOVE_MODE
+    removal = parse_removal_ranges(context.parameters.get("remove_time_ranges")) if remove_mode else []
+    split_train_test = not remove_mode and bool(context.parameters.get("split_train_test", False))
 
     output_root = context.paths.get("output_folder")
     if output_root:
@@ -354,6 +489,8 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         output_root.mkdir(parents=True, exist_ok=True)
 
     context.report(f"找到 {len(videos)} 个视频，处理方式：{encoding_mode}")
+    if remove_mode:
+        context.report("删除时间均以原视频时间轴为准；重叠/相邻区间自动合并，剩余片段按原顺序拼成一个新视频，原视频不修改。")
     if split_train_test:
         context.report("已开启训练集/测试集拆分：指定时间段输出到 train，其余片段合并后输出到 test。")
     if encoding_mode == COPY_MODE:
@@ -369,6 +506,28 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         try:
             context.check_cancelled()
             video_duration = _probe_duration(video, context)
+            if remove_mode:
+                kept, removed, adjusted = remaining_ranges(removal, video_duration)
+                if adjusted:
+                    context.report(f"[{index}/{len(videos)}] {video.name}：超出视频结尾的区间已截断或忽略。")
+                kept_duration = sum(end - start for start, end in kept)
+                context.report(f"[{index}/{len(videos)}] {video.name}：删除 {len(removed)} 段，保留 {len(kept)} 段，预计输出 {kept_duration:.3f} 秒。")
+                parent = output_root or video.parent
+                parent.mkdir(parents=True, exist_ok=True)
+                output = _join_remaining(ffmpeg, video, parent, kept, video_duration, encoding_mode, context)
+                created_for_video.append(output)
+                source_size, output_size = video.stat().st_size, output.stat().st_size
+                outputs.append(output)
+                successful_videos += 1
+                details.append({
+                    "video": str(video), "output": str(output), "clipMode": REMOVE_MODE,
+                    "removedRanges": [{"startSec": start, "endSec": end} for start, end in removed],
+                    "keptRanges": [{"startSec": start, "endSec": end} for start, end in kept],
+                    "durationSec": kept_duration, "sourceDurationSec": video_duration,
+                    "encodingMode": encoding_mode, "sourceSizeBytes": source_size, "outputSizeBytes": output_size,
+                })
+                context.report(f"[{index}/{len(videos)}] 完成：{output.name}，输出 {output_size / 1024 / 1024:.1f} MB")
+                continue
             start, end, clamped = _configured_range(context.parameters, video_duration)
             if clamped:
                 context.report(f"[{index}/{len(videos)}] {video.name}：结束位置超出视频，已自动截到结尾")
@@ -386,17 +545,17 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 created_for_video.append(output)
                 suffix = ".mp4" if encoding_mode == PRECISE_MODE else video.suffix.lower()
                 test_output = _unique_output_file(test_parent, video, 0, video_duration, suffix, "test")
-                remaining_ranges = [
+                test_ranges = [
                     (part_start, part_end)
                     for part_start, part_end in ((0.0, start), (end, video_duration))
                     if part_end - part_start > 0.01
                 ]
-                if not remaining_ranges:
+                if not test_ranges:
                     raise ValueError("指定训练片段覆盖了整个视频，没有剩余内容可生成测试集视频。")
                 staging_dir = Path(tempfile.mkdtemp(prefix=".video_split_parts_", dir=test_parent))
                 parts = [
                     _clip_one(ffmpeg, video, staging_dir, part_start, part_end, encoding_mode, context, f"part{part_index}")
-                    for part_index, (part_start, part_end) in enumerate(remaining_ranges, 1)
+                    for part_index, (part_start, part_end) in enumerate(test_ranges, 1)
                 ]
                 context.report(f"[{index}/{len(videos)}] 正在合并 {len(parts)} 个剩余片段为测试集视频")
                 _concat_clips(ffmpeg, parts, test_output, context)
@@ -433,7 +592,7 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
             for path in created_for_video:
                 path.unlink(missing_ok=True)
             raise
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, OSError) as exc:
             for path in created_for_video:
                 path.unlink(missing_ok=True)
             failures.append({"video": str(video), "error": str(exc)})

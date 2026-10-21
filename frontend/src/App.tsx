@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, stopActiveTask, updateFunction } from './api'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getRunHistory, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, stopActiveTask, updateFunction } from './api'
 import { FunctionEditor } from './components/FunctionEditor'
 import { GroupDialog } from './components/GroupDialog'
 import { FunctionSidebar } from './components/FunctionSidebar'
@@ -35,6 +35,8 @@ function sameActiveTaskState(current: PlatformTaskStatus[], next: PlatformTaskSt
       && task.kind === candidate.kind
       && task.status === candidate.status
       && task.startedAt === candidate.startedAt
+      && task.logs?.length === candidate.logs?.length
+      && task.logs?.at(-1) === candidate.logs?.at(-1)
   })
 }
 
@@ -196,6 +198,7 @@ export default function App() {
   const [outputs, setOutputs] = useState<Record<string, string>>({})
   const [runningIds, setRunningIds] = useState<string[]>([])
   const [activeTasks, setActiveTasks] = useState<PlatformTaskStatus[]>([])
+  const backgroundTasks = useRef(new Map<string, { functionId: string; submittedAt: number }>())
   const [notice, setNotice] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -260,23 +263,39 @@ export default function App() {
     let timer: number | undefined
     const refresh = async () => {
       try {
+        const requestedAt = performance.now()
         const tasks = await getActiveTask()
         if (disposed) return
+        for (const task of tasks) {
+          if (task.functionId === 'video_frames' && !backgroundTasks.current.has(task.id)) {
+            backgroundTasks.current.set(task.id, { functionId: task.functionId, submittedAt: requestedAt })
+          }
+        }
         setActiveTasks((current) => sameActiveTaskState(current, tasks) ? current : tasks)
         setOutputs((current) => {
           let changed = false
           const next = { ...current }
-          for (const task of tasks) {
-            if (task.logs?.length) {
-              const output = task.logs.join('\n')
-              if (current[task.functionId] !== output) {
-                next[task.functionId] = output
-                changed = true
-              }
+          const grouped = new Map<string, PlatformTaskStatus[]>()
+          for (const task of tasks) grouped.set(task.functionId, [...(grouped.get(task.functionId) || []), task])
+          for (const [functionId, entries] of grouped) {
+            const output = entries.filter((task) => task.logs?.length).map((task) => entries.length > 1 ? `【${task.name} · ${task.id.slice(0, 6)}】\n${task.logs?.join('\n')}` : task.logs?.join('\n')).join('\n\n')
+            if (output && current[functionId] !== output) {
+              next[functionId] = output
+              changed = true
             }
           }
           return changed ? next : current
         })
+        const activeIds = new Set(tasks.map((task) => task.id))
+        const ended = [...backgroundTasks.current].filter(([id, entry]) => entry.submittedAt < requestedAt && !activeIds.has(id))
+        await Promise.all([...new Set(ended.map(([, entry]) => entry.functionId))].map(async (functionId) => {
+          const history = await getRunHistory(functionId)
+          if (disposed) return
+          const ids = new Set(ended.filter(([, entry]) => entry.functionId === functionId).map(([id]) => id))
+          const records = history.filter((record) => ids.has(record.id))
+          for (const id of ids) backgroundTasks.current.delete(id)
+          if (records.length) setOutputs((current) => ({ ...current, [functionId]: records.map((record) => `${record.name}\n${record.logs.join('\n')}\n${record.message}`).join('\n\n') }))
+        }))
       } catch {
         // The main request will surface server errors.
       } finally {
@@ -498,6 +517,13 @@ export default function App() {
         ...runValues,
         parameters: { ...runValues.parameters, ...parameterOverrides },
       })
+      if (result.result.background && result.task) {
+        backgroundTasks.current.set(result.task.id, { functionId: item.id, submittedAt: performance.now() })
+        const submitted = result.task
+        setActiveTasks((current) => current.some((task) => task.id === submitted.id) ? current : [...current, submitted])
+        setOutputs((current) => ({ ...current, [item.id]: [...result.messages, result.result.message || ''].join('\n') }))
+        return
+      }
       const lines = [...result.messages]
       if (result.result.message) lines.push('', result.result.message)
       if (result.result.outputFolders?.length) lines.push('', '输出目录：', ...result.result.outputFolders)
@@ -556,8 +582,10 @@ export default function App() {
       const message = error instanceof Error ? error.message : '运行失败'
       setOutputs((current) => ({ ...current, [item.id]: `[${started}] ${message}` }))
     } finally {
-      setRunningIds((current) => current.filter((id) => id !== item.id))
-      setActiveTasks((current) => current.filter((task) => task.functionId !== item.id))
+      setRunningIds((current) => {
+        const index = current.indexOf(item.id)
+        return index < 0 ? current : [...current.slice(0, index), ...current.slice(index + 1)]
+      })
     }
   }
 

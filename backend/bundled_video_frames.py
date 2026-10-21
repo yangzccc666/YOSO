@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import cv2
 from tqdm import tqdm
@@ -66,6 +66,16 @@ def parse_video_paths(inputs: str | list[str]) -> list[str]:
     return result
 
 
+def open_video(path: str):
+    """Keep each FFmpeg decoder small instead of oversubscribing CPU threads."""
+    if hasattr(cv2, "CAP_PROP_N_THREADS"):
+        capture = cv2.VideoCapture(path, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
+        if capture.isOpened():
+            return capture
+        capture.release()
+    return cv2.VideoCapture(path)
+
+
 def vedio2img(
     vedio_path: str,
     images_save_path: str,
@@ -82,10 +92,13 @@ def vedio2img(
     priority_ranges: list[tuple[float, float]] | None = None,
     priority_fps: float = 25,
     background_fps: float = 5,
+    check_cancelled: Callable[[], None] | None = None,
+    report_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, Any] | None:
     Path(images_save_path).mkdir(parents=True, exist_ok=True)
-    capture = cv2.VideoCapture(vedio_path)
+    capture = open_video(vedio_path)
     if not capture.isOpened():
+        capture.release()
         print(f"无法打开视频文件: {vedio_path}")
         return None
     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -177,7 +190,10 @@ def vedio2img(
 
         success = 0
         errors = 0
-        for frame_index in tqdm(selected):
+        progress = selected if report_progress is not None else tqdm(selected)
+        for position, frame_index in enumerate(progress, start=1):
+            if check_cancelled is not None:
+                check_cancelled()
             capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
             ok, frame = capture.read()
             if not ok or frame is None or frame.size == 0:
@@ -189,6 +205,8 @@ def vedio2img(
                 success += 1
             else:
                 errors += 1
+            if report_progress is not None:
+                report_progress(position, len(selected))
         return {
             "success_count": success, "error_count": errors, "candidate_count": len(candidates),
             "selected_frame_indices": selected, "limit_applied": limit_applied,
