@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { choosePaths, forgetRemotePassword, getRemoteCredentialStatus, getRemoteInferenceStatus, seekRemoteInference, setRemoteInferencePaused, startRemoteInference, stopRemoteInference, testRemoteConnection } from '../api'
+import { choosePaths, forgetRemotePassword, getRemoteCredentialStatus, getRemoteInferenceStatus, seekRemoteInference, setRemoteInferencePaused, startRemoteInference, stepRemoteInference, stopRemoteInference, testRemoteConnection } from '../api'
 import { icons } from '../icons'
-import { parseStarModels } from '../remoteStarModels'
+import { useVideoPlaybackShortcut } from '../hooks/useVideoPlaybackShortcut'
+import { FrameStepControls } from './FrameStepControls'
+import { retainNewestPlaybackStatus } from '../playbackStatus'
+import { parseStarModels, selectHistoricalStarModel } from '../remoteStarModels'
+import { StarModelHistoryDialog } from './StarModelHistoryDialog'
 import type { StarModel } from '../remoteStarModels'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { ConnectionTestResult, PlatformTaskStatus, RemoteInferenceStatus, WorkingValues } from '../types'
@@ -50,6 +54,8 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const [submitting, setSubmitting] = useState(false)
   const [playbackSubmitting, setPlaybackSubmitting] = useState(false)
   const [error, setError] = useState('')
+  const [modelHistoryOpen, setModelHistoryOpen] = useState(false)
+  const [modelNotice, setModelNotice] = useState('')
   const [credentialNotice, setCredentialNotice] = useState('')
   const [connectionCheck, setConnectionCheck] = useState<ConnectionCheck | null>(null)
   const [previewExpanded, setPreviewExpanded] = useState(false)
@@ -62,6 +68,8 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const timelineHolding = useRef(false)
   const checkedCredentialIdentity = useRef('')
   const completedSession = useRef('')
+  const previewRef = useRef<HTMLDivElement>(null)
+  const playbackRequest = useRef(false)
 
   const clearTimelineTimer = () => {
     if (timelineHideTimer.current !== undefined) window.clearTimeout(timelineHideTimer.current)
@@ -104,6 +112,14 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const starModels = parseStarModels(values.parameters.star_models, String(values.paths.local_model_file || ''), String(values.parameters.labels || ''), Number(values.parameters.conf ?? 0.5))
 
   const saveStarModels = (models: StarModel[]) => onParameterChange('star_models', JSON.stringify(models))
+  const selectHistoryModel = (model: StarModel): string | null => {
+    const result = selectHistoricalStarModel(starModels, model)
+    if (result.action === 'full') return '当前已有 8 个模型，请先关闭弹窗，移除一个模型或清空全部模型后再选择。'
+    if (result.action !== 'selected') saveStarModels(result.models)
+    setModelNotice(result.action === 'selected' ? '此模型及类别名称已在当前配置中，无需重复添加。' : '历史模型文件、类别名称和置信度已填入；其他模型配置保持不变。')
+    setError('')
+    return null
+  }
   const updateStarModel = (index: number, patch: Partial<StarModel>) => {
     saveStarModels(starModels.map((model, position) => position === index ? { ...model, ...patch } : model))
   }
@@ -166,7 +182,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
       try {
         const next = await getRemoteInferenceStatus(sessionId)
         if (cancelled) return
-        setSession(next)
+        setSession((current) => retainNewestPlaybackStatus(current, next))
         if (!terminalStates.has(next.status)) timer = window.setTimeout(refresh, 700)
       } catch (refreshError) {
         if (cancelled) return
@@ -296,9 +312,11 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
     scrubPositionRef.current = null
     try {
       const next = await startRemoteInference(values)
+      setModelNotice(next.modelHistoryWarning || '本次使用的所有模型配置已保存至历史模型库。')
       sessionStorage.setItem(storageKey, next.id)
       setSession(next)
       setSessionId(next.id)
+      previewRef.current?.focus({ preventScroll: true })
       onParameterChange('password', rememberPassword ? REMEMBERED_PASSWORD_VALUE : '')
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : '远端推理启动失败')
@@ -321,6 +339,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   }
 
   const commitSeek = async () => {
+    if (playbackBusy || playbackRequest.current) { scrubPositionRef.current = null; setScrubPosition(null); return }
     const target = scrubPositionRef.current
     if (target === null || !sessionId) return
     scrubPositionRef.current = null
@@ -338,7 +357,9 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   }
 
   const togglePlayback = async () => {
-    if (!sessionId || !session) return
+    if (!sessionId || !session || !canPause || playbackBusy || playbackRequest.current) return
+    playbackRequest.current = true
+    revealTimeline()
     setPlaybackSubmitting(true)
     setError('')
     try {
@@ -346,16 +367,32 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
     } catch (playbackError) {
       setError(playbackError instanceof Error ? playbackError.message : '暂停或继续视频失败')
     } finally {
+      playbackRequest.current = false
       setPlaybackSubmitting(false)
     }
+  }
+
+  const stepFrame = async (direction: -1 | 1) => {
+    if (!sessionId || !session || !canStep || playbackBusy || playbackRequest.current || pendingSeek !== null || scrubPositionRef.current !== null) return false
+    if (direction < 0 ? session.sourceFrameIndex <= 0 : session.sourceFrameIndex >= session.sourceFrameCount - 1) return false
+    playbackRequest.current = true
+    revealTimeline()
+    setPlaybackSubmitting(true)
+    setError('')
+    try { setSession(await stepRemoteInference(sessionId, direction)); return true }
+    catch (cause) { setError(cause instanceof Error ? cause.message : '逐帧定位失败'); return false }
+    finally { playbackRequest.current = false; setPlaybackSubmitting(false) }
   }
 
   const active = Boolean(session && !terminalStates.has(session.status))
   const streamUrl = session && session.frameCount > 0 ? `${session.streamUrl}?session=${session.id}` : ''
   const duration = session?.durationSeconds || 0
   const displayedPosition = scrubPosition ?? pendingSeek ?? session?.positionSeconds ?? 0
-  const canSeek = Boolean(session && (session.status === 'running' || session.status === 'paused') && duration > 0)
+  const playbackBusy = submitting || playbackSubmitting || Boolean(session?.frameStepPending)
+  const canSeek = Boolean(session && !playbackBusy && (session.status === 'running' || session.status === 'paused') && duration > 0)
   const canPause = Boolean(session && (session.status === 'running' || session.status === 'paused') && session.frameCount > 0 && !session.atEnd)
+  const canStep = Boolean(session && session.frameStepSupported && (session.status === 'running' || session.status === 'paused'))
+  useVideoPlaybackShortcut(previewRef, canPause, playbackBusy, togglePlayback, canStep, stepFrame)
   const connectionError = currentConnectionCheck?.state === 'failed' ? currentConnectionCheck.error || 'SSH 连接测试失败' : ''
   const displayedStatus = active
     ? { className: session?.status || 'idle', label: session?.atEnd ? '已到结尾 · 可回看' : session ? statusLabels[session.status] : '正在运行' }
@@ -382,9 +419,12 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
         </div>)}
         <div className="remote-model-actions">
           <button type="button" className="text-action" disabled={starModels.length >= 8} onClick={() => saveStarModels([...starModels, { path: '', labels: '', conf: Number(values.parameters.conf ?? 0.5) }])}><icons.Plus size={16} />添加 STAR 模型（最多 8 个）</button>
+          <button type="button" className="text-action" onClick={() => { setModelNotice(''); setModelHistoryOpen(true) }}><icons.Clock3 size={16} />历史模型</button>
           <button type="button" className="text-action danger" disabled={starModels.length === 1 && !starModels[0].path.trim() && !starModels[0].labels.trim()} onClick={clearAllStarModels} title="删除全部模型配置并保留一个空白上传窗口"><icons.Trash2 size={16} />清空全部模型</button>
         </div>
+        {modelNotice && <p className="model-history-notice" role="status">{modelNotice}</p>}
       </div>
+      {modelHistoryOpen && <StarModelHistoryDialog currentModels={starModels} onSelect={selectHistoryModel} onClose={() => setModelHistoryOpen(false)} />}
       <div className="remote-run-actions">
         {!active ? <button className="connection-test-button" onClick={testConnection} disabled={testingConnection || submitting}>
           <icons.Settings size={17} />{testingConnection ? '正在连接…' : connectionReady ? '重新测试连接' : '测试连接'}
@@ -402,16 +442,17 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
       {credentialNotice ? <div className="credential-notice" role="status"><icons.Check size={18} /><span>{credentialNotice}</span></div> : null}
       {connectionError || error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{connectionError || error}</span></div> : null}
 
-      <div className={`remote-preview ${previewExpanded ? 'expanded' : ''}`} onMouseMove={revealTimeline} onMouseLeave={leaveTimeline} onPointerDown={revealTimeline} onDoubleClick={() => setPreviewExpanded((current) => !current)} title="双击切换撑满窗口">
+      <div ref={previewRef} tabIndex={0} role="region" aria-label="远程视频预览" aria-keyshortcuts="Space , ." className={`remote-preview ${previewExpanded ? 'expanded' : ''}`} onMouseMove={revealTimeline} onPointerLeave={(event) => { if (event.pointerType === 'mouse') leaveTimeline() }} onPointerDown={revealTimeline} onDoubleClick={() => setPreviewExpanded((current) => !current)} title="空格播放/暂停；, 上一帧，. 下一帧；逐帧按钮支持长按；双击切换撑满窗口">
         <button className="preview-expand-button" onClick={() => setPreviewExpanded((current) => !current)} onDoubleClick={(event) => event.stopPropagation()} aria-label={previewExpanded ? '退出撑满窗口' : '撑满整个窗口'} aria-pressed={previewExpanded}>
           {previewExpanded ? <icons.Minimize2 size={17} /> : <icons.Maximize2 size={17} />}
           {previewExpanded ? '退出全窗口' : '撑满窗口'}
         </button>
         {streamUrl ? <img src={streamUrl} alt="远端 AI 检测实时画面" draggable={false} /> : <div className="remote-preview-empty"><icons.Play size={34} /><strong>{session?.message || '先测试连接，再点击“开始实时检测”'}</strong><span>开始后会自动上传内置推理脚本、所选模型和视频，带框画面会显示在这里</span></div>}
         {session ? <div className={`remote-preview-timeline ${timelineVisible ? '' : 'is-hidden'}`} onPointerDown={() => { timelineHolding.current = true; clearTimelineTimer() }} onPointerUp={releaseTimeline} onPointerCancel={releaseTimeline} onDoubleClick={(event) => event.stopPropagation()}>
-          <button className="remote-preview-playback-button" type="button" onClick={() => void togglePlayback()} onPointerUp={(event) => event.currentTarget.blur()} disabled={!canPause || playbackSubmitting} aria-label={session.status === 'paused' ? '继续视频' : '暂停视频'} title={session.status === 'paused' ? '继续视频' : '暂停视频'}>
+          <button className="remote-preview-playback-button" type="button" onClick={() => void togglePlayback()} onPointerUp={(event) => event.currentTarget.blur()} disabled={!canPause || playbackBusy} aria-keyshortcuts="Space" aria-label={session.status === 'paused' ? '继续视频' : '暂停视频'} title={session.status === 'paused' ? '继续视频（空格）' : '暂停视频（空格）'}>
             {session.status === 'paused' ? <icons.Play size={16} fill="currentColor" /> : <icons.Pause size={16} fill="currentColor" />}
           </button>
+          <FrameStepControls key={session.id} supported={canStep} busy={playbackBusy} index={session.sourceFrameIndex} count={session.sourceFrameCount} onStep={stepFrame} onHoldingChange={(held) => { timelineHolding.current = held; if (held) revealTimeline(); else releaseTimeline() }} />
           <span>{formatVideoTime(displayedPosition)}</span>
           <input aria-label="视频进度，拖动后跳转" type="range" min={0} max={Math.max(duration, 0.01)} step="0.1" value={Math.min(displayedPosition, Math.max(duration, 0.01))} disabled={!canSeek} onFocus={revealTimeline} onChange={(event) => { const next = Number(event.target.value); scrubPositionRef.current = next; setScrubPosition(next) }} onPointerUp={(event) => { void commitSeek(); event.currentTarget.blur() }} onKeyUp={() => void commitSeek()} onBlur={() => { releaseTimeline(); void commitSeek() }} />
           <span>{formatVideoTime(duration)}</span>
@@ -419,6 +460,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
       </div>
 
       <div className="remote-session-summary">
+        <span>快捷键：空格播放 / 暂停；, 上一帧，. 下一帧（兼容 ，。），逐帧自动暂停</span>
         <span>设备：{session ? `${session.username}@${session.host}` : String(values.parameters.host || '未填写')}</span>
         {session?.status === 'uploading' ? <span>上传：{session.transferStage} {session.uploadProgress}%</span> : null}
         <span>已接收预览：{session?.frameCount || 0} 帧</span>

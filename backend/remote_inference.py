@@ -210,6 +210,9 @@ class RemoteInferenceSession:
     duration_seconds: float = 0.0
     position_seconds: float = 0.0
     source_fps: float = 0.0
+    source_frame_index: int = -1
+    source_frame_count: int = 0
+    frame_step_pending: bool = False
     seek_generation: int = 0
     last_frame_generation: int = 0
     pause_preview_pending: bool = False
@@ -235,7 +238,7 @@ class RemoteInferenceSession:
             self.logs.append(clean)
             self.condition.notify_all()
 
-    def publish_frame(self, frame: bytes, position_seconds: float = 0.0, generation: int = 0) -> None:
+    def publish_frame(self, frame: bytes, position_seconds: float = 0.0, generation: int = 0, source_frame_index: int | None = None) -> None:
         with self.condition:
             if generation < self.seek_generation:
                 return
@@ -247,11 +250,33 @@ class RemoteInferenceSession:
             self.frame_version += 1
             self.frame_count += 1
             self.last_frame_generation = generation
+            if source_frame_index is not None:
+                self.source_frame_index = source_frame_index
+            elif self.source_fps > 0:
+                # Worker packets use the source frame's start timestamp.
+                self.source_frame_index = max(0, round(position_seconds * self.source_fps))
+            if self.source_frame_count > 0:
+                self.source_frame_index = min(self.source_frame_index, self.source_frame_count - 1)
+            self.frame_step_pending = False
             self.position_seconds = max(0.0, min(position_seconds, self.duration_seconds)) if self.duration_seconds > 0 else max(0.0, position_seconds)
             if self.status == "starting":
                 self.status = "running"
                 self.message = "远端推理运行中，正在接收实时画面。"
             self.condition.notify_all()
+
+    def frame_step_target(self, direction: Any) -> int:
+        """Called under condition: derive the target from the accepted preview."""
+        if type(direction) is not int or direction not in {-1, 1}:
+            raise ValueError("逐帧方向必须为 -1（上一帧）或 1（下一帧）。")
+        if self.status not in {"running", "paused"} or self.frame_count <= 0:
+            raise ValueError("当前任务尚未进入可逐帧的视频播放阶段。")
+        if self.source_fps <= 0 or self.source_frame_count <= 0 or self.source_frame_index < 0:
+            raise ValueError("视频未提供有效帧率或帧数，暂不支持逐帧。")
+        if self.seek_generation > self.last_frame_generation:
+            raise ValueError("上一条跳转或逐帧请求尚未完成，请稍候。")
+        if self.seek_generation >= 0xFFFFFFFF:
+            raise ValueError("播放控制次数已达到上限，请重新开始推理任务。")
+        return min(max(0, self.source_frame_index + direction), self.source_frame_count - 1)
 
     def update_upload(self, stage: str, transferred: int, total: int) -> None:
         progress = min(100, round(transferred * 100 / total)) if total > 0 else 0
@@ -273,9 +298,15 @@ class RemoteInferenceSession:
                 "startedAt": self.started_at,
                 "finishedAt": self.finished_at,
                 "frameCount": self.frame_count,
+                "controlGeneration": self.seek_generation,
+                "frameVersion": self.frame_version,
                 "durationSeconds": self.duration_seconds,
                 "positionSeconds": self.position_seconds,
                 "sourceFps": self.source_fps,
+                "sourceFrameIndex": self.source_frame_index,
+                "sourceFrameCount": self.source_frame_count,
+                "frameStepSupported": self.source_fps > 0 and self.source_frame_count > 0 and self.source_frame_index >= 0,
+                "frameStepPending": self.frame_step_pending and self.status not in TERMINAL_STATES,
                 "atEnd": self.at_end,
                 "replayRemainingSeconds": max(0, round(self.replay_deadline - time.monotonic())) if self.replay_deadline is not None else 0,
                 "logs": list(self.logs),
@@ -540,6 +571,10 @@ class RemoteInferenceManager:
                     with session.condition:
                         session.duration_seconds = duration if math.isfinite(duration) and duration > 0 else 0.0
                         session.source_fps = fps if math.isfinite(fps) and fps > 0 else 0.0
+                        count = float(metadata.get("sourceFrameCount", duration * fps))
+                        session.source_frame_count = int(count) if math.isfinite(count) and count > 0 else 0
+                        if session.source_frame_index < 0 and session.frame_count > 0 and session.source_fps > 0:
+                            session.source_frame_index = max(0, round(session.position_seconds * session.source_fps))
                         session.condition.notify_all()
                 except (ValueError, TypeError, AttributeError):
                     session.add_log("警告：无法读取视频时长，进度条可能不可用。")
@@ -548,6 +583,8 @@ class RemoteInferenceManager:
                     metadata = json.loads(decoded.removeprefix("VIDEO_EOF_JSON:"))
                     grace = int(metadata.get("graceSeconds", 0))
                     with session.condition:
+                        if int(metadata.get("generation", session.seek_generation)) < session.seek_generation:
+                            continue
                         session.at_end = True
                         session.position_seconds = session.duration_seconds
                         session.replay_deadline = time.monotonic() + max(0, grace)
@@ -585,6 +622,29 @@ class RemoteInferenceManager:
             session.at_end = False
             session.replay_deadline = None
         return {"ok": True, "requestedSeconds": target}
+
+    def step_frame(self, session_id: str, direction: Any) -> dict[str, Any]:
+        session = self.get(session_id)
+        with session.condition:
+            target = session.frame_step_target(direction)
+            if session.control_stdin is None:
+                raise ValueError("远端视频控制连接已断开。")
+            generation = session.seek_generation + 1
+            try:
+                session.control_stdin.write(json.dumps({"action": "step", "frameIndex": target, "generation": generation}) + "\n")
+                session.control_stdin.flush()
+            except (OSError, ValueError) as exc:
+                raise RuntimeError("逐帧命令发送失败，远端任务可能已结束。") from exc
+            session.seek_generation = generation
+            session.status = "paused"
+            session.pause_preview_pending = True
+            session.frame_step_pending = True
+            session.at_end = False
+            session.replay_deadline = None
+            session.message = f"逐帧查看：第 {target + 1} 帧（已暂停）。"
+            session.condition.notify_all()
+            session.condition.wait_for(lambda: session.last_frame_generation >= generation or session.status in TERMINAL_STATES, timeout=2.0)
+        return session.snapshot()
 
     def set_paused(self, session_id: str, paused: bool) -> dict[str, Any]:
         session = self.get(session_id)

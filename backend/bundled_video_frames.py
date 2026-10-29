@@ -36,18 +36,22 @@ def _frames_for_rate(start: int, end: int, source_fps: float, target_fps: float)
     return frames
 
 
-def parse_video_paths(inputs: str | list[str]) -> list[str]:
+def parse_video_paths(inputs: str | list[str], check_cancelled: Callable[[], None] | None = None) -> list[str]:
     values = [inputs] if isinstance(inputs, str) else inputs
     if not isinstance(values, list):
         return []
     videos: list[str] = []
     for raw in values:
+        if check_cancelled:
+            check_cancelled()
         path = str(raw)
         if os.path.isdir(path):
             # Treat a selected folder as a dataset root and inspect every
             # descendant directory without following symlinks.
             found: list[str] = []
             for current, _directories, files in os.walk(path, followlinks=False):
+                if check_cancelled:
+                    check_cancelled()
                 found.extend(
                     os.path.join(current, name)
                     for name in files

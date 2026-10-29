@@ -167,6 +167,21 @@ def capture_frame_index(capture, *, after_read: bool = False) -> int:
     return max(0, index - 1) if after_read else max(0, index)
 
 
+def seek_video_frame(capture, target: int) -> bool:
+    """Position the next read at a zero-based frame, not an approximate time."""
+    positioned = capture.set(cv2.CAP_PROP_POS_FRAMES, target)
+    cursor = capture_frame_index(capture)
+    if not positioned or cursor > target:
+        if not capture.set(cv2.CAP_PROP_POS_FRAMES, 0):
+            return False
+        cursor = capture_frame_index(capture)
+    while cursor < target:
+        if not capture.grab():
+            return False
+        cursor += 1
+    return capture_frame_index(capture) == target
+
+
 def skip_late_video_frames(
     capture,
     source_fps: float,
@@ -220,7 +235,7 @@ def write_timeline_frame(writer, frame: np.ndarray, source_index: int,
     return frame.copy(), source_index, written + 1
 
 
-def read_control_commands(seeks: queue.SimpleQueue[tuple[float, int]], paused: threading.Event) -> None:
+def read_control_commands(seeks: queue.SimpleQueue, paused: threading.Event) -> None:
     """Receive seek and playback controls without blocking the inference loop."""
     for line in sys.stdin:
         try:
@@ -232,8 +247,15 @@ def read_control_commands(seeks: queue.SimpleQueue[tuple[float, int]], paused: t
                 paused.clear()
             elif action == "seek":
                 generation = int(payload["generation"])
-                if 0 <= generation <= 0xFFFFFFFF:
-                    seeks.put((float(payload["seconds"]), generation))
+                seconds = float(payload["seconds"])
+                if 0 <= generation <= 0xFFFFFFFF and np.isfinite(seconds) and seconds >= 0:
+                    seeks.put((seconds, generation))
+            elif action == "step":
+                generation = payload["generation"]
+                target = payload["frameIndex"]
+                if type(generation) is int and 0 <= generation <= 0xFFFFFFFF and type(target) is int and target >= 0:
+                    paused.set()
+                    seeks.put((target, generation, "frame"))
         except (ValueError, TypeError, KeyError, AttributeError):
             continue
 
@@ -318,8 +340,9 @@ def main() -> int:
     preview_period = 1.0 / args.preview_fps if args.preview_fps > 0 else 0.0
     source_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
     duration = source_frames / source_fps if np.isfinite(source_frames) and source_frames > 0 and frame_period > 0 else 0.0
-    print("VIDEO_META_JSON:" + json.dumps({"durationSeconds": duration, "sourceFps": source_fps if frame_period > 0 else 0.0}), file=sys.stderr, flush=True)
-    seeks: queue.SimpleQueue[tuple[float, int]] = queue.SimpleQueue()
+    print("VIDEO_META_JSON:" + json.dumps({"durationSeconds": duration, "sourceFps": source_fps if frame_period > 0 else 0.0,
+                                          "sourceFrameCount": int(source_frames) if np.isfinite(source_frames) and source_frames > 0 else 0}), file=sys.stderr, flush=True)
+    seeks: queue.SimpleQueue = queue.SimpleQueue()
     paused = threading.Event()
     threading.Thread(target=read_control_commands, args=(seeks, paused), daemon=True).start()
     preview_sender = PreviewSender(frame_stream, args.stream_width, args.jpeg_quality)
@@ -336,15 +359,18 @@ def main() -> int:
 
     try:
         while True:
+            if preview_sender.error is not None:
+                raise preview_sender.error
             seek_target = None
             while not seeks.empty():
                 seek_target = seeks.get_nowait()
             if seek_target is not None and duration > 0:
-                requested_seconds, generation = seek_target
-                target_frame = min(max(0, round(requested_seconds * source_fps)), max(0, int(source_frames) - 1))
+                requested, generation = seek_target[:2]
+                target_frame = int(requested) if len(seek_target) == 3 else round(requested * source_fps)
+                target_frame = min(max(0, target_frame), max(0, int(source_frames) - 1))
                 preview_sender.discard_pending()
-                if not capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame):
-                    print("WARNING: video decoder could not seek to the requested position", file=sys.stderr, flush=True)
+                if not seek_video_frame(capture, target_frame):
+                    raise RuntimeError(f"Video decoder could not seek to source frame {target_frame}")
                 if writer is not None:
                     writer.release()
                     writer = None
@@ -360,7 +386,7 @@ def main() -> int:
                 playback_clock_needs_reset = True
                 time.sleep(0.02)
                 continue
-            if args.realtime and frame_period > 0:
+            if args.realtime and frame_period > 0 and seek_target is None and not paused.is_set():
                 if playback_clock_needs_reset:
                     playback_anchor_source = capture_frame_index(capture) / source_fps
                     playback_anchor_wall = time.monotonic()
@@ -379,7 +405,7 @@ def main() -> int:
                 previous_saved_index = None
                 if duration <= 0 or args.replay_grace_seconds == 0:
                     break
-                print("VIDEO_EOF_JSON:" + json.dumps({"graceSeconds": args.replay_grace_seconds}), file=sys.stderr, flush=True)
+                print("VIDEO_EOF_JSON:" + json.dumps({"graceSeconds": args.replay_grace_seconds, "generation": generation}), file=sys.stderr, flush=True)
                 deadline = time.monotonic() + args.replay_grace_seconds
                 while time.monotonic() < deadline and seeks.empty():
                     time.sleep(0.05)
@@ -406,7 +432,7 @@ def main() -> int:
                 cv2.LINE_AA,
             )
 
-            if args.save:
+            if args.save and not (seek_target is not None and len(seek_target) == 3):
                 if writer is None:
                     save_path = Path(args.save)
                     if save_segment > 1:
@@ -421,15 +447,18 @@ def main() -> int:
                 )
                 saved_frame_count += written
 
-            if args.realtime and frame_period > 0:
+            if args.realtime and frame_period > 0 and not paused.is_set():
                 deadline = playback_anchor_wall + max(0.0, source_position - playback_anchor_source)
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
 
             now = time.monotonic()
-            if preview_period == 0 or now - last_preview_at >= preview_period:
-                preview_sender.submit(frame, min(max(0.0, source_position), duration) if duration > 0 else max(0.0, source_position), generation)
+            if seek_target is not None or preview_period == 0 or now - last_preview_at >= preview_period:
+                # Canonical frame start timestamp lets the desktop recover the
+                # exact source index without changing the JPEG wire protocol.
+                preview_position = source_index / source_fps if frame_period > 0 else source_position
+                preview_sender.submit(frame, max(0.0, preview_position), generation)
                 last_preview_at = now
     finally:
         preview_sender.close()

@@ -219,9 +219,41 @@ def _time_token(seconds: float) -> str:
     return f"{token}_{millis:03d}" if millis else token
 
 
-def _unique_output_file(parent: Path, video: Path, start: float, end: float, suffix: str, label: str = "clip") -> Path:
+def _configured_output_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name:
+        return ""
+    if re.search(r'[<>:"/\\|?*\x00-\x1f\x7f]', name):
+        raise ValueError('保存文件名不能包含路径或以下字符：< > : " / \\ | ? *。请在输出文件夹中设置保存位置。')
+    if name.lower() in VIDEO_SUFFIXES:
+        raise ValueError("保存文件名不能只有扩展名，请填写可区分的名称。")
+    # Accept an optional video extension; the actual container follows the encoding mode.
+    if Path(name).suffix.lower() in VIDEO_SUFFIXES:
+        name = name[:-len(Path(name).suffix)]
+    if not name or name in {".", ".."} or name.endswith((".", " ")):
+        raise ValueError("保存文件名不能只有扩展名、句点，或以句点和空格结尾。")
+    if name.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+        raise ValueError("保存文件名使用了系统保留名称，请更换名称。")
+    if len(name.encode("utf-8")) > 180:
+        raise ValueError("保存文件名过长，请限制在 180 字节以内（约 60 个汉字或 180 个英文字母）。")
+    return name
+
+
+def _named_output_stem(name: str, video: Path, batch: bool, label: str = "") -> str:
+    if not name:
+        return ""
+    if batch:
+        source = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", video.stem)
+        # Leave space for the role, duplicate sequence and container extension.
+        budget = 220 - len(name.encode("utf-8")) - 1
+        source = source.encode("utf-8")[:budget].decode("utf-8", errors="ignore").rstrip(". ") or "video"
+        name = f"{name}_{source}"
+    return f"{name}_{label}" if label else name
+
+
+def _unique_output_file(parent: Path, video: Path, start: float, end: float, suffix: str, label: str = "clip", output_name: str = "") -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base = f"{video.stem}_{label}_{_time_token(start)}-{_time_token(end)}_{timestamp}"
+    base = output_name or f"{video.stem}_{label}_{_time_token(start)}-{_time_token(end)}_{timestamp}"
     candidate = parent / f"{base}{suffix}"
     index = 2
     while candidate.exists():
@@ -276,10 +308,11 @@ def _clip_one(
     encoding_mode: str,
     context: RunContext,
     label: str = "clip",
+    output_name: str = "",
 ) -> Path:
     precise = encoding_mode == PRECISE_MODE
     suffix = ".mp4" if precise else video.suffix.lower()
-    output = _unique_output_file(output_parent, video, start, end, suffix, label)
+    output = _unique_output_file(output_parent, video, start, end, suffix, label, output_name)
     temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
     duration = end - start
 
@@ -416,11 +449,11 @@ def _has_audio(ffmpeg: str, video: Path, context: RunContext) -> bool:
 
 def _join_remaining(
     ffmpeg: str, video: Path, parent: Path, ranges: list[tuple[float, float]],
-    duration: float, encoding_mode: str, context: RunContext,
+    duration: float, encoding_mode: str, context: RunContext, output_name: str = "",
 ) -> Path:
     precise = encoding_mode == PRECISE_MODE
     suffix = ".mp4" if precise else video.suffix.lower()
-    output = _unique_output_file(parent, video, 0, duration, suffix, "removed_joined")
+    output = _unique_output_file(parent, video, 0, duration, suffix, "removed_joined", output_name)
     temporary = output.with_name(f".{output.stem}.partial{suffix}")
     try:
         if not precise:
@@ -473,6 +506,7 @@ def _join_remaining(
 
 
 def run_video_clip(context: RunContext) -> dict[str, Any]:
+    custom_name = _configured_output_name(context.parameters.get("clip_output_name", ""))
     videos = _resolve_videos(context)
     ffmpeg = _find_ffmpeg()
     encoding_mode = str(context.parameters.get("encoding_mode", COPY_MODE))
@@ -489,6 +523,8 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         output_root.mkdir(parents=True, exist_ok=True)
 
     context.report(f"找到 {len(videos)} 个视频，处理方式：{encoding_mode}")
+    if custom_name:
+        context.report(f"自定义保存名称：{custom_name}。批量追加原视频名，训练/测试追加 train/test，同名结果自动加序号。")
     if remove_mode:
         context.report("删除时间均以原视频时间轴为准；重叠/相邻区间自动合并，剩余片段按原顺序拼成一个新视频，原视频不修改。")
     if split_train_test:
@@ -514,7 +550,8 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 context.report(f"[{index}/{len(videos)}] {video.name}：删除 {len(removed)} 段，保留 {len(kept)} 段，预计输出 {kept_duration:.3f} 秒。")
                 parent = output_root or video.parent
                 parent.mkdir(parents=True, exist_ok=True)
-                output = _join_remaining(ffmpeg, video, parent, kept, video_duration, encoding_mode, context)
+                output = _join_remaining(ffmpeg, video, parent, kept, video_duration, encoding_mode, context,
+                                         _named_output_stem(custom_name, video, len(videos) > 1))
                 created_for_video.append(output)
                 source_size, output_size = video.stat().st_size, output.stat().st_size
                 outputs.append(output)
@@ -541,10 +578,12 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 test_parent = base_output_parent / "test"
                 train_parent.mkdir(parents=True, exist_ok=True)
                 test_parent.mkdir(parents=True, exist_ok=True)
-                output = _clip_one(ffmpeg, video, train_parent, start, end, encoding_mode, context, "train")
+                output = _clip_one(ffmpeg, video, train_parent, start, end, encoding_mode, context, "train",
+                                   _named_output_stem(custom_name, video, len(videos) > 1, "train"))
                 created_for_video.append(output)
                 suffix = ".mp4" if encoding_mode == PRECISE_MODE else video.suffix.lower()
-                test_output = _unique_output_file(test_parent, video, 0, video_duration, suffix, "test")
+                test_output = _unique_output_file(test_parent, video, 0, video_duration, suffix, "test",
+                                                  _named_output_stem(custom_name, video, len(videos) > 1, "test"))
                 test_ranges = [
                     (part_start, part_end)
                     for part_start, part_end in ((0.0, start), (end, video_duration))
@@ -563,7 +602,8 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 output_group = [output, test_output]
             else:
                 base_output_parent.mkdir(parents=True, exist_ok=True)
-                output = _clip_one(ffmpeg, video, base_output_parent, start, end, encoding_mode, context)
+                output = _clip_one(ffmpeg, video, base_output_parent, start, end, encoding_mode, context,
+                                   output_name=_named_output_stem(custom_name, video, len(videos) > 1))
                 created_for_video.append(output)
                 output_group = [output]
             source_size = video.stat().st_size

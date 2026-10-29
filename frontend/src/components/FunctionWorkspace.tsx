@@ -36,6 +36,7 @@ type Props = {
 }
 
 function ParameterValue({ field, value, onChange, sshHistory }: { field: FunctionParameter; value: string | number | boolean; onChange: (value: string | number | boolean) => void; sshHistory?: { onSelect: (profile: SshConnectionProfile) => void } }) {
+  if (field.id === 'clip_output_name') return <div className="clip-output-name"><input value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder="例如：TCL_工位1_光线变化_训练素材" /><small>只填文件名，无需填写路径或扩展名。留空沿用自动命名；批量追加原视频名，训练/测试分别追加 _train / _test，重名加序号，不覆盖文件。</small></div>
   if (field.id === 'remove_time_ranges') return <textarea className="clip-remove-ranges" rows={5} value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder={'00:10-00:20\n01:30-02:00\n02:50-'} />
   if (sshHistory && (field.id === 'host' || field.id === 'remote_host')) return <SshConnectionHistoryInput host={String(value)} onHostChange={onChange} onSelect={sshHistory.onSelect} />
   if (field.type === 'boolean') return <label className="switch-control"><input type="checkbox" checked={Boolean(value)} onChange={(event) => onChange(event.target.checked)} /><span /><em>{value ? '开启' : '关闭'}</em></label>
@@ -88,8 +89,16 @@ export function FunctionWorkspace(props: Props) {
       {!isYoloTrainingWorkspace && !isCalibrationWorkspace && !isRemoteTrtWorkspace && !isLocalStarPackageWorkspace ? <>
       <section className="workspace-section">
         <div className="section-title"><icons.Folder size={21} /><h2>数据路径</h2></div>
+        {isVideoFramesWorkspace ? <p className="section-description">视频文件夹支持每行一个路径，也可连续点击“添加文件夹”追加。所有文件夹会递归扫描、合并去重，并按资源自动调度；“同时处理的视频数”设为 0 即为自动模式。输出文件夹留空时保存到各自视频旁。</p> : null}
         <div className="path-fields">
-          {visiblePathFields.map((field) => <label className="path-field" key={field.id}><span>{field.label}</span><div>{isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? <textarea rows={6} value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={'/path/to/model_a.pt\n/path/to/model_b.pt'} /> : <input value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={remoteYoloPaths ? '请输入远程服务器上的绝对路径' : `请选择或粘贴${field.mode === 'file' ? '文件' : '文件夹'}路径`} />}<button onClick={() => props.onBrowse(field.id, isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? 'multiple' : field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : undefined}>{remoteYoloPaths ? '远程路径' : isJetsonOnnxExportWorkspace && field.id === 'weights_file' ? '选择多个 PT' : '浏览'}</button></div></label>)}
+          {visiblePathFields.map((field) => {
+            const multiFolders = isVideoFramesWorkspace && field.id === 'video_folder'
+            const multiModels = isJetsonOnnxExportWorkspace && field.id === 'weights_file'
+            return <label className="path-field" key={field.id}><span>{field.label}</span><div>{multiFolders || multiModels
+              ? <textarea rows={multiFolders ? 4 : 6} value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={multiFolders ? '/path/to/视频文件夹1\n/path/to/视频文件夹2' : '/path/to/model_a.pt\n/path/to/model_b.pt'} />
+              : <input value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={remoteYoloPaths ? '请输入远程服务器上的绝对路径' : `请选择或粘贴${field.mode === 'file' ? '文件' : '文件夹'}路径`} />}
+              <button onClick={() => props.onBrowse(field.id, multiFolders ? 'append-directory' : multiModels ? 'multiple' : field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : multiFolders ? '选择一个文件夹并追加到列表，可重复添加' : undefined}>{remoteYoloPaths ? '远程路径' : multiFolders ? '添加文件夹' : multiModels ? '选择多个 PT' : '浏览'}</button></div></label>
+          })}
           {!visiblePathFields.length ? <p className="section-empty">尚未定义数据路径，接入功能时再添加。</p> : null}
         </div>
         {!isRemoteStarWorkspace ? <button className="text-action" onClick={props.onAddPath}><icons.Plus size={17} />添加路径</button> : null}

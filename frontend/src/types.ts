@@ -16,6 +16,7 @@ export type FunctionParameter = {
 }
 
 export type RemoteInferenceStatus = {
+  modelHistoryWarning?: string
   id: string
   host: string
   username: string
@@ -24,9 +25,15 @@ export type RemoteInferenceStatus = {
   startedAt: string
   finishedAt: string | null
   frameCount: number
+  controlGeneration?: number
+  frameVersion?: number
   durationSeconds: number
   positionSeconds: number
   sourceFps: number
+  sourceFrameIndex: number
+  sourceFrameCount: number
+  frameStepSupported: boolean
+  frameStepPending: boolean
   atEnd: boolean
   replayRemainingSeconds: number
   logs: string[]

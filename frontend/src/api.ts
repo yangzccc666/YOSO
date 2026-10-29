@@ -1,4 +1,11 @@
 import type { ConnectionTestResult, FunctionDefinition, PlatformSettings, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, SshConnectionProfile, StarLabelDetectionResult, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
+import type { StarModel, StarModelHistoryRecord } from './remoteStarModels'
+
+export const getStarModelHistory = () => request<{ models: StarModelHistoryRecord[] }>('/api/star-model-history')
+export const saveStarModelHistory = (models: StarModel[]) => request<{ models: StarModelHistoryRecord[] }>('/api/star-model-history', {
+  method: 'POST', body: JSON.stringify({ models }),
+})
+export const deleteStarModelHistory = (id: string) => request<{ ok: boolean }>(`/api/star-model-history/${encodeURIComponent(id)}`, { method: 'DELETE' })
 
 export const SSH_HISTORY_UPDATED_EVENT = 'yolo-ssh-history-updated'
 
@@ -152,6 +159,10 @@ export async function setLocalPTInferencePaused(id: string, paused: boolean): Pr
   return request(`/api/local-pt-inference/${id}/playback`, { method: 'POST', body: JSON.stringify({ paused }) })
 }
 
+export async function stepLocalPTInference(id: string, direction: -1 | 1): Promise<RemoteInferenceStatus> {
+  return request(`/api/local-pt-inference/${id}/step`, { method: 'POST', body: JSON.stringify({ direction }) })
+}
+
 export async function testRemoteConnection(parameters: WorkingValues['parameters']): Promise<ConnectionTestResult> {
   const result = await request<ConnectionTestResult>('/api/remote-inference/test-connection', {
     method: 'POST',
@@ -281,4 +292,8 @@ export async function setRemoteInferencePaused(sessionId: string, paused: boolea
     method: 'POST',
     body: JSON.stringify({ paused }),
   })
+}
+
+export async function stepRemoteInference(sessionId: string, direction: -1 | 1): Promise<RemoteInferenceStatus> {
+  return request(`/api/remote-inference/${sessionId}/step`, { method: 'POST', body: JSON.stringify({ direction }) })
 }

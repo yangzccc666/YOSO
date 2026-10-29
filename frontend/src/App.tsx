@@ -8,6 +8,7 @@ import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { WorkflowTodoDialog } from './components/WorkflowTodoDialog'
 import { PlatformSettingsDialog } from './components/PlatformSettingsDialog'
 import { icons } from './icons'
+import { appendFolderPaths } from './multiFolderPaths'
 import { ExternalToolsMenu } from './components/ExternalToolsMenu'
 import { launchExternalApp } from './api'
 import { parseStarModels, upsertStarModel } from './remoteStarModels'
@@ -315,11 +316,11 @@ export default function App() {
     setSelectedId((current) => workspace.functions.some((item) => item.id === current) ? current : (workspace.functions[0]?.id || ''))
   }
 
-  const updatePathValue = (fieldId: string, value: string) => {
+  const updatePathValue = (fieldId: string, value: string | ((previous: string) => string)) => {
     if (!selected) return
     setWorking((current) => {
       const currentValues = current[selected.id] || defaultsFor(selected)
-      const next = { ...currentValues, paths: { ...currentValues.paths, [fieldId]: value } }
+      const next = { ...currentValues, paths: { ...currentValues.paths, [fieldId]: typeof value === 'function' ? value(currentValues.paths[fieldId] || '') : value } }
       localStorage.setItem(storageKey(selected.id), JSON.stringify(withoutSecrets(selected, next)))
       return { ...current, [selected.id]: next }
     })
@@ -389,8 +390,8 @@ export default function App() {
 
   const browse = async (fieldId: string, mode: string) => {
     try {
-      const paths = await choosePaths(mode)
-      if (paths[0]) updatePathValue(fieldId, mode === 'multiple' ? paths.join('\n') : paths[0])
+      const paths = await choosePaths(mode === 'append-directory' ? 'directory' : mode)
+      if (paths[0]) updatePathValue(fieldId, mode === 'append-directory' ? (previous) => appendFolderPaths(previous, paths) : mode === 'multiple' ? paths.join('\n') : paths[0])
     } catch (error) { setNotice(error instanceof Error ? error.message : '无法打开选择窗口') }
   }
 

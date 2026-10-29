@@ -4,6 +4,35 @@ export type StarModel = {
   conf: number
 }
 
+export type StarModelHistoryRecord = StarModel & {
+  id: string
+  createdAt: string
+  updatedAt: string
+  lastUsedAt: string | null
+  useCount: number
+  available: boolean
+}
+
+const canonicalLabels = (value: string) => value.trim().split(',').map((label) => label.trim()).join(',')
+
+// Unlike workflow upserts, history selection never replaces a different label set.
+export function selectHistoricalStarModel(models: StarModel[], incoming: StarModel, limit = 8): {
+  models: StarModel[]; action: 'selected' | 'replaced-empty' | 'added' | 'full'
+} {
+  if (models.some((model) => model.path.trim() === incoming.path.trim()
+    && canonicalLabels(model.labels) === canonicalLabels(incoming.labels))) return { models, action: 'selected' }
+  const emptyIndex = models.findIndex((model) => !model.path.trim() && !model.labels.trim())
+  if (emptyIndex >= 0) return {
+    models: models.map((model, index) => index === emptyIndex ? incoming : model), action: 'replaced-empty',
+  }
+  if (models.length >= limit) return { models, action: 'full' }
+  return { models: [...models, incoming], action: 'added' }
+}
+
+export function matchesStarModelHistory(record: StarModelHistoryRecord, query: string): boolean {
+  return `${record.path}\n${record.labels}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
+}
+
 export type StarModelMergeAction = 'added' | 'updated' | 'replaced-empty' | 'full'
 
 export function parseStarModels(

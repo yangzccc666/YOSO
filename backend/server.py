@@ -24,6 +24,7 @@ from .local_pt_inference import manager as local_pt_inference_manager
 from .local_star_package import detect_plan_labels
 from .platform_paths import platform_data_dir
 from .run_history import RunHistoryStore
+from .star_model_history import StarModelHistoryStore
 from .remote_yolo_dataset import (
     forget_remote_yolo_password,
     is_remote_yolo_parameters,
@@ -57,6 +58,7 @@ catalog = FunctionCatalog(DATA_DIR / "functions.json")
 group_catalog = GroupCatalog(DATA_DIR / "groups.json")
 training_profile_store = TrainingProfileStore(DATA_DIR / "training_profiles.json")
 run_history = RunHistoryStore(DATA_DIR / "run_history.json")
+star_model_history = StarModelHistoryStore(DATA_DIR / "star_model_history.json")
 _path_chooser: Callable[[str], list[str]] | None = None
 _system_notifier: Callable[[str, str], None] | None = None
 
@@ -272,6 +274,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "name": "YOLO数据处理平台"})
             return
+        if parsed.path == "/api/star-model-history":
+            try:
+                self.send_json({"models": star_model_history.list()})
+            except Exception as exc:
+                self.send_json({"error": f"无法读取历史模型：{exc}"}, 500)
+            return
         if parsed.path == "/api/video-frames/resources":
             self.send_json(_video_frames.resource_pool.status())
             return
@@ -385,6 +393,10 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path == "/api/local-star-package/detect-labels":
                 self.send_json(detect_plan_labels(str(payload.get("modelFile", ""))))
                 return
+            if self.path == "/api/star-model-history":
+                star_model_history.remember(payload.get("models"), require_files=True)
+                self.send_json({"models": star_model_history.list()})
+                return
             if self.path == "/api/remote-inference/test-connection":
                 parameters = payload.get("parameters", payload)
                 if not isinstance(parameters, dict):
@@ -496,6 +508,12 @@ class AppHandler(BaseHTTPRequestHandler):
                         payload,
                         on_finished=lambda finished: finish_async_run(task, finished, details),
                     )
+                    try:
+                        star_model_history.remember_payload(payload)
+                    except Exception as history_error:
+                        # Disk/history failures must not terminate an accepted inference task.
+                        snapshot["modelHistoryWarning"] = f"推理已启动，但历史模型保存失败：{history_error}"
+                        print(f"[YOLO数据处理平台] {snapshot['modelHistoryWarning']}", file=sys.stderr)
                     session_id = str(snapshot["id"])
                     platform_task_manager.set_stop_callback(
                         task.id,
@@ -536,6 +554,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     if action == "playback":
                         self.send_json(local_pt_inference_manager.set_paused(session_id, payload.get("paused")))
                         return
+                    if action == "step":
+                        self.send_json(local_pt_inference_manager.step_frame(session_id, payload.get("direction")))
+                        return
             if self.path.startswith("/api/remote-inference/") and self.path.endswith("/stop"):
                 session_id = self.path.strip("/").split("/")[2]
                 self.send_json(remote_inference_manager.stop(session_id))
@@ -547,6 +568,10 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/remote-inference/") and self.path.endswith("/playback"):
                 session_id = self.path.strip("/").split("/")[2]
                 self.send_json(remote_inference_manager.set_paused(session_id, payload.get("paused")))
+                return
+            if self.path.startswith("/api/remote-inference/") and self.path.endswith("/step"):
+                session_id = self.path.strip("/").split("/")[2]
+                self.send_json(remote_inference_manager.step_frame(session_id, payload.get("direction")))
                 return
             if self.path.startswith("/api/tasks/") and self.path.endswith("/stop"):
                 task_id = self.path.strip("/").split("/")[2]
@@ -572,21 +597,28 @@ class AppHandler(BaseHTTPRequestHandler):
                 parameters = payload.get("parameters", {})
                 is_remote_calib = handler_id == "calib.select_dataset" and is_remote_calib_parameters(parameters)
                 is_remote_trt = handler_id == "remote.build_tensorrt"
+                is_video_frames = handler_id == _video_frames.HANDLER_ID
                 path_values = {
                     key: Path(value) if is_remote_yolo else Path(value).expanduser()
                     for key, value in payload.get("paths", {}).items()
-                    if str(value).strip()
+                    if str(value).strip() and not (is_video_frames and key == "video_folder")
                 }
                 messages: list[str] = []
                 run_parameters = {
                     **{str(parameter.get("id")): parameter.get("default") for parameter in item.get("parameters", []) if parameter.get("id")},
                     **dict(parameters),
                 }
-                is_video_frames = handler_id == _video_frames.HANDLER_ID
                 task_name = str(item["name"])
                 if is_video_frames:
+                    folders = _video_frames.normalize_video_folder_paths(payload.get("paths", {}).get("video_folder", ""))
+                    run_parameters["_video_folder_paths"] = [str(folder) for folder in folders]
+                    if folders:
+                        path_values["video_folder"] = folders[0]
                     source = path_values.get("video_file") or path_values.get("video_folder")
-                    task_name += f" · {source.name if source else '未选择视频'} · {run_parameters.get('scene_code') or '未填写场景'}"
+                    source_name = source.name if source else "未选择视频"
+                    if len(folders) > 1 or (folders and path_values.get("video_file")):
+                        source_name = f"{len(folders)} 个文件夹" + (" + 单个视频" if path_values.get("video_file") else "")
+                    task_name += f" · {source_name} · {run_parameters.get('scene_code') or '按视频名命名'}"
                 task = platform_task_manager.start(
                     item_id, task_name,
                     "remote-build" if is_remote_trt else "remote" if is_remote_yolo or is_remote_calib else "local",
@@ -736,6 +768,11 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/star-model-history/"):
+                record_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).strip()
+                star_model_history.delete(record_id)
+                self.send_json({"ok": True})
+                return
             if parsed.path.startswith("/api/tasks/history/"):
                 record_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).strip()
                 run_history.delete(record_id)

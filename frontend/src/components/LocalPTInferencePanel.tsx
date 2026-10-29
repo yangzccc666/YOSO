@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { getLocalPTInferenceStatus, seekLocalPTInference, setLocalPTInferencePaused, startLocalPTInference, stopLocalPTInference } from '../api'
+import { getLocalPTInferenceStatus, seekLocalPTInference, setLocalPTInferencePaused, startLocalPTInference, stepLocalPTInference, stopLocalPTInference } from '../api'
 import { icons } from '../icons'
+import { useVideoPlaybackShortcut } from '../hooks/useVideoPlaybackShortcut'
+import { FrameStepControls } from './FrameStepControls'
+import { retainNewestPlaybackStatus } from '../playbackStatus'
 import type { PlatformTaskStatus, RemoteInferenceStatus, WorkingValues } from '../types'
 
 type Props = { itemId: string; values: WorkingValues; platformTask: PlatformTaskStatus | null }
@@ -20,11 +23,14 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
   const [visible, setVisible] = useState(true)
   const [scrubbing, setScrubbing] = useState<number | null>(null)
   const hideTimer = useRef<number | undefined>(undefined)
+  const previewRef = useRef<HTMLDivElement>(null)
+  const playbackRequest = useRef(false)
   const scrubRef = useRef<number | null>(null)
+  const frameHolding = useRef(false)
   const reveal = () => {
     setVisible(true)
     window.clearTimeout(hideTimer.current)
-    hideTimer.current = window.setTimeout(() => setVisible(false), 3000)
+    if (!frameHolding.current) hideTimer.current = window.setTimeout(() => setVisible(false), 3000)
   }
 
   useEffect(() => {
@@ -35,7 +41,7 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
       try {
         const next = await getLocalPTInferenceStatus(sessionId)
         if (cancelled) return
-        setSession(next)
+        setSession((current) => retainNewestPlaybackStatus(current, next))
         if (!ended.has(next.status)) timer = window.setTimeout(poll, 700)
       } catch (cause) {
         if (cancelled) return
@@ -59,8 +65,10 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
 
   const active = Boolean(session && !ended.has(session.status))
   const duration = session?.durationSeconds || 0
-  const seekable = Boolean(active && duration > 0 && (session?.status === 'running' || session?.status === 'paused'))
+  const playbackBusy = busy || Boolean(session?.frameStepPending)
+  const seekable = Boolean(active && !playbackBusy && duration > 0 && (session?.status === 'running' || session?.status === 'paused'))
   const pausable = Boolean(active && !session?.atEnd && session?.frameCount && (session?.status === 'running' || session?.status === 'paused'))
+  const steppable = Boolean(active && session?.frameStepSupported && (session?.status === 'running' || session?.status === 'paused'))
 
   const start = async () => {
     setBusy(true); setError(''); setSession(null)
@@ -70,6 +78,7 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
       sessionStorage.setItem(key, next.id)
       setSessionId(next.id)
       setSession(next)
+      previewRef.current?.focus({ preventScroll: true })
     } catch (cause) { setError(cause instanceof Error ? cause.message : '启动失败') }
     finally { setBusy(false) }
   }
@@ -81,13 +90,27 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
     finally { setBusy(false) }
   }
   const toggle = async () => {
-    if (!sessionId || !session) return
+    if (!sessionId || !session || !pausable || playbackBusy || playbackRequest.current) return
+    playbackRequest.current = true
+    reveal()
     setBusy(true); setError('')
     try { setSession(await setLocalPTInferencePaused(sessionId, session.status !== 'paused')) }
     catch (cause) { setError(cause instanceof Error ? cause.message : '播放控制失败') }
-    finally { setBusy(false) }
+    finally { playbackRequest.current = false; setBusy(false) }
   }
+  const stepFrame = async (direction: -1 | 1) => {
+    if (!sessionId || !session || !steppable || playbackBusy || playbackRequest.current || scrubRef.current !== null) return false
+    if (direction < 0 ? session.sourceFrameIndex <= 0 : session.sourceFrameIndex >= session.sourceFrameCount - 1) return false
+    playbackRequest.current = true
+    reveal()
+    setBusy(true); setError('')
+    try { setSession(await stepLocalPTInference(sessionId, direction)); return true }
+    catch (cause) { setError(cause instanceof Error ? cause.message : '逐帧定位失败'); return false }
+    finally { playbackRequest.current = false; setBusy(false) }
+  }
+  useVideoPlaybackShortcut(previewRef, pausable, playbackBusy, toggle, steppable, stepFrame)
   const commitSeek = async () => {
+    if (playbackBusy || playbackRequest.current) { scrubRef.current = null; setScrubbing(null); return }
     const target = scrubRef.current
     if (target === null || !sessionId) return
     scrubRef.current = null
@@ -104,14 +127,15 @@ export function LocalPTInferencePanel({ itemId, values, platformTask }: Props) {
         {active ? <icons.X size={18} /> : <icons.Play size={18} fill="currentColor" />}{active ? session?.atEnd ? '结束回看并清理' : '停止检测' : busy ? '正在启动…' : '开始本地检测'}
       </button>
       <span className={`remote-status ${session?.status || 'idle'}`}><i />{status}</span>
-      <small>直接使用本机视频和 PT 权重；类别名称从权重读取，不需要 SSH。</small>
+      <small>直接使用本机视频和 PT 权重；类别名称从权重读取。空格播放 / 暂停；, 上一帧，. 下一帧（兼容 ，。）。</small>
     </div>
     {error || session?.error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{error || session?.error}</span></div> : null}
-    <div className={`remote-preview ${expanded ? 'expanded' : ''}`} onMouseMove={reveal} onMouseLeave={() => setVisible(false)} onDoubleClick={() => setExpanded((current) => !current)} title="双击切换撑满窗口">
+    <div ref={previewRef} tabIndex={0} role="region" aria-label="本地视频预览" aria-keyshortcuts="Space , ." className={`remote-preview ${expanded ? 'expanded' : ''}`} onMouseMove={reveal} onPointerLeave={(event) => { if (event.pointerType === 'mouse') setVisible(false) }} onPointerDown={reveal} onDoubleClick={() => setExpanded((current) => !current)} title="空格播放/暂停；, 上一帧，. 下一帧；逐帧按钮支持长按；双击切换撑满窗口">
       <button className="preview-expand-button" onClick={() => setExpanded((current) => !current)} onDoubleClick={(event) => event.stopPropagation()} aria-label={expanded ? '退出撑满窗口' : '撑满整个窗口'}>{expanded ? '退出全窗口' : '撑满窗口'}</button>
       {session?.frameCount ? <img src={session.streamUrl} alt="本地 PT 检测预览画面" draggable={false} /> : <div className="remote-preview-empty"><icons.Play size={34} /><strong>{session?.message || '选择 PT 权重和视频，然后开始本地检测'}</strong></div>}
       {session ? <div className={`remote-preview-timeline ${visible ? '' : 'is-hidden'}`} onDoubleClick={(event) => event.stopPropagation()} onMouseMove={reveal}>
-        <button className="remote-preview-playback-button" disabled={!pausable || busy} onClick={() => void toggle()} onPointerUp={(event) => event.currentTarget.blur()} aria-label={session.status === 'paused' ? '继续视频' : '暂停视频'}>{session.status === 'paused' ? <icons.Play size={16} fill="currentColor" /> : <icons.Pause size={16} fill="currentColor" />}</button>
+        <button className="remote-preview-playback-button" disabled={!pausable || playbackBusy} onClick={() => void toggle()} onPointerUp={(event) => event.currentTarget.blur()} aria-keyshortcuts="Space" title="空格播放/暂停" aria-label={session.status === 'paused' ? '继续视频' : '暂停视频'}>{session.status === 'paused' ? <icons.Play size={16} fill="currentColor" /> : <icons.Pause size={16} fill="currentColor" />}</button>
+        <FrameStepControls key={session.id} supported={steppable} busy={playbackBusy} index={session.sourceFrameIndex} count={session.sourceFrameCount} onStep={stepFrame} onHoldingChange={(held) => { frameHolding.current = held; reveal() }} />
         <span>{formatTime(scrubbing ?? session.positionSeconds)}</span>
         <input type="range" aria-label="视频进度，拖动后跳转" min={0} max={Math.max(duration, 0.01)} step="0.1" value={Math.min(scrubbing ?? session.positionSeconds, Math.max(duration, 0.01))} disabled={!seekable} onFocus={reveal} onChange={(event) => { const next = Number(event.target.value); scrubRef.current = next; setScrubbing(next) }} onPointerUp={() => void commitSeek()} onKeyUp={() => void commitSeek()} onBlur={() => void commitSeek()} />
         <span>{formatTime(duration)}</span>

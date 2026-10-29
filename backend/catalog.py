@@ -14,16 +14,16 @@ from typing import Any
 VIDEO_FUNCTION = {
     "id": "video_frames",
     "name": "视频切图",
-    "description": "批量从 MP4 视频中按固定密度、时间间隔或工序重点时间段提取 JPG 图片；选择文件夹时会递归查找所有层级的 MP4。",
+    "description": "支持多个视频文件夹，每行一个路径；递归合并、去重并按资源并行提取 JPG，可按固定密度、时间间隔或工序重点时间段抽帧。",
     "handlerId": "video.extract_frames",
     "pathFields": [
-        {"id": "video_folder", "label": "视频文件夹（递归扫描子文件夹）", "mode": "directory"},
+        {"id": "video_folder", "label": "视频文件夹（每行一个，递归扫描）", "mode": "directory"},
         {"id": "video_file", "label": "单个视频（可选）", "mode": "file"},
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
     "parameters": [
-        {"id": "project_code", "label": "项目英文标识（如 tcl）", "type": "text", "default": "", "options": []},
-        {"id": "scene_code", "label": "场景英文标识（如 line2_station3）", "type": "text", "default": "", "options": []},
+        {"id": "project_code", "label": "项目英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
+        {"id": "scene_code", "label": "场景英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
         {"id": "parallel_workers", "label": "同时处理的视频数（0 自动，1 串行，最多 16）", "type": "number", "default": 0, "options": []},
         {
             "id": "extraction_mode",
@@ -167,6 +167,7 @@ VIDEO_CLIP_FUNCTION = {
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
     "parameters": [
+        {"id": "clip_output_name", "label": "保存文件名（留空自动命名）", "type": "text", "default": "", "options": []},
         {
             "id": "clip_mode",
             "label": "裁剪时间方案",
@@ -479,8 +480,10 @@ class FunctionCatalog:
                 local_star_package_marker = self.storage_file.with_name(self.storage_file.name + ".local-star-package-v1")
                 local_star_only_marker = self.storage_file.with_name(self.storage_file.name + ".local-star-package-local-v3")
                 video_frame_naming_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1")
+                video_filename_fallback_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-filename-fallback-v2")
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
                 video_folder_recursive_marker = self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1")
+                video_multi_folders_marker = self.storage_file.with_name(self.storage_file.name + ".video-multi-folders-v2")
                 video_parallel_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
@@ -536,6 +539,14 @@ class FunctionCatalog:
                             for path in item.get("pathFields", [])
                         ]
                         changed = True
+                    if (not video_multi_folders_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_FUNCTION["id"]):
+                        item["description"] = VIDEO_FUNCTION["description"]
+                        for field in item.get("pathFields", []):
+                            if isinstance(field, dict) and field.get("id") == "video_folder" and field.get("label") in {"视频文件夹", "视频文件夹（递归扫描子文件夹）"}:
+                                field["label"] = VIDEO_FUNCTION["pathFields"][0]["label"]
+                                changed = True
+                        changed = True
                     if (not yolo_training_remote_source_marker.exists() and isinstance(item, dict)
                             and item.get("id") == YOLO_TRAINING_FUNCTION["id"]):
                         item["description"] = YOLO_TRAINING_FUNCTION["description"]
@@ -581,6 +592,16 @@ class FunctionCatalog:
                         ]
                         item["parameters"] = [*new_parameters, *parameters]
                         changed = True
+                    if (not video_filename_fallback_marker.exists() and isinstance(item, dict)
+                            and item.get("id") == VIDEO_FUNCTION["id"]):
+                        labels = {field["id"]: field["label"] for field in VIDEO_FUNCTION["parameters"][:2]}
+                        old_labels = {"project_code": "项目英文标识（如 tcl）", "scene_code": "场景英文标识（如 line2_station3）"}
+                        for parameter in item.get("parameters", []):
+                            if isinstance(parameter, dict) and parameter.get("id") in labels:
+                                field_id = parameter["id"]
+                                if parameter.get("label") == old_labels[field_id]:
+                                    parameter["label"] = labels[field_id]
+                                    changed = True
                     if (not video_frame_priority_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_FUNCTION["id"]):
                         item["description"] = VIDEO_FUNCTION["description"]
@@ -637,6 +658,12 @@ class FunctionCatalog:
                                 if parameter["id"] == "split_train_test"
                             )
                             parameters.append(deepcopy(source_split))
+                            changed = True
+                    if isinstance(item, dict) and item.get("id") == VIDEO_CLIP_FUNCTION["id"]:
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(parameter, dict) and parameter.get("id") == "clip_output_name" for parameter in parameters):
+                            source_name = next(parameter for parameter in VIDEO_CLIP_FUNCTION["parameters"] if parameter["id"] == "clip_output_name")
+                            parameters.insert(0, deepcopy(source_name))
                             changed = True
                     if (not clip_remove_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_CLIP_FUNCTION["id"]):
@@ -810,10 +837,14 @@ class FunctionCatalog:
                     local_star_only_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_frame_naming_marker.exists():
                     video_frame_naming_marker.write_text("migrated\n", encoding="utf-8")
+                if not video_filename_fallback_marker.exists():
+                    video_filename_fallback_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_frame_priority_marker.exists():
                     video_frame_priority_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_folder_recursive_marker.exists():
                     video_folder_recursive_marker.write_text("migrated\n", encoding="utf-8")
+                if not video_multi_folders_marker.exists():
+                    video_multi_folders_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_parallel_marker.exists():
                     video_parallel_marker.write_text("migrated\n", encoding="utf-8")
                 if not realtime_playback_marker.exists():
@@ -859,7 +890,9 @@ class FunctionCatalog:
         self.storage_file.with_name(self.storage_file.name + ".local-star-package-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".local-star-package-local-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-frame-naming-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-frame-filename-fallback-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".video-multi-folders-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1").write_text("migrated\n", encoding="utf-8")

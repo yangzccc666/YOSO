@@ -23,6 +23,7 @@ from .handlers import RunContext, register_handler
 from .local_pt_worker import receive as receive_worker_packet, send as send_worker_packet
 from .remote_star_worker import (
     capture_frame_index,
+    seek_video_frame,
     skip_late_video_frames,
     video_position_seconds,
     write_timeline_frame,
@@ -199,6 +200,7 @@ class LocalPTSession(RemoteInferenceSession):
         super().__init__(id=session_id, host="本机", username="", status="starting", message="正在加载本地 PT 模型……", stream_prefix="/api/local-pt-inference")
         self.paused = False
         self.seek_target: float | None = None
+        self.seek_frame: int | None = None
         self.worker: subprocess.Popen[bytes] | None = None
 
 
@@ -266,12 +268,32 @@ class LocalPTInferenceManager:
                 raise ValueError("当前视频不能跳转。")
             target = min(target, max(0, session.duration_seconds - 0.001))
             session.seek_target = target
+            session.seek_frame = None
             session.seek_generation += 1
             session.pause_preview_pending = session.paused
             session.at_end = False
             session.replay_deadline = None
             session.condition.notify_all()
         return {"ok": True, "requestedSeconds": target}
+
+    def step_frame(self, session_id: str, direction: Any) -> dict[str, Any]:
+        session = self.get(session_id)
+        with session.condition:
+            target = session.frame_step_target(direction)
+            session.paused = True
+            session.status = "paused"
+            session.seek_target = None
+            session.seek_frame = target
+            session.seek_generation += 1
+            generation = session.seek_generation
+            session.pause_preview_pending = True
+            session.frame_step_pending = True
+            session.at_end = False
+            session.replay_deadline = None
+            session.message = f"逐帧查看：第 {target + 1} 帧（已暂停）。"
+            session.condition.notify_all()
+            session.condition.wait_for(lambda: session.last_frame_generation >= generation or session.status in TERMINAL_STATES, timeout=2.0)
+        return session.snapshot()
 
     def _run(self, session: LocalPTSession, config: dict[str, Any], on_finished: Callable[[dict[str, Any]], None] | None) -> None:
         capture = None
@@ -299,6 +321,7 @@ class LocalPTInferenceManager:
             with session.condition:
                 session.source_fps = fps if math.isfinite(fps) and fps > 0 else 0
                 session.duration_seconds = duration
+                session.source_frame_count = int(total_frames) if math.isfinite(total_frames) and total_frames > 0 else 0
                 session.condition.notify_all()
             session.add_log(f"本地模型：{config['model'].name}；视频：{config['video'].name}")
             session.add_log(f"类别：{getattr(model, 'names', '由权重文件提供')}")
@@ -316,16 +339,23 @@ class LocalPTInferenceManager:
             previous_saved_index = None
             while not session.stop_event.is_set():
                 with session.condition:
-                    while session.paused and session.seek_target is None and not session.stop_event.is_set():
+                    while session.paused and session.seek_target is None and session.seek_frame is None and not session.stop_event.is_set():
                         playback_clock_needs_reset = True
                         session.condition.wait(0.1)
                     if session.stop_event.is_set():
                         break
                     seek_target = session.seek_target
+                    frame_target = session.seek_frame
                     generation = session.seek_generation
                     session.seek_target = None
-                if seek_target is not None:
-                    capture.set(cv2.CAP_PROP_POS_MSEC, seek_target * 1000)
+                    session.seek_frame = None
+                jumping = seek_target is not None or frame_target is not None
+                if jumping:
+                    if frame_target is not None:
+                        if not seek_video_frame(capture, frame_target):
+                            raise RuntimeError(f"视频解码器无法定位到第 {frame_target + 1} 帧。")
+                    else:
+                        capture.set(cv2.CAP_PROP_POS_MSEC, seek_target * 1000)
                     last_preview = 0
                     playback_anchor_source = capture_frame_index(capture) / fps if fps > 0 else seek_target
                     playback_anchor_wall = time.monotonic()
@@ -336,7 +366,7 @@ class LocalPTInferenceManager:
                         previous_saved_frame = None
                         previous_saved_index = None
                         session.add_log("已跳转：停止向原保存文件写入，避免拼接不连续片段。")
-                if config["realtime"] and fps > 0:
+                if config["realtime"] and fps > 0 and not jumping and not session.paused:
                     if playback_clock_needs_reset:
                         playback_anchor_source = capture_frame_index(capture) / fps
                         playback_anchor_wall = time.monotonic()
@@ -354,13 +384,13 @@ class LocalPTInferenceManager:
                         session.position_seconds = duration
                         session.replay_deadline = time.monotonic() + config["replay_grace_seconds"]
                         session.message = "视频已到结尾，可拖动进度条回看。"
-                        while session.seek_target is None and not session.stop_event.is_set() and time.monotonic() < session.replay_deadline:
+                        while session.seek_target is None and session.seek_frame is None and not session.stop_event.is_set() and session.replay_deadline is not None and time.monotonic() < session.replay_deadline:
                             session.condition.wait(0.1)
-                        if session.seek_target is None:
+                        if session.seek_target is None and session.seek_frame is None:
                             break
                     continue
                 source_index = capture_frame_index(capture, after_read=True)
-                position = video_position_seconds(capture, fps, source_index)
+                position = source_index / fps if frame_target is not None and fps > 0 else video_position_seconds(capture, fps, source_index)
                 kwargs = {"conf": config["conf"], "iou": config["iou"], "max_det": config["max_det"], "verbose": False}
                 if config["device"] != "auto":
                     kwargs["device"] = config["device"]
@@ -377,7 +407,7 @@ class LocalPTInferenceManager:
                     (18, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
                     (0, 255, 255), 2, cv2.LINE_AA,
                 )
-                if config["output"] is not None and (writer is not None or not output_created):
+                if frame_target is None and config["output"] is not None and (writer is not None or not output_created):
                     if writer is None:
                         height, width = annotated.shape[:2]
                         writer = cv2.VideoWriter(str(config["output"]), cv2.VideoWriter_fourcc(*"mp4v"), fps if fps > 0 else 25, (width, height))
@@ -389,20 +419,22 @@ class LocalPTInferenceManager:
                         previous_saved_frame, previous_saved_index,
                     )
                     saved += written
-                if config["realtime"] and fps > 0:
+                if config["realtime"] and fps > 0 and not session.paused:
                     deadline = playback_anchor_wall + max(0.0, position - playback_anchor_source)
                     delay = deadline - time.monotonic()
                     if delay > 0 and session.stop_event.wait(delay):
                         break
                 now = time.monotonic()
                 preview_due = config["preview_fps"] == 0 or now - last_preview >= 1 / config["preview_fps"]
-                if preview_due or seek_target is not None:
+                if preview_due or jumping:
                     height, width = annotated.shape[:2]
                     if width > config["stream_width"]:
                         annotated = cv2.resize(annotated, (config["stream_width"], round(height * config["stream_width"] / width)))
                     success, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, config["jpeg_quality"]])
+                    if not success and jumping:
+                        raise RuntimeError("目标帧画面编码失败，请检查视频是否损坏。")
                     if success:
-                        session.publish_frame(encoded.tobytes(), position, generation)
+                        session.publish_frame(encoded.tobytes(), position, generation, source_index)
                         last_preview = now
             with session.condition:
                 session.status = "stopped" if session.stop_event.is_set() else "completed"

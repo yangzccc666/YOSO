@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import threading
@@ -100,6 +101,24 @@ def video_frame_task_key(function_id: str, paths: dict[str, Path], parameters: d
     return f"{function_id}:{fingerprint}"
 
 
+def normalize_video_folder_paths(value: Any) -> list[Path]:
+    """Read newline-separated folder paths without treating spaces as separators."""
+    if value is not None and not isinstance(value, (str, Path, list)):
+        raise ValueError("视频文件夹路径必须是文字，每行一个文件夹。")
+    values = value if isinstance(value, list) else str(value or "").splitlines()
+    paths: dict[str, Path] = {}
+    for raw in values:
+        if not isinstance(raw, (str, Path)):
+            raise ValueError("视频文件夹路径必须是文字，每行一个文件夹。")
+        text = str(raw).strip()
+        if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+            text = text[1:-1].strip()
+        if text:
+            path = Path(text).expanduser().resolve()
+            paths[os.path.normcase(str(path))] = path
+    return sorted(paths.values(), key=lambda path: str(path).casefold())
+
+
 def _filename_number(value: float) -> str:
     return f"{value:.6f}".rstrip("0").rstrip(".").replace("-", "m").replace(".", "p")
 
@@ -107,10 +126,20 @@ def _filename_number(value: float) -> str:
 def _english_identifier(value: Any, label: str) -> str:
     identifier = re.sub(r"[_-]+", "_", str(value or "").strip().lower().replace(" ", "_"))
     if not identifier:
-        raise ValueError(f"请填写{label}，例如 tcl 或 line2_station3。")
+        return ""
     if len(identifier) > 48 or not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*", identifier):
         raise ValueError(f"{label}只能包含英文字母、数字、空格、下划线或短横线，且不能超过 48 个字符。")
     return identifier
+
+
+def _video_filename_identity(video: Path, project: str, scene: str, index: int) -> tuple[str, str, str]:
+    """Resolve blank identifiers per video, keeping its original case and Chinese name."""
+    source = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", video.stem).strip().rstrip(". ")
+    # Leave room for an explicit identifier, sampling tag, timestamps and frame index.
+    source = source.encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip(". ") or "video"
+    resolved_project, resolved_scene = project or source, scene or source
+    parts = [resolved_project, resolved_scene] if project or scene else [source]
+    return resolved_project, resolved_scene, f"{'_'.join(parts)}_video{index:02d}"
 
 
 def _sampling_filename_info(
@@ -171,16 +200,29 @@ def _ensure_informative_filenames(
 
 
 def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
-    inputs: list[str] = []
-    folder = context.paths.get("video_folder")
+    folders = normalize_video_folder_paths(context.parameters.get("_video_folder_paths", context.paths.get("video_folder", "")))
     video_file = context.paths.get("video_file")
-    if folder:
-        inputs.append(str(folder))
+    if not folders and not video_file:
+        raise ValueError("请填写一个或多个视频文件夹（每行一个），或者选择一个 MP4 视频。")
+    roots: list[Path] = []
+    for folder in sorted(folders, key=lambda path: (len(path.parts), str(path).casefold())):
+        context.check_cancelled()
+        if not folder.is_dir():
+            context.report(f"[跳过文件夹] 路径不存在或不是文件夹：{folder}")
+        elif any(root == folder or root in folder.parents for root in roots):
+            context.report(f"[跳过重复扫描] 已包含在其他文件夹中：{folder}")
+        else:
+            roots.append(folder)
+    found: set[Path] = set()
+    for index, folder in enumerate(roots, 1):
+        context.check_cancelled()
+        context.report(f"[扫描 {index}/{len(roots)}] 正在递归查找：{folder}")
+        scanned = module.parse_video_paths([str(folder)], check_cancelled=context.check_cancelled)
+        found.update(Path(value).resolve() for value in scanned)
+        context.report(f"[扫描 {index}/{len(roots)}] 找到 {len(scanned)} 个 MP4 视频。")
     if video_file:
-        inputs.append(str(video_file))
-    if not inputs:
-        raise ValueError("请选择视频文件夹，或者选择一个 MP4 视频。")
-    videos = [Path(value).resolve() for value in module.parse_video_paths(inputs)]
+        found.update(Path(value).resolve() for value in module.parse_video_paths([str(video_file)], check_cancelled=context.check_cancelled))
+    videos = sorted(found, key=lambda path: str(path).casefold())
     if not videos:
         raise ValueError("没有找到可处理的 MP4 视频，请检查输入路径。")
     return videos
@@ -236,7 +278,7 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
 
     limit_description = f"每个视频最多 {max_images} 张" if max_images is not None else "不限制图片总数"
     context.report(f"已递归扫描输入文件夹，共找到 {len(videos)} 个 MP4 视频；抽帧方式：{mode_message}，{limit_description}")
-    context.report(f"英文命名：项目 {project_code}；场景 {scene_code}")
+    context.report(f"输出命名：项目 {project_code or '使用各自视频文件名'}；场景 {scene_code or '使用各自视频文件名'}。两项均留空时视频名只保留一份。")
     context.report(
         f"有效区间：{start_time_sec:g} 秒 至 "
         f"{f'{end_time_sec:g} 秒' if end_time_sec is not None else '视频结尾'}；"
@@ -279,7 +321,7 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             sampling_tag, source_fps = _sampling_filename_info(
                 module, video, target_fps, interval_sec, fallback_step,
             )
-        english_prefix = f"{project_code}_{scene_code}_video{index:02d}"
+        video_project, video_scene, english_prefix = _video_filename_identity(video, project_code, scene_code, index)
         output_folder = _unique_output_folder(parent, f"{english_prefix}_{sampling_tag}")
         report(f"[{index}/{len(videos)}] 正在处理：{video}\n输出目录：{output_folder}")
         probe = module.open_video(str(video))
@@ -331,8 +373,8 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             "priorityRanges": priority_ranges,
             "priorityCandidateCount": process_result.get("priority_candidate_count", 0) if process_result else 0,
             "backgroundCandidateCount": process_result.get("background_candidate_count", 0) if process_result else 0,
-            "projectCode": project_code,
-            "sceneCode": scene_code,
+            "projectCode": video_project,
+            "sceneCode": video_scene,
             "englishPrefix": english_prefix,
             "output": str(output_folder),
         }
@@ -395,8 +437,8 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         "videoCount": len(videos),
         "imageCount": total_images,
         "maxImagesPerVideo": max_images,
-        "projectCode": project_code,
-        "sceneCode": scene_code,
+        "projectCode": project_code or (details[0]["projectCode"] if len(videos) == 1 else ""),
+        "sceneCode": scene_code or (details[0]["sceneCode"] if len(videos) == 1 else ""),
         "outputFolders": output_folders,
         "details": details,
         "failedVideos": failures,
