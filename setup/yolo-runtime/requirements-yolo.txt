@@ -1,0 +1,8 @@
+# Runtime only: no desktop UI, packaging tools, or administrator components.
+# The installer installs CPU PyTorch from its official wheel index first.
+torch>=2.2,<3
+torchvision>=0.17,<1
+ultralytics>=8.4,<9
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
+onnxslim>=0.1,<1

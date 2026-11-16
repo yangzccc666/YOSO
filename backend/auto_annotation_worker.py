@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -51,7 +52,7 @@ def write_xml(image, shape, detections, target):
     return count
 
 
-def run(config, model, report=print):
+def collect_images(config):
     folder = Path(config['folder'])
     images = sorted(p for p in (folder.rglob('*') if config['recursive'] else folder.iterdir())
                     if p.is_file() and p.suffix.lower() in SUFFIXES)
@@ -63,6 +64,13 @@ def run(config, model, report=print):
         if target in targets:
             raise ValueError(f'同目录存在不同扩展名的同名图片，会产生同名 XML：{target}')
         targets.add(target)
+    return images
+
+
+def run(config, model, report=print, check_cancelled=lambda: None, images=None):
+    folder = Path(config['folder'])
+    report(f'正在扫描图片目录：{folder}')
+    images = collect_images(config) if images is None else images
     if getattr(model, 'task', None) != 'detect':
         raise ValueError('当前自动标注仅支持目标检测 PT 模型。')
     names = model.names
@@ -73,18 +81,24 @@ def run(config, model, report=print):
     result = dict(written=0, skipped=0, failed=0, objects=0, empty=0, total=len(images), backup='')
     report(f'找到 {len(images)} 张图片；模型类别：{names}')
     for index, image in enumerate(images, 1):
+        check_cancelled()
         target = image.with_suffix('.xml')
         if target.exists() and config['existing'] == '跳过':
             result['skipped'] += 1
             report(f'[{index}/{len(images)}] 已有标注，跳过：{image.name}')
             continue
         try:
+            started = time.monotonic()
+            report(f'[{index}/{len(images)}] 开始检测：{image}；首次检测可能需要初始化推理环境。' if index == 1
+                   else f'[{index}/{len(images)}] 开始检测：{image}')
             prediction = model.predict(source=str(image), conf=config['conf'], iou=config['iou'],
                                        imgsz=config['imgsz'], device=config['device'] or None,
-                                       classes=config['classes'] or None, verbose=False, save=False)[0]
+                                       classes=config['classes'] or None, verbose=False, save=False, show=False)[0]
+            report(f'[{index}/{len(images)}] 检测完成，用时 {time.monotonic()-started:.2f} 秒，正在生成 XML：{target.name}')
             boxes = prediction.boxes
             detections = [(names[int(cls)], xyxy) for cls, xyxy in
                           zip(boxes.cls.cpu().tolist(), boxes.xyxy.cpu().tolist())]
+            check_cancelled()
             if not detections and not config['empty_xml']:
                 result['skipped'] += 1
                 report(f'[{index}/{len(images)}] 无目标，保留原标注不变：{image.name}')
@@ -100,6 +114,7 @@ def run(config, model, report=print):
             result['empty'] += int(count == 0)
             report(f'[{index}/{len(images)}] {image.name}：{count} 个目标 → {target.name}')
         except Exception as exc:
+            check_cancelled()
             result['failed'] += 1
             report(f'[{index}/{len(images)}] 失败：{image.name}：{exc}')
     return result
@@ -107,9 +122,13 @@ def run(config, model, report=print):
 
 if __name__ == '__main__':
     try:
+        print('正在加载 Ultralytics / PyTorch…', flush=True)
         from ultralytics import YOLO
         config = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-        result = run(config, YOLO(config['weights']), lambda text: print(text, flush=True))
+        print(f"正在加载 PT 模型：{config['weights']}", flush=True)
+        model = YOLO(config['weights'])
+        print('PT 模型加载完成。', flush=True)
+        result = run(config, model, lambda text: print(text, flush=True))
         print('RESULT_JSON:' + json.dumps(result, ensure_ascii=False), flush=True)
     except Exception as exc:
         print(f'自动标注失败：{exc}', flush=True)

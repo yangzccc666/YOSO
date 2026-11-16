@@ -7,9 +7,11 @@ from PyInstaller.utils.hooks import collect_submodules
 
 ROOT = Path(SPECPATH).parent
 APP_NAME = "YOLO-Data-Platform"
-VERSION = "26.1.3"
+VERSION = "26.1.4"
 
 datas = [
+    *[(str(ROOT / "setup" / "yolo-runtime" / filename), "AI-Environment-Setup")
+      for filename in ("install_yolo_env.bat", "install_yolo_env.py", "requirements-yolo.txt", "README.md")],
     (str(ROOT / "frontend" / "dist"), "frontend/dist"),
     (str(ROOT / "backend" / "*.py"), "backend"),
     (str(ROOT / "backend" / "license_public.json"), "backend"),

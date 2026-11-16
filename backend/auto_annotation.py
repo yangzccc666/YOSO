@@ -3,16 +3,12 @@ from __future__ import annotations
 
 import json
 import math
-import os
-import queue
-import signal
-import subprocess
 import tempfile
-import threading
 from pathlib import Path
 
 from .handlers import RunContext, register_handler
 from .jetson_onnx_export import _resolve_python
+from .annotation_process import supervise_annotation
 
 
 def run_auto_annotation(context: RunContext) -> dict:
@@ -49,43 +45,8 @@ def run_auto_annotation(context: RunContext) -> dict:
     with tempfile.TemporaryDirectory(prefix='yolo-annotation-') as temp:
         settings = Path(temp) / 'config.json'
         settings.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
-        process = subprocess.Popen([str(python), '-u', '-B', str(Path(__file__).with_name('auto_annotation_worker.py')), str(settings)],
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        messages = queue.Queue()
-        def read():
-            try:
-                for line in process.stdout:
-                    messages.put(line.rstrip())
-            finally:
-                messages.put(None)
-        threading.Thread(target=read, daemon=True).start()
-        result = None
-        last = ''
-        try:
-            while True:
-                context.check_cancelled()
-                try:
-                    line = messages.get(timeout=.2)
-                except queue.Empty:
-                    continue
-                if line is None:
-                    break
-                if line.startswith('RESULT_JSON:'):
-                    result = json.loads(line[len('RESULT_JSON:'):])
-                else:
-                    last = line or last
-                    context.report(line)
-            if process.wait() != 0 or result is None:
-                raise RuntimeError(last or '自动标注进程异常退出。')
-        finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
-            process.stdout.close()
+        result = supervise_annotation([str(python), '-u', '-B', str(Path(__file__).with_name('auto_annotation_worker.py')), str(settings)],
+                                     context.report, context.check_cancelled)
     summary = f"生成 {result['written']} 份 XML，{result['objects']} 个目标；空标注 {result['empty']}，跳过 {result['skipped']}，失败 {result['failed']}。"
     context.report(summary)
     if result['backup']:
