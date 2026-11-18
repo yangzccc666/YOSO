@@ -12,6 +12,7 @@ ssh_credentials.json
 .DS_Store
 /build/
 /dist/
+/.desktop-ime/
 
 # Owner-only tools must never enter the public user edition.
 /license_admin.py

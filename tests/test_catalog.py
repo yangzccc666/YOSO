@@ -52,8 +52,10 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(parameters["background_fps"]["default"], 5)
         self.assertEqual(parameters["priority_max_images"]["default"], 500)
         self.assertEqual(item["handlerId"], "video.extract_frames")
-        self.assertEqual(item["parameters"][0]["id"], "project_code")
-        self.assertEqual(item["parameters"][1]["id"], "scene_code")
+        self.assertEqual(item["parameters"][0]["id"], "output_layout")
+        self.assertEqual(parameters['output_layout']['default'], '按源文件夹分别保存')
+        self.assertEqual(item["parameters"][1]["id"], "project_code")
+        self.assertEqual(item["parameters"][2]["id"], "scene_code")
         max_images = next(parameter for parameter in item["parameters"] if parameter["id"] == "max_images_limit")
         self.assertEqual(max_images["default"], "")
         start_time = next(parameter for parameter in item["parameters"] if parameter["id"] == "range_start_time")
@@ -125,8 +127,8 @@ class CatalogTests(unittest.TestCase):
 
         migrated = FunctionCatalog(storage).get("video_frames")
 
-        self.assertEqual([parameter["id"] for parameter in migrated["parameters"][:2]], [
-            "project_code", "scene_code",
+        self.assertEqual([parameter["id"] for parameter in migrated["parameters"][:3]], [
+            "output_layout", "project_code", "scene_code",
         ])
         self.assertTrue(storage.with_name("legacy-functions.json.video-frame-naming-v1").exists())
 
@@ -358,18 +360,22 @@ class CatalogTests(unittest.TestCase):
         self.catalog.delete(item["id"])
         self.assertIsNone(self.catalog.get(item["id"]))
 
-    def test_linux_fcitx_falls_back_to_bundled_xim_plugin(self) -> None:
+    def test_linux_fcitx_uses_verified_native_plugin_without_xim_fallback(self) -> None:
+        from desktop_input_method import InputMethodReport
+
         environment = {
             "XDG_SESSION_TYPE": "x11",
             "QT_IM_MODULE": "fcitx",
             "XMODIFIERS": "@im=fcitx",
         }
-        with patch.dict(os.environ, environment, clear=True), patch.object(sys, "platform", "linux"):
-            self.assertEqual(configure_linux_input_method(), "xim")
-            self.assertEqual(os.environ["QT_IM_MODULE"], "xim")
+        with patch.dict(os.environ, environment, clear=True), patch.object(sys, "platform", "linux"), \
+             patch("desktop_input_method.configure_input_method", return_value=InputMethodReport("fcitx", "verified-native.so")) as configure:
+            self.assertEqual(configure_linux_input_method(), "fcitx")
+            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
+            configure.assert_called_once_with()
 
     def test_input_method_override_is_respected(self) -> None:
-        with patch.dict(os.environ, {"PROCESSING_VIEW_QT_IM_MODULE": "ibus"}, clear=True):
+        with patch.dict(os.environ, {"PROCESSING_VIEW_QT_IM_MODULE": "ibus"}, clear=True), patch.object(sys, "platform", "linux"):
             self.assertEqual(configure_linux_input_method(), "ibus")
             self.assertEqual(os.environ["QT_IM_MODULE"], "ibus")
 
@@ -1097,7 +1103,8 @@ class CatalogTests(unittest.TestCase):
         self.assertTrue(any(re.fullmatch(r"name=yolo26_\d{4}_\d{4}", item) for item in command))
         self.assertNotIn("cos_lr=True", command)
         self.assertNotIn("optimizer=SGD", command)
-        self.assertEqual(len(command), 13)
+        self.assertIn('amp=True', command)
+        self.assertEqual(len(command), 14)
 
     def test_yolo_training_name_is_generated_only_for_execution(self) -> None:
         self.assertEqual(DEFAULT_TRAINING_VALUES["run_name"], "")
@@ -1147,11 +1154,11 @@ class CatalogTests(unittest.TestCase):
         source_shell, _ = _remote_training_shell(
             [executable, "detect", "train", f"model={REMOTE_YOLO26_MODEL}", "epochs=2"],
             "yolo-training-source-test",
-            REMOTE_ULTRALYTICS_SOURCE,
+            "/srv/custom-ultralytics",
         )
         source_launch = shlex.split(source_shell)[2]
-        self.assertIn(f"cd {REMOTE_ULTRALYTICS_SOURCE}", source_launch)
-        self.assertIn(f"PYTHONPATH={REMOTE_ULTRALYTICS_SOURCE}", source_launch)
+        self.assertIn("cd /srv/custom-ultralytics", source_launch)
+        self.assertIn("PYTHONPATH=/srv/custom-ultralytics", source_launch)
 
     def test_yolo_training_profiles_support_named_scenario_crud(self) -> None:
         store = TrainingProfileStore(Path(self.temp.name) / "training_profiles.json")

@@ -32,8 +32,8 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
-      RELEASE_VERSION: v26.1.4
-      ASSET_NAME: YOLO-Data-Platform-v26.1.4-${{ matrix.asset }}
+      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.5' }}
+      ASSET_NAME: YOLO-Data-Platform-${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.5' }}-${{ matrix.asset }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -63,6 +63,15 @@ jobs:
       - name: Install packaging dependencies
         run: python -m pip install --upgrade -r requirements-build.txt
 
+      - name: Build matching native Fcitx input plugin
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxkbcommon-dev libxkbcommon-x11-0 libxcb-cursor0 libegl1 zstd
+          bash setup/linux-ime/build_release_plugin.sh "${RUNNER_TEMP}/yoso-fcitx"
+          echo 'PROCESSING_VIEW_REQUIRE_FCITX=1' >> "$GITHUB_ENV"
+
       - name: Verify user edition contains no owner tools
         run: python packaging/check_user_distribution.py
 
@@ -80,7 +89,7 @@ jobs:
       - name: Smoke-test package on Linux
         if: runner.os == 'Linux'
         shell: bash
-        run: QT_QPA_PLATFORM=offscreen ./dist/YOLO-Data-Platform/YOLO-Data-Platform --check
+        run: QT_QPA_PLATFORM=offscreen ./dist/YOLO-Data-Platform/YOLO-Data-Platform --check --require-fcitx
 
       - name: Smoke-test package on Windows
         if: runner.os == 'Windows'
@@ -102,7 +111,7 @@ jobs:
         shell: pwsh
         run: |
           Compress-Archive -Path dist/YOLO-Data-Platform -DestinationPath "${env:ASSET_NAME}.zip"
-          Compress-Archive -Path setup/yolo-runtime -DestinationPath "YOLO-Data-Platform-v26.1.4-yolo-environment-setup.zip"
+          Compress-Archive -Path setup/yolo-runtime -DestinationPath "YOLO-Data-Platform-${env:RELEASE_VERSION}-yolo-environment-setup.zip"
 
       - name: Create macOS archive
         if: matrix.archive == 'mac'
@@ -114,8 +123,8 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: |
-            YOLO-Data-Platform-v26.1.4-${{ matrix.asset }}.*
-            YOLO-Data-Platform-v26.1.4-yolo-environment-setup.zip
+            ${{ env.ASSET_NAME }}.*
+            YOLO-Data-Platform-${{ env.RELEASE_VERSION }}-yolo-environment-setup.zip
           if-no-files-found: error
 
   release:
@@ -124,6 +133,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download packaged applications
         uses: actions/download-artifact@v4
         with:
@@ -134,10 +145,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
-        run: >-
-          gh release create "${GITHUB_REF_NAME}"
-          release-assets/*
-          --repo "${GITHUB_REPOSITORY}"
-          --title "YOLO数据处理平台 ${GITHUB_REF_NAME}"
-          --generate-notes
-          --verify-tag
+        run: |
+          notes="docs/RELEASE-${GITHUB_REF_NAME}.md"
+          if [[ -f "$notes" ]]; then
+            notes_args=(--notes-file "$notes")
+          else
+            notes_args=(--generate-notes)
+          fi
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" --title "YOLO数据处理平台 ${GITHUB_REF_NAME}" \
+            "${notes_args[@]}" --verify-tag

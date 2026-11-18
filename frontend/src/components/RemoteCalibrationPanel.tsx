@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
+import { CollapsibleSection } from './CollapsibleSection'
 import { choosePaths, forgetYoloRemotePassword, getYoloRemoteCredentialStatus, testYoloRemoteConnection } from '../api'
 import { icons } from '../icons'
+import { HelpTip } from './HelpTip'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { PlatformTaskStatus, WorkingValues, YoloConnectionTestResult } from '../types'
 import { SshConnectionHistoryInput } from './SshConnectionHistoryInput'
@@ -132,27 +134,26 @@ export function RemoteCalibrationPanel({ values, output, running, platformTask, 
 
   return <>
     <section className="workspace-section calibration-section">
-      <div className="section-title"><icons.Settings size={21} /><h2>运行位置</h2></div>
+      <div className="section-title"><icons.Settings size={21} /><h2>运行位置</h2><HelpTip label="量化数据集运行位置说明">{remoteRequested ? '目录填写远程服务器上的绝对路径；执行前需要先测试 SSH 连接。' : '直接处理本机目录，使用平台当前 Python 环境，不需要 SSH 连接。'}</HelpTip></div>
       <div className="calibration-location-switch" role="group" aria-label="量化数据集运行位置">
         {['本地运行', 'SSH 远程服务器'].map((location) => <button type="button" className={executionLocation === location ? 'active' : ''} aria-pressed={executionLocation === location} onClick={() => { set('execution_location', location); setError('') }} key={location}>{location === '本地运行' ? <icons.Box size={17} /> : <icons.Code2 size={17} />}{location}</button>)}
       </div>
-      <p className="section-description calibration-location-description">{remoteRequested ? '目录填写远程服务器上的绝对路径；执行前需要先测试 SSH 连接。' : '直接处理本机目录，使用平台当前 Python 环境，不需要 SSH 连接。'}</p>
     </section>
     <section className="workspace-section calibration-section">
-      <div className="section-title"><icons.Folder size={21} /><h2>{remoteRequested ? '服务器' : '本机'}数据路径</h2></div>
+      <CollapsibleSection heading={<div className="section-title"><icons.Folder size={21} /><h2>{remoteRequested ? '服务器' : '本机'}数据路径</h2><HelpTip label="量化数据集抽样说明">抽样顺序：先保留全部非 copy 原始图片；数量不足时，再从文件名含 copy 的扩充图片和负样本中按比例补齐。</HelpTip></div>} count={7}>
       <div className="calibration-form">
         <label className="wide"><span>图片目录 <em>必填；每行一个，可填写多个</em></span><span className="calibration-directory-input"><textarea rows={3} value={String(parameter('image_dirs') || '')} onChange={(event) => set('image_dirs', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/images\n/home/user/dataset/images_extra' : '/path/to/dataset/images'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('image_dirs', true)}>添加文件夹</button> : null}</span></label>
-        <label className="wide"><span>标注目录 <em>可选；按顺序对应图片目录，不填则在图片目录查找</em></span><span className="calibration-directory-input"><textarea rows={3} value={String(parameter('annotation_dirs') || '')} onChange={(event) => set('annotation_dirs', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/annotations' : '/path/to/dataset/annotations'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('annotation_dirs', true)}>添加文件夹</button> : null}</span></label>
+        <label className="wide"><span>标注目录 <em>可选</em><HelpTip label="量化标注目录说明">按顺序对应图片目录，不填则在图片目录查找。</HelpTip></span><span className="calibration-directory-input"><textarea rows={3} value={String(parameter('annotation_dirs') || '')} onChange={(event) => set('annotation_dirs', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/annotations' : '/path/to/dataset/annotations'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('annotation_dirs', true)}>添加文件夹</button> : null}</span></label>
         <label className="wide"><span>负样本图片目录 <em>可选；每行一个，不需要标注</em></span><span className="calibration-directory-input"><textarea rows={2} value={String(parameter('negative_dirs') || '')} onChange={(event) => set('negative_dirs', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/negative' : '/path/to/dataset/negative'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('negative_dirs', true)}>添加文件夹</button> : null}</span></label>
-        <label className="wide"><span>输出目录 <em>留空时默认在第一个图片目录旁创建 calib_dataset；已有文件不会覆盖</em></span><span className="calibration-directory-input single-line"><input value={String(parameter('output_dir') || '')} onChange={(event) => set('output_dir', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/calib_dataset' : '/path/to/dataset/calib_dataset'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('output_dir')}>选择文件夹</button> : null}</span></label>
+        <label className="wide"><span>输出目录 <em>可选</em><HelpTip label="量化数据集输出说明">留空时默认在第一个图片目录旁创建 calib_dataset；已有文件不会覆盖。</HelpTip></span><span className="calibration-directory-input single-line"><input value={String(parameter('output_dir') || '')} onChange={(event) => set('output_dir', event.target.value)} placeholder={remoteRequested ? '/home/user/dataset/calib_dataset' : '/path/to/dataset/calib_dataset'} />{!remoteRequested ? <button type="button" onClick={() => void chooseDirectory('output_dir')}>选择文件夹</button> : null}</span></label>
         <label><span>标注格式</span><select value={String(parameter('annotation_format') || 'auto')} onChange={(event) => set('annotation_format', event.target.value)}><option value="auto">自动识别</option><option value="xml">VOC XML</option><option value="json">LabelMe JSON</option></select></label>
         <label><span>抽取图片数量</span><input type="number" min="1" max="100000" value={String(parameter('num_samples') ?? 128)} onChange={(event) => set('num_samples', event.target.value === '' ? '' : Number(event.target.value))} /></label>
         <label><span>随机种子</span><input type="number" value={String(parameter('random_seed') ?? 42)} onChange={(event) => set('random_seed', event.target.value === '' ? '' : Number(event.target.value))} /></label>
-        <p className="wide calibration-hint">抽样顺序：先保留全部非 copy 原始图片；数量不足时，再从文件名含 copy 的扩充图片和负样本中按比例补齐。</p>
       </div>
+      </CollapsibleSection>
     </section>
     {remoteRequested ? <section className="workspace-section calibration-section">
-      <div className="section-title"><icons.Settings size={21} /><h2>SSH 服务器</h2></div>
+      <CollapsibleSection heading={<div className="section-title"><icons.Settings size={21} /><h2>SSH 服务器</h2></div>} count={6}>
       <div className="calibration-form">
         <label><span>服务器 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={checking || running} onHostChange={(value) => set('remote_host', value)} onSelect={(profile) => {
           set('remote_port', profile.port); set('remote_username', profile.username); set('remember_password', true); set('remote_password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setNotice(profile.passwordRemembered ? '已选择历史服务器，并填充保存的 SSH 密码。' : '已选择历史服务器，请输入 SSH 密码。')
@@ -163,6 +164,7 @@ export function RemoteCalibrationPanel({ values, output, running, platformTask, 
         <label className="wide"><span>远程 Python 解释器 <em>需要已安装 Pillow；可填虚拟环境 Python 的绝对路径</em></span><input value={String(parameter('remote_python') || '')} onChange={(event) => set('remote_python', event.target.value)} placeholder="python3" /></label>
       </div>
       <label className="calibration-remember"><input type="checkbox" checked={remember} onChange={(event) => set('remember_password', event.target.checked)} />记住 SSH 密码</label>
+      </CollapsibleSection>
     </section> : null}
     <section className="remote-inference-section yolo-run-section calibration-run-section">
       <div className="remote-run-actions">

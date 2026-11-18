@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { choosePaths, forgetRemotePassword, getRemoteCredentialStatus, getRemoteInferenceStatus, seekRemoteInference, setRemoteInferencePaused, startRemoteInference, stepRemoteInference, stopRemoteInference, testRemoteConnection } from '../api'
+import { CollapsibleSection } from './CollapsibleSection'
+import { confirmStop } from '../confirmActions'
+import { choosePaths, detectRemoteStarLabels, forgetRemotePassword, getRemoteCredentialStatus, getRemoteInferenceStatus, seekRemoteInference, setRemoteInferencePaused, startRemoteInference, stepRemoteInference, stopRemoteInference, testRemoteConnection } from '../api'
 import { icons } from '../icons'
+import { HelpTip } from './HelpTip'
 import { useVideoPlaybackShortcut } from '../hooks/useVideoPlaybackShortcut'
 import { FrameStepControls } from './FrameStepControls'
 import { retainNewestPlaybackStatus } from '../playbackStatus'
@@ -56,6 +59,8 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const [error, setError] = useState('')
   const [modelHistoryOpen, setModelHistoryOpen] = useState(false)
   const [modelNotice, setModelNotice] = useState('')
+  const [readingModel, setReadingModel] = useState<number | null>(null)
+  const labelReadRequest = useRef(0)
   const [credentialNotice, setCredentialNotice] = useState('')
   const [connectionCheck, setConnectionCheck] = useState<ConnectionCheck | null>(null)
   const [previewExpanded, setPreviewExpanded] = useState(false)
@@ -110,8 +115,45 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   const connectionReady = currentConnectionCheck?.state === 'success'
   const testingConnection = currentConnectionCheck?.state === 'checking'
   const starModels = parseStarModels(values.parameters.star_models, String(values.paths.local_model_file || ''), String(values.parameters.labels || ''), Number(values.parameters.conf ?? 0.5))
+  const latestStarModels = useRef(starModels)
+  latestStarModels.current = starModels
+  useEffect(() => () => { labelReadRequest.current += 1 }, [])
 
-  const saveStarModels = (models: StarModel[]) => onParameterChange('star_models', JSON.stringify(models))
+  const saveStarModels = (models: StarModel[]) => {
+    labelReadRequest.current += 1
+    latestStarModels.current = models
+    setReadingModel(null)
+    setModelNotice('')
+    onParameterChange('star_models', JSON.stringify(models))
+  }
+  const readModelLabels = async (index: number) => {
+    const requestedModels = JSON.stringify(starModels)
+    const model = starModels[index]
+    setError('')
+    setModelNotice('')
+    if (!model?.path.trim()) {
+      setError(`请先为模型 ${index + 1} 选择本机 STAR 文件。`)
+      return
+    }
+    const requestId = ++labelReadRequest.current
+    setReadingModel(index)
+    try {
+      const result = await detectRemoteStarLabels(model.path)
+      if (requestId !== labelReadRequest.current) return
+      if (JSON.stringify(latestStarModels.current) !== requestedModels) {
+        setModelNotice('模型配置已改变，本次读取结果未填充，请重新点击读取。')
+        return
+      }
+      saveStarModels(latestStarModels.current.map((entry, position) => position === index ? { ...entry, labels: result.labels.join(',') } : entry))
+      setModelNotice(`模型 ${index + 1}：${result.message} 来源：${result.source}`)
+    } catch (cause) {
+      if (requestId === labelReadRequest.current && JSON.stringify(latestStarModels.current) === requestedModels) {
+        setError(`模型 ${index + 1}：${cause instanceof Error ? cause.message : '读取类别失败'}；已保留原类别。`)
+      }
+    } finally {
+      if (requestId === labelReadRequest.current) setReadingModel(null)
+    }
+  }
   const selectHistoryModel = (model: StarModel): string | null => {
     const result = selectHistoricalStarModel(starModels, model)
     if (result.action === 'full') return '当前已有 8 个模型，请先关闭弹窗，移除一个模型或清空全部模型后再选择。'
@@ -214,7 +256,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   useEffect(() => {
     if (!previewExpanded) return
     const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setPreviewExpanded(false)
+      if (event.key === 'Escape') { setPreviewExpanded(false); revealTimeline() }
     }
     document.body.classList.add('remote-preview-open')
     window.addEventListener('keydown', closeOnEscape)
@@ -238,9 +280,27 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   }, [])
 
   useEffect(() => {
+    // A seek can end outside the player or the window. Never leave controls
+    // pinned visible forever because their local pointerup was missed.
+    const finishPointer = () => {
+      if (!timelineHolding.current) return
+      const focused = document.activeElement
+      if (focused instanceof HTMLElement && focused !== previewRef.current && previewRef.current?.contains(focused)) focused.blur()
+      releaseTimeline()
+    }
+    window.addEventListener('pointerup', finishPointer)
+    window.addEventListener('pointercancel', finishPointer)
+    window.addEventListener('blur', finishPointer)
+    return () => {
+      window.removeEventListener('pointerup', finishPointer)
+      window.removeEventListener('pointercancel', finishPointer)
+      window.removeEventListener('blur', finishPointer)
+    }
+  }, [])
+
+  useEffect(() => {
     if (!session?.frameCount) return
-    setTimelineVisible(true)
-    timelineHideTimer.current = window.setTimeout(() => setTimelineVisible(false), TIMELINE_HIDE_DELAY_MS)
+    revealTimeline()
     return clearTimelineTimer
   }, [Boolean(session?.frameCount), session?.id])
 
@@ -326,7 +386,8 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
   }
 
   const stop = async () => {
-    if (!sessionId) return
+    if (!sessionId || submitting || session?.status === 'stopping') return
+    if (!confirmStop(session?.atEnd ? '远程推理回看并清理' : '远程实时 AI 推理', '将结束检测或回看，并按当前清理设置处理远端任务临时文件。')) return
     setSubmitting(true)
     setError('')
     try {
@@ -406,24 +467,23 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
 
   return (
     <section className="remote-inference-section">
-      <div className="remote-multi-models">
-        <div className="section-title"><icons.Settings size={19} /><h2>同一视频使用多个 STAR 模型</h2></div>
-        <p className="section-description">所有 STAR 模型都在这里统一配置。每个模型分别填写文件、类别名和置信度，检测框会叠加在同一视频上。多个模型会降低推理帧率；开启“保持原视频速度”后，平台会自动跳过已经落后的源帧，避免画面变成慢动作。</p>
+      <CollapsibleSection className="remote-multi-models" count={starModels.length} heading={<div className="section-title"><icons.Settings size={19} /><h2>同一视频使用多个 STAR 模型</h2><HelpTip label="多模型推理说明">所有 STAR 模型都在这里统一配置。每个模型分别填写文件、类别名和置信度，检测框会叠加在同一视频上。多个模型会降低推理帧率；开启“保持原视频速度”后，平台会自动跳过已经落后的源帧，避免画面变成慢动作。</HelpTip></div>}>
         {starModels.map((model, index) => <div className="remote-model-card" key={index}>
           <div className="remote-model-card-title"><strong>模型 {index + 1}</strong><button type="button" onClick={() => removeStarModel(index)} title={starModels.length === 1 ? '至少需要保留一个模型' : `移除模型 ${index + 1}`}>移除</button></div>
           <label><span>模型文件</span><div className="remote-model-path"><input value={model.path} onChange={(event) => updateStarModel(index, { path: event.target.value })} placeholder="选择本机 .star / .plan / .engine 文件" /><button type="button" onClick={() => void browseStarModel(index)}>浏览</button></div></label>
           <div className="remote-model-options">
-            <label><span>类别名称（英文逗号分隔）</span><input value={model.labels} onChange={(event) => updateStarModel(index, { labels: event.target.value })} placeholder="例如：person,car" /></label>
+            <label><span className="remote-model-label-heading"><span>类别名称（英文逗号分隔）</span><button type="button" aria-label={`读取模型 ${index + 1} 类别`} disabled={readingModel !== null || submitting} onClick={() => void readModelLabels(index)}>{readingModel === index ? '正在读取…' : '读取类别'}</button></span><input value={model.labels} onChange={(event) => updateStarModel(index, { labels: event.target.value })} placeholder="例如：person,car" /></label>
             <label><span>置信度阈值</span><input type="number" min="0" max="1" step="0.01" value={model.conf} onChange={(event) => updateStarModel(index, { conf: Number(event.target.value) })} /></label>
           </div>
         </div>)}
         <div className="remote-model-actions">
+          <HelpTip label="STAR 读取类别说明">“读取类别”直接解析本机 STAR 内嵌类别元数据，不连接 SSH、不启动推理；只填入所点模型，保留置信度。PLAN/engine 或缺少元数据的 STAR 请手动填写。读取期间修改配置会取消本次自动填充。</HelpTip>
           <button type="button" className="text-action" disabled={starModels.length >= 8} onClick={() => saveStarModels([...starModels, { path: '', labels: '', conf: Number(values.parameters.conf ?? 0.5) }])}><icons.Plus size={16} />添加 STAR 模型（最多 8 个）</button>
           <button type="button" className="text-action" onClick={() => { setModelNotice(''); setModelHistoryOpen(true) }}><icons.Clock3 size={16} />历史模型</button>
           <button type="button" className="text-action danger" disabled={starModels.length === 1 && !starModels[0].path.trim() && !starModels[0].labels.trim()} onClick={clearAllStarModels} title="删除全部模型配置并保留一个空白上传窗口"><icons.Trash2 size={16} />清空全部模型</button>
         </div>
         {modelNotice && <p className="model-history-notice" role="status">{modelNotice}</p>}
-      </div>
+      </CollapsibleSection>
       {modelHistoryOpen && <StarModelHistoryDialog currentModels={starModels} onSelect={selectHistoryModel} onClose={() => setModelHistoryOpen(false)} />}
       <div className="remote-run-actions">
         {!active ? <button className="connection-test-button" onClick={testConnection} disabled={testingConnection || submitting}>
@@ -434,7 +494,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
           {submitting ? '请稍候…' : active ? (session?.atEnd ? '结束回看并清理' : '停止实时检测') : platformTask ? '正在运行' : '开始实时检测'}
         </button>
         <span className={`remote-status ${displayedStatus.className}`}><i />{displayedStatus.label}</span>
-        <small>{rememberPassword ? '已开启密码记忆；首次连接成功后无需再次输入。' : '先测试 SSH 连接；连接参数改变后需要重新测试。'}</small>
+        <HelpTip label="推理 SSH 连接说明">{rememberPassword ? '已开启密码记忆；首次连接成功后无需再次输入。' : '先测试 SSH 连接；连接参数改变后需要重新测试。'}</HelpTip>
         {rememberPassword ? <button className="forget-password-button" onClick={forgetPassword} disabled={submitting || testingConnection}>清除已保存密码</button> : null}
       </div>
 
@@ -442,8 +502,8 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
       {credentialNotice ? <div className="credential-notice" role="status"><icons.Check size={18} /><span>{credentialNotice}</span></div> : null}
       {connectionError || error ? <div className="remote-error" role="alert"><icons.CircleAlert size={18} /><span>{connectionError || error}</span></div> : null}
 
-      <div ref={previewRef} tabIndex={0} role="region" aria-label="远程视频预览" aria-keyshortcuts="Space , ." className={`remote-preview ${previewExpanded ? 'expanded' : ''}`} onMouseMove={revealTimeline} onPointerLeave={(event) => { if (event.pointerType === 'mouse') leaveTimeline() }} onPointerDown={revealTimeline} onDoubleClick={() => setPreviewExpanded((current) => !current)} title="空格播放/暂停；, 上一帧，. 下一帧；逐帧按钮支持长按；双击切换撑满窗口">
-        <button className="preview-expand-button" onClick={() => setPreviewExpanded((current) => !current)} onDoubleClick={(event) => event.stopPropagation()} aria-label={previewExpanded ? '退出撑满窗口' : '撑满整个窗口'} aria-pressed={previewExpanded}>
+      <div ref={previewRef} tabIndex={0} role="region" aria-label="远程视频预览" aria-description="空格播放/暂停；, 上一帧，. 下一帧；双击切换撑满窗口，Esc 退出；控件静止三秒自动隐藏" aria-keyshortcuts="Space , ." className={`remote-preview ${previewExpanded ? 'expanded' : ''} ${streamUrl && !timelineVisible ? 'controls-idle' : ''}`} onPointerEnter={revealTimeline} onPointerMove={revealTimeline} onPointerLeave={(event) => { if (event.pointerType === 'mouse') leaveTimeline() }} onPointerDown={revealTimeline} onFocusCapture={revealTimeline} onKeyDownCapture={revealTimeline} onDoubleClick={() => { revealTimeline(); setPreviewExpanded((current) => !current) }}>
+        <button className={`preview-expand-button ${streamUrl && !timelineVisible ? 'is-hidden' : ''}`} onClick={(event) => { revealTimeline(); setPreviewExpanded((current) => !current); if (event.detail > 0) { event.currentTarget.blur(); previewRef.current?.focus({ preventScroll: true }) } }} onDoubleClick={(event) => event.stopPropagation()} aria-label={previewExpanded ? '退出撑满窗口' : '撑满整个窗口'} aria-pressed={previewExpanded}>
           {previewExpanded ? <icons.Minimize2 size={17} /> : <icons.Maximize2 size={17} />}
           {previewExpanded ? '退出全窗口' : '撑满窗口'}
         </button>

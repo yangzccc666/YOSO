@@ -22,6 +22,7 @@ VIDEO_FUNCTION = {
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
     "parameters": [
+        {"id": "output_layout", "label": "图片保存方式", "type": "select", "default": "按源文件夹分别保存", "options": ["按源文件夹分别保存", "全部视频合并保存"]},
         {"id": "project_code", "label": "项目英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
         {"id": "scene_code", "label": "场景英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
         {"id": "parallel_workers", "label": "同时处理的视频数（0 自动，1 串行，最多 16）", "type": "number", "default": 0, "options": []},
@@ -56,10 +57,12 @@ VIDEO_FUNCTION = {
 IMAGE_DEDUP_FUNCTION = {
     "id": "image_dedup",
     "name": "图片智能去重",
-    "description": "面向 YOLO 训练筛选连续相似帧，保护工序变化与过程锚点；移出的图片保留备份并支持回滚。",
+    "description": "按实际画面差异保留代表样本，不设保留比例或删除配额。可包含子文件夹，各工位目录独立分析，不跨目录比较，支持批量报告与回滚。自动模式核验原图整体、局部差异及标注，不确定就保留；近重复判断不保证语义等价或识别所有微小缺陷。完整工序循环模式需单目录指定参考轮。",
     "handlerId": "image.smart_dedup",
     "pathFields": [
         {"id": "images_folder", "label": "需要去重的图片文件夹", "mode": "directory"},
+        {"id": "cycle_start_image", "label": "参考循环起始图片（包含此图）", "mode": "file"},
+        {"id": "cycle_end_image", "label": "参考循环结束图片（包含此图）", "mode": "file"},
     ],
     "parameters": [
         {
@@ -67,18 +70,23 @@ IMAGE_DEDUP_FUNCTION = {
             "label": "操作方式",
             "type": "select",
             "default": "分析并去重",
-            "options": ["分析并去重", "回滚最近一次"],
+            "options": ["仅分析（不移动文件）", "分析并去重", "回滚最近一次"],
         },
+        {"id": "dedup_mode", "label": "去重模式", "type": "select", "default": "差异优先去重（自动）",
+         "options": ["差异优先去重（自动）", "工位工序去重（忽略背景）", "仅精确重复", "连续相似帧去重", "完整工序循环去重"], "visibleWhen": {"fieldId": "operation", "notEquals": "回滚最近一次"}},
+        {"id": "recursive", "label": "包含子文件夹（各目录独立去重）", "type": "boolean", "default": False, "options": []},
+        {"id": "process_regions", "label": "工位关注区域配置", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "dedup_mode", "equals": "工位工序去重（忽略背景）"}},
+        {"id": "process_strength", "label": "工位去重力度", "type": "select", "default": "平衡（推荐）", "options": ["保守", "较保守", "平衡（推荐）", "较强", "强力"], "visibleWhen": {"fieldId": "dedup_mode", "equals": "工位工序去重（忽略背景）"}},
         {
             "id": "dedup_strength",
             "label": "去重力度",
             "type": "select",
-            "default": "平衡（推荐）",
+            "default": "保守",
             "options": ["保守", "较保守", "平衡（推荐）", "较强", "强力"],
-            "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"},
+            "visibleWhen": {"fieldId": "operation", "notEquals": "回滚最近一次"},
         },
-        {"id": "minimum_keep_ratio", "label": "最低保留比例（0.05-1）", "type": "number", "default": 0.4, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"}},
-        {"id": "max_consecutive_skips", "label": "最多连续移除张数", "type": "number", "default": 8, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "分析并去重"}},
+        {"id": "cycle_min_ratio", "label": "最短循环张数倍数（默认参考轮的 0.4 倍）", "type": "number", "default": .4, "options": [], "visibleWhen": {"fieldId": "dedup_mode", "equals": "完整工序循环去重"}},
+        {"id": "cycle_max_ratio", "label": "最长循环张数倍数（默认参考轮的 2.5 倍）", "type": "number", "default": 2.5, "options": [], "visibleWhen": {"fieldId": "dedup_mode", "equals": "完整工序循环去重"}},
     ],
 }
 
@@ -130,13 +138,13 @@ YOLO_DATASET_FUNCTION = {
 YOLO_TRAINING_FUNCTION = {
     "id": "yolo_model_training",
     "name": "YOLO 模型训练",
-    "description": "使用指定远程 Ultralytics 源码和固定 yolo26n.pt 启动训练，支持多任务、后台 tmux、训练日志和任务管理。",
+    "description": "使用远程 Ultralytics 环境训练，可选自定义源码目录和模型；支持多任务、后台 tmux、训练日志和任务管理。",
     "handlerId": "yolo.train",
     "pathFields": [],
     "parameters": [
-        {"id": "remote_host", "label": "远程服务器 IP / 主机名", "type": "text", "default": "192.168.21.5", "options": []},
+        {"id": "remote_host", "label": "远程服务器 IP / 主机名", "type": "text", "default": "", "options": []},
         {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "options": []},
-        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "dell", "options": []},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "", "options": []},
         {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "options": []},
         {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "options": []},
     ],
@@ -145,10 +153,11 @@ YOLO_TRAINING_FUNCTION = {
 NEGATIVE_SAMPLE_FUNCTION = {
     "id": "extract_negative_samples",
     "name": "提取负样本",
-    "description": "检查同名 VOC XML，将没有 object 标注的 JPG/JPEG 移动到负样本目录，并删除对应空 XML。",
+    "description": "支持图片与 XML 混放或分开存放。XML 文件夹留空时在图片目录查找；按同名 VOC XML 提取无 object 的 JPG/JPEG，移动图片并删除对应空 XML。递归时优先匹配相同子目录，否则仅匹配唯一同名图片；输出保留图片子目录。",
     "handlerId": "dataset.extract_negative_samples",
     "pathFields": [
-        {"id": "source_folder", "label": "图片和 XML 输入文件夹", "mode": "directory"},
+        {"id": "source_folder", "label": "图片输入文件夹（可与 XML 混放）", "mode": "directory"},
+        {"id": "xml_folder", "label": "XML 标注文件夹（可选，混放时留空）", "mode": "directory"},
         {"id": "negative_folder", "label": "负样本图片输出文件夹", "mode": "directory"},
     ],
     "parameters": [
@@ -159,7 +168,7 @@ NEGATIVE_SAMPLE_FUNCTION = {
 VIDEO_CLIP_FUNCTION = {
     "id": "video_clip",
     "name": "视频裁剪",
-    "description": "按时间裁剪、拆分训练/测试集，或删除多个不要的时间段后自动拼接剩余内容；原视频不修改，默认不重新编码。",
+    "description": "按时间精确裁剪、拆分训练/测试集或删除片段并拼接；默认另存，也可确认后备份并替换原视频。",
     "handlerId": "video.clip",
     "pathFields": [
         {"id": "video_folder", "label": "视频文件夹", "mode": "directory"},
@@ -167,6 +176,8 @@ VIDEO_CLIP_FUNCTION = {
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
     "parameters": [
+        {"id": "clip_save_mode", "label": "裁剪保存方式", "type": "select", "default": "另存为新视频", "options": ["另存为新视频", "替换原视频（自动备份）"]},
+        {"id": "clip_exact_time", "label": "按帧精确裁剪时间", "type": "boolean", "default": True, "options": []},
         {"id": "clip_output_name", "label": "保存文件名（留空自动命名）", "type": "text", "default": "", "options": []},
         {
             "id": "clip_mode",
@@ -239,15 +250,18 @@ REMOTE_STAR_INFERENCE_FUNCTION = {
 
 LOCAL_PT_INFERENCE_FUNCTION = {
     "id": "local_pt_inference",
-    "name": "本地 PT 视频检测",
-    "description": "使用本机 Ultralytics YOLO .pt 权重检测本地视频，按原视频时间轴预览带框画面；性能不足时自动跳过落后帧。",
+    "name": "本地 PT / ONNX 推理检测",
+    "description": "支持视频或图片文件夹，使用 Ultralytics PT 和标准 YOLO ONNX 自动读取类别、检测目标。图片可递归检测并保存带框结果，不修改原图。不支持 Jetson 裁剪头 ONNX。",
     "handlerId": "local.pt_inference",
     "pathFields": [
-        {"id": "model_file", "label": "本地 PT 权重文件", "mode": "file"},
+        {"id": "model_file", "label": "本地 PT / ONNX 模型文件", "mode": "file"},
         {"id": "video_file", "label": "本地视频文件", "mode": "file"},
-        {"id": "output_folder", "label": "保存带框视频的文件夹（可选）", "mode": "directory"},
+        {"id": "output_folder", "label": "检测结果输出文件夹", "mode": "directory"},
+        {"id": "image_folder", "label": "本地图片文件夹", "mode": "directory"},
     ],
     "parameters": [
+        {"id": "input_mode", "label": "输入类型", "type": "select", "default": "视频检测", "options": ["视频检测", "图片文件夹检测"]},
+        {"id": "recursive_images", "label": "包含图片子文件夹", "type": "boolean", "default": True, "options": []},
         {"id": "conf", "label": "置信度阈值", "type": "number", "default": 0.5, "options": []},
         {"id": "iou", "label": "NMS IoU 阈值", "type": "number", "default": 0.45, "options": []},
         {"id": "max_det", "label": "每帧最大检测框数", "type": "number", "default": 300, "options": []},
@@ -318,6 +332,7 @@ JETSON_ONNX_EXPORT_FUNCTION = {
     ],
     "parameters": [
         {"id": "model_family", "label": "模型版本", "type": "select", "default": "YOLO26", "options": ["YOLO26", "YOLOv5"]},
+        {"id": "deployment_precision", "label": "后续部署精度", "type": "select", "default": "INT8", "options": ["INT8", "FP16", "FP32"], "visibleWhen": {"fieldId": "target_platform", "equals": "Jetson / TensorRT（NCHW）"}},
         {"id": "task_type", "label": "模型任务类型", "type": "select", "default": "目标检测", "options": ["目标检测", "目标分割", "旋转目标检测", "姿态估计", "图像分类"]},
         {"id": "target_platform", "label": "目标平台", "type": "select", "default": "Jetson / TensorRT（NCHW）", "options": ["Jetson / TensorRT（NCHW）", "RKNN（NHWC）"]},
         {"id": "imgsz", "label": "输入尺寸 imgsz", "type": "number", "default": 640, "options": []},
@@ -331,11 +346,11 @@ JETSON_ONNX_EXPORT_FUNCTION = {
 REMOTE_TENSORRT_BUILD_FUNCTION = {
     "id": "remote_tensorrt_build",
     "name": "远程 TensorRT 引擎构建",
-    "description": "通过 SSH 读取 Jetson AI 推理盒子上的多个量化 ONNX，按填写顺序构建 TensorRT .plan 引擎并保存在原目录。",
+    "description": "通过 SSH 顺序构建 TensorRT .plan。支持未量化 FP32 ONNX 构建 FP16/FP32 引擎，也支持已有量化 ONNX 的部署流程。切换构建精度不会恢复量化损失；FP16/FP32 会检查并拒绝量化图。",
     "handlerId": "remote.build_tensorrt",
     "pathFields": [],
     "parameters": [
-        {"id": "onnx_files", "label": "量化 ONNX 路径（每行一个）", "type": "text", "default": "", "options": []},
+        {"id": "onnx_files", "label": "远端 ONNX 路径（每行一个）", "type": "text", "default": "", "options": []},
         {"id": "operation", "label": "操作方式", "type": "select", "default": "构建 TensorRT 引擎", "options": ["构建 TensorRT 引擎", "检查远程环境"]},
         {"id": "trtexec_path", "label": "远端 trtexec 路径", "type": "text", "default": "/usr/src/tensorrt/bin/trtexec", "options": []},
         {"id": "remote_workspace", "label": "远端任务根目录", "type": "text", "default": "~/.local/state/yolo-processing/tensorrt", "options": []},
@@ -370,7 +385,7 @@ LOCAL_STAR_PACKAGE_FUNCTION = {
         {"id": "model_name", "label": "模型架构名称", "type": "text", "default": "yolo26", "options": []},
         {"id": "category", "label": "模型类别", "type": "select", "default": "generic", "options": ["generic", "seg", "classify"]},
         {"id": "version", "label": "版本信息", "type": "text", "default": "1", "options": []},
-        {"id": "precision", "label": "模型精度", "type": "select", "default": "INT8 (1)", "options": ["INT4 (0)", "INT8 (1)", "FP8 (2)", "FP16 (3)", "FP32 (4)"]},
+        {"id": "precision", "label": "引擎精度声明（不转换模型）", "type": "select", "default": "INT8 (1)", "options": ["INT4 (0)", "INT8 (1)", "FP8 (2)", "FP16 (3)", "FP32 (4)"]},
         {"id": "input_n", "label": "输入张量 N", "type": "number", "default": 1, "options": []},
         {"id": "input_c", "label": "输入张量 C", "type": "number", "default": 3, "options": []},
         {"id": "input_h", "label": "输入张量 H", "type": "number", "default": 640, "options": []},
@@ -381,21 +396,30 @@ LOCAL_STAR_PACKAGE_FUNCTION = {
 
 AUTO_ANNOTATE_FUNCTION = {
     "id": "auto_annotation", "name": "模型自动标注", "handlerId": "dataset.auto_annotate",
-    "description": "使用本机 Ultralytics 检测 PT 模型生成同名 VOC XML，保存于原图片旁；类别名读取模型，原图片保持不变。自动标注后请人工复核。",
+    "description": "本地 PT 或远程 STAR 模型自动标注。本机图片旁生成同名 VOC XML，原图不变。STAR 模式逐张上传到 SSH 盒子，复用实时推理预处理与解码；任务结束清理临时文件。自动标注及未检出目标的空标注都需要人工复核。",
     "pathFields": [
         {"id": "image_folder", "label": "待标注图片文件夹", "mode": "directory"},
         {"id": "weights_file", "label": "训练后的 PT 检测模型", "mode": "file"},
     ],
     "parameters": [
+        {"id": "annotation_mode", "label": "自动标注模式", "type": "select", "default": "本地 PT 标注", "options": ["本地 PT 标注", "远程 STAR 标注"]},
         {"id": "conf", "label": "置信度阈值（0–1）", "type": "number", "default": 0.5},
         {"id": "iou", "label": "重叠框抑制 IoU 阈值（0–1）", "type": "number", "default": 0.7},
-        {"id": "imgsz", "label": "推理尺寸（32 的倍数）", "type": "number", "default": 640},
-        {"id": "device", "label": "设备（留空自动；cpu 或 GPU 编号如 0）", "type": "text", "default": ""},
+        {"id": "imgsz", "label": "推理尺寸（32 的倍数）", "type": "number", "default": 640, "visibleWhen": {"fieldId": "annotation_mode", "equals": "本地 PT 标注"}},
+        {"id": "device", "label": "设备（留空自动；cpu 或 GPU 编号如 0）", "type": "text", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "本地 PT 标注"}},
         {"id": "classes", "label": "仅标注类别编号（逗号分隔；留空全部）", "type": "text", "default": ""},
         {"id": "recursive", "label": "包含子文件夹", "type": "boolean", "default": True},
         {"id": "existing", "label": "已有 XML", "type": "select", "default": "跳过", "options": ["跳过", "备份后覆盖"]},
         {"id": "empty_xml", "label": "没有目标时生成空 XML（待人工确认的负样本）", "type": "boolean", "default": True},
-        {"id": "python_path", "label": "Python 路径（留空自动使用本机 yolo26 环境）", "type": "text", "default": ""},
+        {"id": "python_path", "label": "Python 路径（留空自动使用本机 yolo26 环境）", "type": "text", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "本地 PT 标注"}},
+        {"id": "star_labels", "label": "STAR 类别名称（每行一个；留空读取模型）", "type": "text", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remote_host", "label": "标注盒子 IP / 主机名", "type": "text", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remote_port", "label": "SSH 端口", "type": "number", "default": 22, "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remote_username", "label": "SSH 用户名", "type": "text", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remote_password", "label": "SSH 密码", "type": "password", "default": "", "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remember_password", "label": "记住 SSH 密码", "type": "boolean", "default": True, "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "remote_python", "label": "盒子 Python 解释器（命令或绝对路径）", "type": "text", "default": "python3", "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
+        {"id": "cuda_backend", "label": "CUDA 后端", "type": "select", "default": "auto", "options": ["auto", "cuda-driver-ctypes", "cuda-driver", "cuda-python", "pycuda"], "visibleWhen": {"fieldId": "annotation_mode", "equals": "远程 STAR 标注"}},
     ],
 }
 
@@ -462,10 +486,15 @@ class FunctionCatalog:
             content = json.loads(self.storage_file.read_text(encoding="utf-8"))
             if isinstance(content, list):
                 migration_marker = self.storage_file.with_name(self.storage_file.name + ".local-pt-v1")
+                local_images_marker = self.storage_file.with_name(self.storage_file.name + ".local-images-v1")
                 clip_migration_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1")
                 clip_split_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2")
                 clip_remove_marker = self.storage_file.with_name(self.storage_file.name + ".video-clip-remove-v3")
                 dedup_migration_marker = self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1")
+                cycle_dedup_marker = self.storage_file.with_name(self.storage_file.name + ".image-cycle-dedup-v2")
+                quality_dedup_marker = self.storage_file.with_name(self.storage_file.name + ".image-quality-dedup-v3")
+                recursive_dedup_marker = self.storage_file.with_name(self.storage_file.name + ".image-recursive-dedup-v4")
+                process_dedup_marker = self.storage_file.with_name(self.storage_file.name + ".image-process-dedup-v5")
                 quant_migration_marker = self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1")
                 export_migration_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1")
                 export_family_marker = self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-family-v2")
@@ -484,14 +513,18 @@ class FunctionCatalog:
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
                 video_folder_recursive_marker = self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1")
                 video_multi_folders_marker = self.storage_file.with_name(self.storage_file.name + ".video-multi-folders-v2")
+                video_output_layout_marker = self.storage_file.with_name(self.storage_file.name + ".video-output-layout-v1")
                 video_parallel_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
                 yolo_training_function_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1")
                 yolo_training_remote_source_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-training-remote-source-v2")
                 negative_sample_marker = self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1")
+                negative_separate_marker = self.storage_file.with_name(self.storage_file.name + ".negative-sample-separate-folders-v2")
                 changed = False
                 annotation_marker = self.storage_file.with_name(self.storage_file.name + ".auto-annotation-v1")
+                annotation_star_marker = self.storage_file.with_name(self.storage_file.name + ".auto-annotation-star-v2")
+                precision_options_marker = self.storage_file.with_name(self.storage_file.name + ".precision-options-v1")
                 if not yolo_training_function_marker.exists():
                     if not any(isinstance(item, dict) and item.get("id") == YOLO_TRAINING_FUNCTION["id"] for item in content):
                         content.append(deepcopy(YOLO_TRAINING_FUNCTION))
@@ -523,6 +556,86 @@ class FunctionCatalog:
                     content.append(deepcopy(LOCAL_STAR_PACKAGE_FUNCTION))
                     changed = True
                 for item in content:
+                    if (not process_dedup_marker.exists() and isinstance(item, dict)
+                            and item.get('handlerId') == IMAGE_DEDUP_FUNCTION['handlerId']):
+                        params = item.setdefault('parameters', [])
+                        for source in IMAGE_DEDUP_FUNCTION['parameters']:
+                            if source['id'] not in {'dedup_mode', 'process_regions', 'process_strength'}:
+                                continue
+                            existing = next((p for p in params if p.get('id') == source['id']), None)
+                            if existing is None:
+                                params.append(deepcopy(source))
+                            elif source['id'] == 'dedup_mode':
+                                existing['options'] = deepcopy(source['options'])
+                        changed = True
+                    if (not recursive_dedup_marker.exists() and isinstance(item, dict)
+                            and item.get('handlerId') == IMAGE_DEDUP_FUNCTION['handlerId']):
+                        item['description'] = IMAGE_DEDUP_FUNCTION['description']
+                        params = item.setdefault('parameters', [])
+                        if not any(p.get('id') == 'recursive' for p in params):
+                            params.insert(2, deepcopy(next(p for p in IMAGE_DEDUP_FUNCTION['parameters'] if p['id'] == 'recursive')))
+                        changed = True
+                    if (not quality_dedup_marker.exists() and isinstance(item, dict)
+                            and item.get('handlerId') == IMAGE_DEDUP_FUNCTION['handlerId']):
+                        item['description'] = IMAGE_DEDUP_FUNCTION['description']
+                        item['parameters'] = [p for p in item.get('parameters', []) if p.get('id') not in {'minimum_keep_ratio', 'max_consecutive_skips'}]
+                        mode_field = next((p for p in item['parameters'] if p.get('id') == 'dedup_mode'), None)
+                        source = next(p for p in IMAGE_DEDUP_FUNCTION['parameters'] if p['id'] == 'dedup_mode')
+                        if mode_field is None:
+                            item['parameters'].insert(1, deepcopy(source))
+                        else:
+                            mode_field['options'] = deepcopy(source['options'])
+                            if mode_field.get('default') == '连续相似帧去重':
+                                mode_field['default'] = source['default']
+                        changed = True
+                    if (not video_output_layout_marker.exists() and isinstance(item, dict)
+                            and item.get('handlerId') == VIDEO_FUNCTION['handlerId']):
+                        params = item.setdefault('parameters', [])
+                        if not any(isinstance(p, dict) and p.get('id') == 'output_layout' for p in params):
+                            params.insert(0, deepcopy(next(p for p in VIDEO_FUNCTION['parameters'] if p['id'] == 'output_layout')))
+                            changed = True
+                    if not precision_options_marker.exists() and isinstance(item, dict):
+                        handler = item.get('handlerId')
+                        if handler == JETSON_ONNX_EXPORT_FUNCTION['handlerId']:
+                            params = item.setdefault('parameters', [])
+                            if not any(isinstance(p, dict) and p.get('id') == 'deployment_precision' for p in params):
+                                params.insert(1, deepcopy(next(p for p in JETSON_ONNX_EXPORT_FUNCTION['parameters'] if p['id'] == 'deployment_precision')))
+                                changed = True
+                        if handler == REMOTE_TENSORRT_BUILD_FUNCTION['handlerId']:
+                            item['description'] = REMOTE_TENSORRT_BUILD_FUNCTION['description']
+                            for parameter in item.get('parameters', []):
+                                if parameter.get('id') == 'onnx_files' and parameter.get('label') == '量化 ONNX 路径（每行一个）':
+                                    parameter['label'] = '远端 ONNX 路径（每行一个）'
+                            changed = True
+                        if handler == LOCAL_STAR_PACKAGE_FUNCTION['handlerId']:
+                            for parameter in item.get('parameters', []):
+                                if parameter.get('id') == 'precision' and parameter.get('label') == '模型精度':
+                                    parameter['label'] = '引擎精度声明（不转换模型）'
+                                    changed = True
+                    if (not annotation_star_marker.exists() and isinstance(item, dict)
+                            and item.get("handlerId") == AUTO_ANNOTATE_FUNCTION["handlerId"]):
+                        parameters = item.setdefault("parameters", [])
+                        existing = {field.get("id"): field for field in parameters if isinstance(field, dict)}
+                        for field in AUTO_ANNOTATE_FUNCTION["parameters"]:
+                            if field["id"] not in existing:
+                                parameters.append(deepcopy(field))
+                            elif field.get("visibleWhen"):
+                                existing[field["id"]]["visibleWhen"] = deepcopy(field["visibleWhen"])
+                        item["description"] = AUTO_ANNOTATE_FUNCTION["description"]
+                        changed = True
+                    if (not negative_separate_marker.exists() and isinstance(item, dict)
+                            and item.get("handlerId") == NEGATIVE_SAMPLE_FUNCTION["handlerId"]):
+                        fields = item.setdefault("pathFields", [])
+                        if not any(isinstance(field, dict) and field.get("id") == "xml_folder" for field in fields):
+                            insert_at = next((index for index, field in enumerate(fields)
+                                              if isinstance(field, dict) and field.get("id") == "source_folder"), -1) + 1
+                            fields.insert(insert_at, deepcopy(NEGATIVE_SAMPLE_FUNCTION["pathFields"][1]))
+                        for field in fields:
+                            if isinstance(field, dict) and field.get("id") == "source_folder" and field.get("label") == "图片和 XML 输入文件夹":
+                                field["label"] = NEGATIVE_SAMPLE_FUNCTION["pathFields"][0]["label"]
+                        if item.get("description") == "检查同名 VOC XML，将没有 object 标注的 JPG/JPEG 移动到负样本目录，并删除对应空 XML。":
+                            item["description"] = NEGATIVE_SAMPLE_FUNCTION["description"]
+                        changed = True
                     if (not video_parallel_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_FUNCTION["id"]):
                         parameters = item.setdefault("parameters", [])
@@ -587,14 +700,14 @@ class FunctionCatalog:
                             if isinstance(parameter, dict)
                         }
                         new_parameters = [
-                            deepcopy(parameter) for parameter in VIDEO_FUNCTION["parameters"][:2]
-                            if parameter["id"] not in existing_ids
+                            deepcopy(parameter) for parameter in VIDEO_FUNCTION["parameters"]
+                            if parameter['id'] in {'project_code', 'scene_code'} and parameter["id"] not in existing_ids
                         ]
                         item["parameters"] = [*new_parameters, *parameters]
                         changed = True
                     if (not video_filename_fallback_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_FUNCTION["id"]):
-                        labels = {field["id"]: field["label"] for field in VIDEO_FUNCTION["parameters"][:2]}
+                        labels = {field["id"]: field["label"] for field in VIDEO_FUNCTION["parameters"] if field['id'] in {'project_code', 'scene_code'}}
                         old_labels = {"project_code": "项目英文标识（如 tcl）", "scene_code": "场景英文标识（如 line2_station3）"}
                         for parameter in item.get("parameters", []):
                             if isinstance(parameter, dict) and parameter.get("id") in labels:
@@ -633,7 +746,26 @@ class FunctionCatalog:
                                 break
                         changed = True
                     if isinstance(item, dict) and item.get("id") == LOCAL_PT_INFERENCE_FUNCTION["id"]:
+                        if item.get("name") in {"本地 PT 视频检测", "本地 PT / ONNX 视频检测"}:
+                            item["name"] = LOCAL_PT_INFERENCE_FUNCTION["name"]
+                            item["description"] = LOCAL_PT_INFERENCE_FUNCTION["description"]
+                            changed = True
                         fields = item.get("pathFields", [])
+                        if not local_images_marker.exists():
+                            if not any(isinstance(field, dict) and field.get("id") == "image_folder" for field in fields):
+                                item.setdefault("pathFields", []).append(deepcopy(LOCAL_PT_INFERENCE_FUNCTION["pathFields"][3]))
+                            for field in fields:
+                                if isinstance(field, dict) and field.get("id") == "output_folder" and field.get("label") == "保存带框视频的文件夹（可选）":
+                                    field["label"] = LOCAL_PT_INFERENCE_FUNCTION["pathFields"][2]["label"]
+                            parameters = item.setdefault("parameters", [])
+                            for source in LOCAL_PT_INFERENCE_FUNCTION["parameters"][:2]:
+                                if not any(isinstance(param, dict) and param.get("id") == source["id"] for param in parameters):
+                                    parameters.append(deepcopy(source))
+                            changed = True
+                        for field in fields:
+                            if isinstance(field, dict) and field.get("id") == "model_file" and field.get("label") == "本地 PT 权重文件":
+                                field["label"] = LOCAL_PT_INFERENCE_FUNCTION["pathFields"][0]["label"]
+                                changed = True
                         if any(isinstance(field, dict) and field.get("id") == "output_file" for field in fields):
                             item["pathFields"] = [deepcopy(LOCAL_PT_INFERENCE_FUNCTION["pathFields"][2]) if isinstance(field, dict) and field.get("id") == "output_file" else field for field in fields]
                             changed = True
@@ -661,6 +793,13 @@ class FunctionCatalog:
                             changed = True
                     if isinstance(item, dict) and item.get("id") == VIDEO_CLIP_FUNCTION["id"]:
                         parameters = item.setdefault("parameters", [])
+                        if item.get('description') == '按时间裁剪、拆分训练/测试集，或删除多个不要的时间段后自动拼接剩余内容；原视频不修改，默认不重新编码。':
+                            item['description'] = VIDEO_CLIP_FUNCTION['description']
+                            changed = True
+                        for field_id in ('clip_save_mode', 'clip_exact_time'):
+                            if not any(isinstance(parameter, dict) and parameter.get('id') == field_id for parameter in parameters):
+                                parameters.append(deepcopy(next(parameter for parameter in VIDEO_CLIP_FUNCTION['parameters'] if parameter['id'] == field_id)))
+                                changed = True
                         if not any(isinstance(parameter, dict) and parameter.get("id") == "clip_output_name" for parameter in parameters):
                             source_name = next(parameter for parameter in VIDEO_CLIP_FUNCTION["parameters"] if parameter["id"] == "clip_output_name")
                             parameters.insert(0, deepcopy(source_name))
@@ -795,6 +934,20 @@ class FunctionCatalog:
                             for parameter in LOCAL_STAR_PACKAGE_FUNCTION["parameters"]
                         ]
                         changed = True
+                if not cycle_dedup_marker.exists():
+                    for item in content:
+                        if not isinstance(item, dict) or item.get("handlerId") != "image.smart_dedup":
+                            continue
+                        item["description"] = IMAGE_DEDUP_FUNCTION["description"]
+                        for key in ("pathFields", "parameters"):
+                            existing = {field.get("id"): field for field in item.get(key, []) if isinstance(field, dict)}
+                            for field in IMAGE_DEDUP_FUNCTION[key]:
+                                if field["id"] not in existing:
+                                    item.setdefault(key, []).append(deepcopy(field))
+                                elif field["id"] in {"operation", "dedup_strength", "minimum_keep_ratio", "max_consecutive_skips"}:
+                                    existing[field["id"]]["options"] = deepcopy(field["options"])
+                                    existing[field["id"]]["visibleWhen"] = deepcopy(field.get("visibleWhen"))
+                        changed = True
                 if changed:
                     temporary = self.storage_file.with_suffix(".tmp")
                     temporary.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -809,6 +962,11 @@ class FunctionCatalog:
                     clip_remove_marker.write_text("migrated\n", encoding="utf-8")
                 if not dedup_migration_marker.exists():
                     dedup_migration_marker.write_text("migrated\n", encoding="utf-8")
+                if not cycle_dedup_marker.exists():
+                    cycle_dedup_marker.write_text("migrated\n", encoding="utf-8")
+                quality_dedup_marker.write_text("migrated\n", encoding="utf-8")
+                recursive_dedup_marker.write_text("migrated\n", encoding="utf-8")
+                process_dedup_marker.write_text("migrated\n", encoding="utf-8")
                 if not quant_migration_marker.exists():
                     quant_migration_marker.write_text("migrated\n", encoding="utf-8")
                 if not export_migration_marker.exists():
@@ -845,6 +1003,7 @@ class FunctionCatalog:
                     video_folder_recursive_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_multi_folders_marker.exists():
                     video_multi_folders_marker.write_text("migrated\n", encoding="utf-8")
+                video_output_layout_marker.write_text("migrated\n", encoding="utf-8")
                 if not video_parallel_marker.exists():
                     video_parallel_marker.write_text("migrated\n", encoding="utf-8")
                 if not realtime_playback_marker.exists():
@@ -855,10 +1014,16 @@ class FunctionCatalog:
                     yolo_training_function_marker.write_text("migrated\n", encoding="utf-8")
                 if not yolo_training_remote_source_marker.exists():
                     yolo_training_remote_source_marker.write_text("migrated\n", encoding="utf-8")
+                if not local_images_marker.exists():
+                    local_images_marker.write_text("migrated\n", encoding="utf-8")
                 if not negative_sample_marker.exists():
                     negative_sample_marker.write_text("migrated\n", encoding="utf-8")
+                if not negative_separate_marker.exists():
+                    negative_separate_marker.write_text("migrated\n", encoding="utf-8")
                 items = [self._normalize(item) for item in content if isinstance(item, dict)]
                 annotation_marker.write_text("migrated\n", encoding="utf-8")
+                annotation_star_marker.write_text("migrated\n", encoding="utf-8")
+                precision_options_marker.write_text("migrated\n", encoding="utf-8")
                 return items
         except (OSError, json.JSONDecodeError):
             pass
@@ -871,13 +1036,16 @@ class FunctionCatalog:
         temporary.replace(self.storage_file)
         self.storage_file.with_name(self.storage_file.name + ".auto-annotation-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".local-pt-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".local-images-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-copy-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-train-test-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".video-clip-remove-v3").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-training-function-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".yolo-training-remote-source-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".negative-sample-extractor-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".negative-sample-separate-folders-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".image-dedup-v1").write_text("migrated\n", encoding="utf-8")
+        self.storage_file.with_name(self.storage_file.name + ".image-cycle-dedup-v2").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".docker-onnx-quant-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-export-v1").write_text("migrated\n", encoding="utf-8")
         self.storage_file.with_name(self.storage_file.name + ".jetson-onnx-batch-v3").write_text("migrated\n", encoding="utf-8")

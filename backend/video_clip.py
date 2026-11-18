@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import math
+import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -26,6 +30,23 @@ LEGACY_ENCODING_MODES = {
     "精确裁剪（推荐）": PRECISE_MODE,
 }
 ENCODING_MODES = {COPY_MODE, PRECISE_MODE}
+SAVE_AS = '另存为新视频'
+REPLACE_SOURCE = '替换原视频（自动备份）'
+_replacing_sources: set[Path] = set()
+_replacement_lock = threading.Lock()
+
+
+@contextmanager
+def _claim_source(video: Path):
+    with _replacement_lock:
+        if video in _replacing_sources:
+            raise ValueError('该视频正在被另一个任务原位裁剪，请等待完成。')
+        _replacing_sources.add(video)
+    try:
+        yield
+    finally:
+        with _replacement_lock:
+            _replacing_sources.discard(video)
 
 
 def parse_time(value: Any, label: str) -> float:
@@ -138,7 +159,7 @@ def _run_process(command: list[str], context: RunContext) -> subprocess.Complete
                 return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
             except subprocess.TimeoutExpired:
                 continue
-    except TaskCancelled:
+    except BaseException:
         if process.poll() is None:
             process.terminate()
             try:
@@ -147,6 +168,11 @@ def _run_process(command: list[str], context: RunContext) -> subprocess.Complete
                 process.kill()
                 process.wait()
         raise
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
 
 
 def _probe_duration(video: Path, context: RunContext | None = None) -> float:
@@ -321,14 +347,15 @@ def _clip_one(
         "-hide_banner",
         "-loglevel", "error",
         "-y",
-        "-ss", f"{start:.6f}",
         "-i", str(video),
-        "-t", f"{duration:.6f}",
     ]
     if precise:
         output_options = [
             "-map", "0:v:0",
             "-map", "0:a?",
+            "-vf", f"setpts=PTS-STARTPTS,trim=start={start:.6f}:end={end:.6f},setpts=PTS-STARTPTS",
+            "-af", f"asetpts=PTS-STARTPTS,atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS",
+            "-vsync", "vfr",
             "-c:v", "libx264",
             "-preset", "medium",
             "-crf", "23",
@@ -337,6 +364,8 @@ def _clip_one(
             "-movflags", "+faststart",
         ]
     else:
+        command_prefix = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y',
+                          '-ss', f'{start:.6f}', '-i', str(video), '-t', f'{duration:.6f}']
         output_options = [
             "-map", "0",
             "-c", "copy",
@@ -377,7 +406,7 @@ def _clip_one(
                 "-avoid_negative_ts", "make_zero",
                 "-movflags", "+faststart",
             ])
-    except TaskCancelled:
+    except BaseException:
         temporary.unlink(missing_ok=True)
         raise
     if not succeeded(completed):
@@ -470,9 +499,9 @@ def _join_remaining(
         audio = _has_audio(ffmpeg, video, context)
         filters = []
         count = len(ranges)
-        filters.append(f"[0:v:0]split={count}" + "".join(f"[sv{i}]" for i in range(count)))
+        filters.append(f"[0:v:0]setpts=PTS-STARTPTS,split={count}" + "".join(f"[sv{i}]" for i in range(count)))
         if audio:
-            filters.append(f"[0:a:0]asplit={count}" + "".join(f"[sa{i}]" for i in range(count)))
+            filters.append(f"[0:a:0]asetpts=PTS-STARTPTS,asplit={count}" + "".join(f"[sa{i}]" for i in range(count)))
         inputs = []
         for index, (start, end) in enumerate(ranges):
             context.report(f"保留片段 {index + 1}/{count}：{start:.3f} 秒 → {end:.3f} 秒")
@@ -491,7 +520,7 @@ def _join_remaining(
         ]
         if audio:
             command += ["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]
-        command += ["-c:v", "libx264", "-preset", "medium", "-crf", "23", "-map_metadata", "0", "-movflags", "+faststart", str(temporary)]
+        command += ["-vsync", "vfr", "-c:v", "libx264", "-preset", "medium", "-crf", "23", "-map_metadata", "0", "-movflags", "+faststart", str(temporary)]
         audio_note = "保留首条音轨" if audio else "原视频无音轨"
         context.report(f"正在精确删除并拼接 {count} 个保留片段（一次编码，{audio_note}）")
         completed = _run_process(command, context)
@@ -505,33 +534,177 @@ def _join_remaining(
         temporary.unlink(missing_ok=True)
 
 
+def _video_timing(video: Path, context: RunContext) -> dict[str, float]:
+    ffprobe = shutil.which('ffprobe')
+    if ffprobe:
+        result = _run_process([ffprobe, '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration,avg_frame_rate,width,height', '-of', 'json', str(video)], context)
+        try:
+            stream = json.loads(result.stdout)['streams'][0]
+            numerator, denominator = str(stream['avg_frame_rate']).split('/')
+            fps = float(numerator) / float(denominator)
+            duration = float(stream.get('duration', 0))
+            if result.returncode == 0 and fps > 0 and duration > 0:
+                return {'fps': fps, 'duration': duration, 'width': int(stream['width']), 'height': int(stream['height'])}
+        except (KeyError, IndexError, TypeError, ValueError, ZeroDivisionError):
+            pass
+    import cv2
+    capture = cv2.VideoCapture(str(video))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        frames = float(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        width, height = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    if fps <= 0 or frames <= 0 or width <= 0 or height <= 0:
+        raise RuntimeError(f'无法验证裁剪结果的视频轨道：{video.name}')
+    return {'fps': fps, 'duration': frames / fps, 'width': width, 'height': height}
+
+
+def _validate_precise_output(output: Path, expected: float, source: dict[str, float], context: RunContext, segments=1):
+    timing = _video_timing(output, context)
+    # Fractional boundaries can only select existing frames. Each kept segment
+    # contributes at most one source-frame rounding interval for CFR video.
+    tolerance = max(0.02, segments / source['fps'] + 0.005)
+    if (timing['width'], timing['height']) != (source['width'], source['height']):
+        raise RuntimeError('裁剪结果分辨率校验失败，原视频未修改。')
+    if abs(timing['duration'] - expected) > tolerance:
+        raise RuntimeError(f"裁剪结果时间校验失败：期望{expected:.6f}秒，实际视频轨道{timing['duration']:.6f}秒，容差{tolerance:.6f}秒；原视频未修改。")
+    context.report(f"时间校验：期望 {expected:.6f} 秒，实际视频轨道 {timing['duration']:.6f} 秒（帧级容差 {tolerance:.6f} 秒）。")
+    return timing['duration']
+
+
+def _source_signature(video: Path):
+    state = video.stat()
+    return state.st_dev, state.st_ino, state.st_size, state.st_mtime_ns
+
+
+def _replace_video(ffmpeg: str, video: Path, duration: float, context: RunContext):
+    """Encode away from the source, validate, copy a recoverable backup, then atomically commit."""
+    with _claim_source(video):
+        signature = _source_signature(video)
+        source = _video_timing(video, context)
+        remove = context.parameters.get('clip_mode') == REMOVE_MODE
+        if remove:
+            kept, removed, adjusted = remaining_ranges(parse_removal_ranges(context.parameters.get('remove_time_ranges')), duration)
+            if adjusted:
+                raise ValueError('删除区间超出视频时长，原位精确裁剪不会自动截断；请修改时间。')
+        else:
+            start, end, clamped = _configured_range(context.parameters, duration)
+            if clamped:
+                raise ValueError('结束时间超出视频时长，原位精确裁剪不会自动截断；请修改时间或留空到结尾。')
+            kept, removed = [(start, end)], []
+        expected = sum(end-start for start, end in kept)
+        context.report(f'原位裁剪 {video.name}：保留 {kept}，预计 {expected:.6f} 秒。')
+        with tempfile.TemporaryDirectory(prefix='.video_clip_staging_', dir=video.parent) as temporary:
+            staging = Path(temporary)
+            output = (_join_remaining(ffmpeg, video, staging, kept, duration, PRECISE_MODE, context, 'replacement')
+                      if remove else _clip_one(ffmpeg, video, staging, kept[0][0], kept[0][1], PRECISE_MODE, context, output_name='replacement'))
+            if output.suffix.lower() != video.suffix.lower():
+                remuxed = staging / f'replacement{video.suffix.lower()}'
+                container = {'.mkv': 'matroska', '.mov': 'mov', '.m4v': 'ipod'}[video.suffix.lower()]
+                completed = _run_process([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(output),
+                    '-map', '0', '-c', 'copy', '-f', container, str(remuxed)], context)
+                if completed.returncode != 0:
+                    raise RuntimeError(f'无法保持原视频容器格式，原视频未修改：{completed.stderr.strip()}')
+                output = remuxed
+            actual = _validate_precise_output(output, expected, source, context, len(kept))
+            context.report('正在完整解码验证裁剪结果，验证通过后才会备份并替换原视频。')
+            completed = _run_process([ffmpeg, '-hide_banner', '-loglevel', 'error', '-xerror', '-i', str(output),
+                '-map', '0:v:0', '-an', '-f', 'null', '-'], context)
+            if completed.returncode != 0:
+                raise RuntimeError('裁剪结果完整解码校验失败，原视频未修改。')
+            context.check_cancelled()
+            if _source_signature(video) != signature:
+                raise RuntimeError('处理期间原视频被其他程序修改，已取消替换。')
+            backup_root = video.parent / '.video_clip_backups'
+            if backup_root.is_symlink():
+                raise ValueError('备份目录不能是符号链接，原视频未修改。')
+            backup_root.mkdir(exist_ok=True)
+            backup_dir = Path(tempfile.mkdtemp(prefix=datetime.now().strftime('%Y%m%d_%H%M%S_'), dir=backup_root))
+            backup = backup_dir / video.name
+            try:
+                with video.open('rb') as source_stream, backup.open('xb') as target:
+                    while chunk := source_stream.read(8 * 1024 * 1024):
+                        context.check_cancelled()
+                        target.write(chunk)
+                    target.flush()
+                    os.fsync(target.fileno())
+                shutil.copystat(video, backup)
+                context.check_cancelled()
+                if _source_signature(video) != signature:
+                    raise RuntimeError('备份期间原视频被其他程序修改，已取消替换。')
+                with output.open('rb+') as stream:
+                    os.fsync(stream.fileno())
+                output.chmod(video.stat().st_mode & 0o777)
+            except BaseException:
+                backup.unlink(missing_ok=True)
+                backup_dir.rmdir()
+                raise
+            output_size = output.stat().st_size
+            # Do not check cancellation between commit and recording its result:
+            # a completed atomic replacement must remain reported as completed.
+            context.report(f'原视频完整备份已保存：{backup}')
+            context.check_cancelled()
+            try:
+                output.replace(video)
+            except OSError as exc:
+                raise RuntimeError(f'原视频替换失败，原文件保留，完整备份位于 {backup}：{exc}') from exc
+            context.report(f'原视频已安全替换：{video}；原始备份：{backup}')
+            return {'video': str(video), 'output': str(video), 'backupFile': str(backup),
+                'saveMode': REPLACE_SOURCE, 'encodingMode': PRECISE_MODE, 'clipMode': context.parameters.get('clip_mode'),
+                'keptRanges': [{'startSec': start, 'endSec': end} for start, end in kept],
+                'removedRanges': [{'startSec': start, 'endSec': end} for start, end in removed],
+                'durationSec': expected, 'actualDurationSec': actual, 'sourceDurationSec': duration,
+                'sourceSizeBytes': signature[2], 'outputSizeBytes': output_size}
+
+
 def run_video_clip(context: RunContext) -> dict[str, Any]:
-    custom_name = _configured_output_name(context.parameters.get("clip_output_name", ""))
+    save_mode = context.parameters.get('clip_save_mode', SAVE_AS)
+    if save_mode not in {SAVE_AS, REPLACE_SOURCE}:
+        raise ValueError('请选择有效的视频保存方式。')
+    replace_source = save_mode == REPLACE_SOURCE
+    if replace_source and context.parameters.get('clip_replace_confirmed') is not True:
+        raise ValueError('替换原视频前必须确认；请在界面点击运行并确认替换操作。')
+    custom_name = '' if replace_source else _configured_output_name(context.parameters.get("clip_output_name", ""))
     videos = _resolve_videos(context)
+    if replace_source:
+        if context.parameters.get('split_train_test') and context.parameters.get('clip_mode') != REMOVE_MODE:
+            raise ValueError('替换原视频不能同时拆分训练/测试集，请选择另存为新视频。')
+        if (context.paths.get('video_file') and context.paths['video_file'].is_symlink()) or any(video.is_symlink() for video in videos):
+            raise ValueError('原位裁剪不支持符号链接，请选择实际视频文件或另存为新视频。')
+        if any(video.suffix.lower() not in {'.mp4', '.m4v', '.mov', '.mkv'} for video in videos):
+            raise ValueError('原位精确裁剪支持 MP4、M4V、MOV、MKV；其他容器请另存为新 MP4。')
     ffmpeg = _find_ffmpeg()
     encoding_mode = str(context.parameters.get("encoding_mode", COPY_MODE))
     encoding_mode = LEGACY_ENCODING_MODES.get(encoding_mode, encoding_mode)
     if encoding_mode not in ENCODING_MODES:
         raise ValueError("请选择有效的裁剪处理方式。")
+    exact_time = replace_source or context.parameters.get('clip_exact_time', False) is True
+    if exact_time:
+        encoding_mode = PRECISE_MODE
     remove_mode = context.parameters.get("clip_mode") == REMOVE_MODE
     removal = parse_removal_ranges(context.parameters.get("remove_time_ranges")) if remove_mode else []
     split_train_test = not remove_mode and bool(context.parameters.get("split_train_test", False))
 
-    output_root = context.paths.get("output_folder")
+    output_root = None if replace_source else context.paths.get("output_folder")
     if output_root:
         output_root = output_root.expanduser().resolve()
         output_root.mkdir(parents=True, exist_ok=True)
 
-    context.report(f"找到 {len(videos)} 个视频，处理方式：{encoding_mode}")
+    context.report(f"找到 {len(videos)} 个视频，保存方式：{save_mode}；处理方式：{encoding_mode}")
+    if encoding_mode == PRECISE_MODE:
+        context.report('按原视频帧时间戳选择 [开始, 结束) 范围；精确到现有视频帧，不按关键帧取整。重新编码保持原分辨率，不保证文件体积与原视频相同。')
     if custom_name:
         context.report(f"自定义保存名称：{custom_name}。批量追加原视频名，训练/测试追加 train/test，同名结果自动加序号。")
-    if remove_mode:
+    if remove_mode and not replace_source:
         context.report("删除时间均以原视频时间轴为准；重叠/相邻区间自动合并，剩余片段按原顺序拼成一个新视频，原视频不修改。")
     if split_train_test:
         context.report("已开启训练集/测试集拆分：指定时间段输出到 train，其余片段合并后输出到 test。")
     if encoding_mode == COPY_MODE:
         context.report("将直接复制原视频编码流，不改变分辨率、码率和画质；裁剪起点会对齐到附近的关键帧。")
     outputs: list[Path] = []
+    backups: list[str] = []
     details: list[dict[str, Any]] = []
     failures: list[dict[str, str]] = []
     successful_videos = 0
@@ -541,9 +714,19 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         staging_dir: Path | None = None
         try:
             context.check_cancelled()
-            video_duration = _probe_duration(video, context)
+            source_timing = _video_timing(video, context) if encoding_mode == PRECISE_MODE else None
+            video_duration = source_timing['duration'] if source_timing else _probe_duration(video, context)
+            if replace_source:
+                detail = _replace_video(ffmpeg, video, video_duration, context)
+                outputs.append(video)
+                backups.append(detail['backupFile'])
+                details.append(detail)
+                successful_videos += 1
+                continue
             if remove_mode:
                 kept, removed, adjusted = remaining_ranges(removal, video_duration)
+                if adjusted and exact_time:
+                    raise ValueError('删除时间段超出视频时长，精确时间模式不会自动截断，请修改时间。')
                 if adjusted:
                     context.report(f"[{index}/{len(videos)}] {video.name}：超出视频结尾的区间已截断或忽略。")
                 kept_duration = sum(end - start for start, end in kept)
@@ -553,6 +736,7 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 output = _join_remaining(ffmpeg, video, parent, kept, video_duration, encoding_mode, context,
                                          _named_output_stem(custom_name, video, len(videos) > 1))
                 created_for_video.append(output)
+                actual_duration = _validate_precise_output(output, kept_duration, source_timing, context, len(kept)) if source_timing else None
                 source_size, output_size = video.stat().st_size, output.stat().st_size
                 outputs.append(output)
                 successful_videos += 1
@@ -562,10 +746,13 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                     "keptRanges": [{"startSec": start, "endSec": end} for start, end in kept],
                     "durationSec": kept_duration, "sourceDurationSec": video_duration,
                     "encodingMode": encoding_mode, "sourceSizeBytes": source_size, "outputSizeBytes": output_size,
+                    'actualDurationSec': actual_duration, 'saveMode': SAVE_AS,
                 })
                 context.report(f"[{index}/{len(videos)}] 完成：{output.name}，输出 {output_size / 1024 / 1024:.1f} MB")
                 continue
             start, end, clamped = _configured_range(context.parameters, video_duration)
+            if clamped and exact_time:
+                raise ValueError('结束时间超出视频时长，精确时间模式不会自动截断；请修改时间或留空到结尾。')
             if clamped:
                 context.report(f"[{index}/{len(videos)}] {video.name}：结束位置超出视频，已自动截到结尾")
             context.report(
@@ -591,13 +778,17 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 ]
                 if not test_ranges:
                     raise ValueError("指定训练片段覆盖了整个视频，没有剩余内容可生成测试集视频。")
-                staging_dir = Path(tempfile.mkdtemp(prefix=".video_split_parts_", dir=test_parent))
-                parts = [
-                    _clip_one(ffmpeg, video, staging_dir, part_start, part_end, encoding_mode, context, f"part{part_index}")
-                    for part_index, (part_start, part_end) in enumerate(test_ranges, 1)
-                ]
-                context.report(f"[{index}/{len(videos)}] 正在合并 {len(parts)} 个剩余片段为测试集视频")
-                _concat_clips(ffmpeg, parts, test_output, context)
+                if encoding_mode == PRECISE_MODE:
+                    test_output = _join_remaining(ffmpeg, video, test_parent, test_ranges, video_duration, encoding_mode, context,
+                        _named_output_stem(custom_name, video, len(videos) > 1, 'test'))
+                else:
+                    staging_dir = Path(tempfile.mkdtemp(prefix=".video_split_parts_", dir=test_parent))
+                    parts = [
+                        _clip_one(ffmpeg, video, staging_dir, part_start, part_end, encoding_mode, context, f"part{part_index}")
+                        for part_index, (part_start, part_end) in enumerate(test_ranges, 1)
+                    ]
+                    context.report(f"[{index}/{len(videos)}] 正在合并 {len(parts)} 个剩余片段为测试集视频")
+                    _concat_clips(ffmpeg, parts, test_output, context)
                 created_for_video.append(test_output)
                 output_group = [output, test_output]
             else:
@@ -606,6 +797,9 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                                    output_name=_named_output_stem(custom_name, video, len(videos) > 1))
                 created_for_video.append(output)
                 output_group = [output]
+            actual_duration = _validate_precise_output(output, end-start, source_timing, context) if source_timing else None
+            if split_train_test and source_timing:
+                _validate_precise_output(test_output, sum(stop-begin for begin, stop in test_ranges), source_timing, context, len(test_ranges))
             source_size = video.stat().st_size
             output_size = sum(path.stat().st_size for path in output_group)
             outputs.extend(output_group)
@@ -622,6 +816,7 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
                 "encodingMode": encoding_mode,
                 "sourceSizeBytes": source_size,
                 "outputSizeBytes": output_size,
+                'actualDurationSec': actual_duration, 'saveMode': SAVE_AS,
             })
             context.report(
                 f"[{index}/{len(videos)}] 完成："
@@ -645,8 +840,10 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         reason = failures[0]["error"] if failures else "没有生成结果"
         raise RuntimeError(f"所有视频均未成功裁剪：{reason}")
 
-    output_folders = list(dict.fromkeys(str(path.parent) for path in outputs))
+    output_folders = list(dict.fromkeys([*(str(path.parent) for path in outputs), *(str(Path(path).parent) for path in backups)]))
     message = f"视频裁剪完成：成功处理 {successful_videos} 个视频"
+    if replace_source:
+        message += f'，已替换原视频并保留 {len(backups)} 份原始备份'
     if split_train_test:
         message += f"，生成训练集和测试集视频共 {len(outputs)} 个"
     if failures:
@@ -660,6 +857,7 @@ def run_video_clip(context: RunContext) -> dict[str, Any]:
         "outputFolders": output_folders,
         "details": details,
         "failures": failures,
+        'backupFiles': backups, 'saveMode': save_mode,
     }
 
 

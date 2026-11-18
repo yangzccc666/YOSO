@@ -1,5 +1,6 @@
 import { icons } from '../icons'
 import type { WorkflowTodo } from '../workflowTodos'
+import { HelpTip } from './HelpTip'
 
 type Props = {
   items: WorkflowTodo[]
@@ -18,7 +19,7 @@ export function WorkflowTodoPanel({ items, onApply, onDelete }: Props) {
     items.filter((item) => item.status === 'applied').map((item) => item.targetHandlerId),
   )
   return <section className="workflow-todos" aria-label="工作流待办">
-    <div className="workflow-todos-heading"><span><icons.Clock3 size={18} /><strong>工作流待办</strong><em>{items.length}</em></span><small>前置步骤的结果保存在这里，不会自动覆盖当前配置。</small></div>
+    <div className="workflow-todos-heading"><span><icons.Clock3 size={18} /><strong>工作流待办</strong><HelpTip label="工作流待办说明">前置步骤的结果保存在这里，不会自动覆盖当前配置。已应用的待办只会暂时锁定同一个目标功能；其他功能的待办可以立即应用。目标功能成功运行后，该待办会自动删除并解除锁定。</HelpTip><em>{items.length}</em></span></div>
     <div className="workflow-todo-list">{items.map((item) => {
       const sameTargetIsApplied = item.status !== 'applied' && appliedTargets.has(item.targetHandlerId)
       const buttonTitle = sameTargetIsApplied ? '同一目标功能已有待办等待运行；运行成功后即可应用此待办' : undefined
@@ -30,6 +31,5 @@ export function WorkflowTodoPanel({ items, onApply, onDelete }: Props) {
         </div>
       </article>
     })}</div>
-    {appliedTargets.size ? <p className="workflow-todo-hint">已应用的待办只会暂时锁定同一个目标功能；其他功能的待办可以立即应用。目标功能成功运行后，该待办会自动删除并解除锁定。</p> : null}
   </section>
 }

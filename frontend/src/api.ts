@@ -1,13 +1,38 @@
 import type { ConnectionTestResult, FunctionDefinition, PlatformSettings, PlatformTaskStatus, RemoteCredentialStatus, RemoteInferenceStatus, RunHistoryRecord, SshConnectionProfile, StarLabelDetectionResult, WorkingValues, WorkspaceData, YoloConnectionTestResult, YoloTrainingProfile, YoloTrainingProfilesPayload, YoloTrainingSession, YoloTrainingSummary, YoloTrainingValues } from './types'
 import type { StarModel, StarModelHistoryRecord } from './remoteStarModels'
+import { createSetupGuidanceMonitor, SETUP_GUIDANCE_EVENT } from './setupGuidance'
 
+export const getPlatformDependencies = () => request<import('./types').PlatformDependencyReport>('/api/dependencies')
+export const getTensorRTQueue = () => request<import('./types').TensorRTQueueStatus>('/api/tensorrt-build/queue')
+export const enqueueTensorRTBuild = (functionId: string, values: WorkingValues) => request<import('./types').TensorRTQueueSubmission>('/api/tensorrt-build/queue', {
+  method: 'POST', body: JSON.stringify({ functionId, ...values }),
+})
+export const pauseTensorRTQueue = (paused: boolean, parameters?: WorkingValues['parameters']) => request<import('./types').TensorRTQueueStatus>('/api/tensorrt-build/queue/pause', { method: 'POST', body: JSON.stringify({ paused, parameters }) })
+export const clearTensorRTWaiting = () => request<import('./types').TensorRTQueueStatus>('/api/tensorrt-build/queue/clear', { method: 'POST', body: '{}' })
+export const removeTensorRTQueueItem = (id: string, forget = false) => request<import('./types').TensorRTQueueStatus>(`/api/tensorrt-build/queue/${encodeURIComponent(id)}${forget ? '?forget=true' : ''}`, { method: 'DELETE' })
+export const stopTensorRTQueueItem = (id: string) => request<import('./types').TensorRTQueueStatus>(`/api/tensorrt-build/queue/${encodeURIComponent(id)}/stop`, { method: 'POST', body: '{}' })
+export const reconnectTensorRTQueueItem = (id: string, parameters: WorkingValues['parameters']) => request<import('./types').TensorRTQueueStatus>(`/api/tensorrt-build/queue/${encodeURIComponent(id)}/reconnect`, { method: 'POST', body: JSON.stringify({ parameters }) })
+export const discoverTensorRTBuilds = (functionId: string, parameters: WorkingValues['parameters']) => request<import('./types').TensorRTQueueStatus & { message: string }>('/api/tensorrt-build/queue/discover', { method: 'POST', body: JSON.stringify({ functionId, parameters }) })
 export const getStarModelHistory = () => request<{ models: StarModelHistoryRecord[] }>('/api/star-model-history')
 export const saveStarModelHistory = (models: StarModel[]) => request<{ models: StarModelHistoryRecord[] }>('/api/star-model-history', {
   method: 'POST', body: JSON.stringify({ models }),
 })
 export const deleteStarModelHistory = (id: string) => request<{ ok: boolean }>(`/api/star-model-history/${encodeURIComponent(id)}`, { method: 'DELETE' })
 
+export const INFERENCE_VIDEOS_UPDATED_EVENT = 'yolo-inference-videos-updated'
+export const getInferenceVideos = () => request<{ videos: import('./inferenceVideos').InferenceVideoRecord[] }>('/api/inference-video-history')
+export const saveInferenceVideo = (path: string, scene: string, station: string) => request<{ videos: import('./inferenceVideos').InferenceVideoRecord[] }>('/api/inference-video-history', { method: 'POST', body: JSON.stringify({ path, scene, station }) })
+export const deleteInferenceVideo = (id: string) => request<{ ok: boolean }>(`/api/inference-video-history/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
 export const SSH_HISTORY_UPDATED_EVENT = 'yolo-ssh-history-updated'
+
+const observeSetup = createSetupGuidanceMonitor(guide => {
+  window.dispatchEvent(new CustomEvent(SETUP_GUIDANCE_EVENT, { detail: guide }))
+})
+
+export class ApiRequestError extends Error {
+  constructor(message: string, readonly messages: string[]) { super(message) }
+}
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -16,7 +41,8 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   })
   const data = await response.json()
   if (data.code === 'activation_required') window.dispatchEvent(new Event('yolo-activation-required'))
-  if (!response.ok) throw new Error(data.error || '请求失败')
+  observeSetup(url, options?.method || 'GET', response.ok, data)
+  if (!response.ok) throw new ApiRequestError(data.error || '请求失败', Array.isArray(data.messages) ? data.messages : [])
   return data as T
 }
 
@@ -24,6 +50,10 @@ export async function getFunctions(): Promise<FunctionDefinition[]> {
   const data = await request<{ functions: FunctionDefinition[] }>('/api/functions')
   return data.functions
 }
+
+export const previewDedupRegion = (imagesFolder: string, recursive: boolean, folderKey?: string, sampleName?: string) => request<import('./processRegions').RegionPreview>('/api/image-dedup/region-preview', {
+  method: 'POST', body: JSON.stringify({ imagesFolder, recursive, ...(folderKey === undefined ? {} : { folderKey }), ...(sampleName ? { sampleName } : {}) }),
+})
 
 export async function launchXAnyLabeling(): Promise<{ message: string }> {
   return request('/api/apps/xanylabeling/launch', { method: 'POST', body: '{}' })
@@ -40,6 +70,13 @@ export async function launchExternalApp(appId: string): Promise<{ message: strin
 export async function getPlatformSettings(): Promise<PlatformSettings> {
   return request('/api/settings')
 }
+export const getPackageNaming = (line = '', station = '') => request<import('./packageNaming').PackageNamingHistory>(`/api/local-star-package/naming?line=${encodeURIComponent(line)}&station=${encodeURIComponent(station)}`)
+
+export const getWorkClock = () => request<import('./workClock').WorkClockPayload>('/api/work-clock')
+export const getOvertime = () => request<import('./overtime').OvertimeStatus>('/api/overtime')
+export const updateOvertime = (action: string, values: Record<string, unknown>) => request<import('./overtime').OvertimeStatus>(`/api/overtime/${action}`, { method: 'POST', body: JSON.stringify(values) })
+export const saveWorkClock = (settings: import('./workClock').WorkClockSettings) => request<import('./workClock').WorkClockPayload>('/api/work-clock', { method: 'PUT', body: JSON.stringify(settings) })
+export const saveFunctionDefaults = (functionId: string, values: WorkingValues) => request<FunctionDefinition>(`/api/functions/${encodeURIComponent(functionId)}/defaults`, { method: 'PUT', body: JSON.stringify(values) })
 
 export async function savePlatformSettings(settings: PlatformSettings): Promise<PlatformSettings> {
   return request('/api/settings', { method: 'PUT', body: JSON.stringify(settings) })
@@ -133,15 +170,32 @@ export async function detectLocalStarLabels(modelFile: string): Promise<StarLabe
 }
 
 export async function startRemoteInference(values: WorkingValues): Promise<RemoteInferenceStatus> {
-  return request<RemoteInferenceStatus>('/api/remote-inference/start', {
+  const result = await request<RemoteInferenceStatus>('/api/remote-inference/start', {
     method: 'POST',
     body: JSON.stringify(values),
   })
+  window.dispatchEvent(new CustomEvent(INFERENCE_VIDEOS_UPDATED_EVENT, { detail: result.videoHistoryWarning || '' }))
+  return result
 }
 
+export const detectRemoteStarLabels = (modelFile: string) => request<StarLabelDetectionResult>('/api/remote-inference/detect-labels', {
+  method: 'POST', body: JSON.stringify({ modelFile }),
+})
+
 export async function startLocalPTInference(values: WorkingValues): Promise<RemoteInferenceStatus> {
-  return request('/api/local-pt-inference/start', { method: 'POST', body: JSON.stringify(values) })
+  const result = await request<RemoteInferenceStatus>('/api/local-pt-inference/start', { method: 'POST', body: JSON.stringify(values) })
+  if (values.parameters.input_mode !== '图片文件夹检测') window.dispatchEvent(new CustomEvent(INFERENCE_VIDEOS_UPDATED_EVENT, { detail: result.videoHistoryWarning || '' }))
+  return result
 }
+
+export type LocalModelLabels = { labels: string[]; count: number; found: boolean; modelType: string; source: string; message: string }
+export type ExportModelLabels = { labels: string[]; count: number; found: boolean; modelFamily: string; task: string; source: string; message: string }
+export const detectExportModelLabels = (modelFile: string, parameters: WorkingValues['parameters']) => request<ExportModelLabels>('/api/jetson-onnx-export/detect-labels', {
+  method: 'POST', body: JSON.stringify({ modelFile, parameters: { model_family: parameters.model_family, python_path: parameters.python_path, yolov5_repo: parameters.yolov5_repo } }),
+})
+export const detectLocalModelLabels = (modelFile: string) => request<LocalModelLabels>('/api/local-pt-inference/detect-labels', {
+  method: 'POST', body: JSON.stringify({ modelFile }),
+})
 
 export async function getLocalPTInferenceStatus(id: string): Promise<RemoteInferenceStatus> {
   return request(`/api/local-pt-inference/${id}/status`)
@@ -252,14 +306,14 @@ export async function getYoloTrainingSessions(): Promise<YoloTrainingSummary[]> 
   return data.sessions
 }
 
-export async function deleteYoloTrainingSession(sessionId: string): Promise<void> {
-  await request(`/api/yolo-training/sessions/${sessionId}`, { method: 'DELETE' })
+export async function deleteYoloTrainingSession(sessionId: string, forget = false): Promise<void> {
+  await request(`/api/yolo-training/sessions/${encodeURIComponent(sessionId)}${forget ? '?forget=true' : ''}`, { method: 'DELETE' })
 }
 
-export async function stopYoloTraining(sessionId: string): Promise<YoloTrainingSession> {
+export async function stopYoloTraining(sessionId: string, parameters?: YoloTrainingValues): Promise<YoloTrainingSession> {
   return request<YoloTrainingSession>(`/api/yolo-training/${sessionId}/stop`, {
     method: 'POST',
-    body: '{}',
+    body: JSON.stringify({ parameters }),
   })
 }
 

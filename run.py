@@ -53,6 +53,10 @@ def run_web() -> None:
 
 
 def main() -> None:
+    if sys.argv[1:2] == ["--internal-worker"]:
+        from backend.worker_runtime import run_worker
+        run_worker(sys.argv[2:])
+        return
     os.chdir(ROOT)
     build_frontend()
     if "--check" in sys.argv[1:]:
@@ -61,7 +65,33 @@ def main() -> None:
         functions = workspace_payload().get("functions", [])
         if not functions:
             raise RuntimeError("安装包未能加载功能目录。")
+        if "--require-fcitx" in sys.argv[1:]:
+            from PySide6.QtCore import qVersion
+            from desktop_input_method import configure_input_method, private_plugin_root
+
+            os.environ["PROCESSING_VIEW_QT_IM_MODULE"] = "fcitx"
+            report = configure_input_method()
+            expected = private_plugin_root(ROOT, qVersion()).resolve()
+            if not report.plugin or not Path(report.plugin).resolve().is_relative_to(expected):
+                raise RuntimeError("安装包未能加载内置 Fcitx 插件。" + report.describe())
+            print(report.describe())
+        if "--require-ai" in sys.argv[1:]:
+            import importlib
+            from backend.distribution import AI_MODULES, module_present
+            missing = [name for name in AI_MODULES if not module_present(name)]
+            if missing:
+                raise RuntimeError("AI 集成检查未通过，缺少：" + ", ".join(missing))
+            for name in AI_MODULES:
+                try:
+                    importlib.import_module(name)
+                except Exception as exc:
+                    raise RuntimeError(f"AI 集成检查未通过，{name} 无法加载：{exc}") from exc
         print(f"YOLO数据处理平台安装包检查通过：{len(functions)} 个功能。")
+        return
+    if "--dependencies" in sys.argv[1:]:
+        import json
+        from backend.distribution import dependency_report
+        print(json.dumps(dependency_report(), ensure_ascii=False, indent=2))
         return
     if "--web" in sys.argv[1:]:
         run_web()

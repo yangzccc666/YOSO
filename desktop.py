@@ -16,37 +16,72 @@ APP_DISPLAY_NAME = "YOLO数据处理平台"
 APP_PROCESS_NAME = "yolo-data-platform"
 
 
-def configure_linux_input_method() -> str | None:
-    """Use Fcitx's XIM bridge when bundled Qt has no matching Fcitx plugin."""
-    override = os.environ.get("PROCESSING_VIEW_QT_IM_MODULE", "").strip()
-    if override:
-        os.environ["QT_IM_MODULE"] = override
-        return override
-    if not sys.platform.startswith("linux"):
-        return None
-    if os.environ.get("XDG_SESSION_TYPE", "").lower() != "x11":
-        return None
-    current = os.environ.get("QT_IM_MODULE", "").lower()
-    if current not in {"fcitx", "fcitx5"}:
-        return None
+def configure_linux_system_bus() -> None:
+    """Avoid Conda libdbus's build-time prefix; keep explicit user addresses."""
+    if not sys.platform.startswith("linux") or os.environ.get("DBUS_SYSTEM_BUS_ADDRESS"):
+        return
+    for address in ("/run/dbus/system_bus_socket", "/var/run/dbus/system_bus_socket"):
+        try:
+            if Path(address).is_socket():
+                os.environ["DBUS_SYSTEM_BUS_ADDRESS"] = f"unix:path={address}"
+                return
+        except OSError:
+            continue
 
+
+def can_create_opengl_context() -> bool:
+    """Probe after QApplication exists, before WebEngine creates its renderer."""
+    from PySide6.QtGui import QOffscreenSurface, QOpenGLContext
+
+    context = QOpenGLContext()
+    if not context.create():
+        return False
+    surface = QOffscreenSurface()
+    surface.setFormat(context.format())
+    surface.create()
     try:
-        from PySide6.QtCore import QLibraryInfo
+        return surface.isValid() and context.makeCurrent(surface)
+    finally:
+        context.doneCurrent()
+        surface.destroy()
 
-        plugin_root = Path(QLibraryInfo.path(QLibraryInfo.LibraryPath.PluginsPath))
-        input_plugins = plugin_root / "platforminputcontexts"
-        has_native_fcitx = input_plugins.is_dir() and any(input_plugins.glob("*fcitx*.so"))
-    except (ImportError, OSError):
-        has_native_fcitx = False
 
-    if has_native_fcitx:
-        return current
+def configure_desktop_rendering(probe: Callable[[], bool] = can_create_opengl_context) -> str:
+    """Select a working Qt/Chromium renderer without changing AI/CUDA settings."""
+    mode = os.environ.get("PROCESSING_VIEW_RENDERER", "auto").strip().lower() or "auto"
+    if mode not in {"auto", "software", "hardware"}:
+        raise RuntimeError("PROCESSING_VIEW_RENDERER 仅支持 auto、software 或 hardware。")
+    backend = os.environ.get("QT_QUICK_BACKEND", "").strip().lower()
+    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+    software = mode == "software"
+    reason = "手动指定"
+    if mode == "auto":
+        software = backend == "software" or "--disable-gpu" in flags.split()
+        reason = "现有环境配置"
+        # Other platforms and explicitly chosen Vulkan/Metal/etc. retain Qt's
+        # defaults. Linux's default RHI is OpenGL; test it before WebEngine uses it.
+        rhi = os.environ.get("QSG_RHI_BACKEND", "").strip().lower()
+        if not software and sys.platform.startswith("linux") and backend in {"", "rhi"} and rhi in {"", "opengl"}:
+            software = not probe()
+            reason = "OpenGL 上下文不可用"
+    if software:
+        # Both layers need software rendering: disabling only Chromium's GPU
+        # still leaves Qt's RHI trying to create the failing OpenGL context.
+        os.environ["QT_QUICK_BACKEND"] = "software"
+        if "--disable-gpu" not in flags.split():
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = f"{flags} --disable-gpu".strip()
+        return f"软件兼容模式（{reason}）"
+    return "硬件加速模式"
 
-    # Fcitx/Sogou publishes an XIM endpoint through XMODIFIERS. PySide6 ships
-    # a version-matched XIM plugin even when its bundle omits the Fcitx plugin.
-    os.environ.setdefault("XMODIFIERS", "@im=fcitx")
-    os.environ["QT_IM_MODULE"] = "xim"
-    return "xim"
+
+def configure_linux_input_method() -> str | None:
+    """Load a native plugin using this process only; never alter the IME service."""
+    from desktop_input_method import configure_input_method
+
+    report = configure_input_method()
+    if report.describe():
+        print(report.describe(), flush=True)
+    return report.module or None
 
 
 @dataclass
@@ -56,27 +91,80 @@ class DialogRequest:
     error: Exception | None = None
 
 
+def confirm_desktop_close(parent=None) -> bool:
+    """Require explicit consent; Enter/Escape default to keeping the app open."""
+    from PySide6.QtWidgets import QMessageBox
+
+    dialog = QMessageBox(parent)
+    dialog.setWindowTitle("确认关闭平台")
+    dialog.setIcon(QMessageBox.Icon.Question)
+    dialog.setText("确定关闭 YOLO 数据处理平台吗？")
+    dialog.setInformativeText(
+        "本地运行任务和实时推理可能被中断；构建等待队列会保存，重开后默认自动执行（手动暂停或异常除外）。\n"
+        "已在远端独立后台启动的训练和 TensorRT 构建会继续运行，重开后可以重新连接。\n\n"
+        "如需继续使用，请选择“取消”。"
+    )
+    exit_button = dialog.addButton("确认关闭", QMessageBox.ButtonRole.AcceptRole)
+    cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+    dialog.setDefaultButton(cancel_button)
+    dialog.setEscapeButton(cancel_button)
+    dialog.exec()
+    return dialog.clickedButton() is exit_button
+
+
+def handle_desktop_close(event, parent, on_close: Callable[[], None]) -> bool:
+    """Never shut down the server before the close confirmation is accepted."""
+    event.ignore()
+    if not confirm_desktop_close(parent):
+        return False
+    on_close()
+    event.accept()
+    return True
+
+
 def run_desktop(static_dir: Path, port: int = 0) -> int:
+    configure_linux_system_bus()
     input_method = configure_linux_input_method()
-    if input_method:
-        print(f"桌面输入法模式：{input_method}", flush=True)
     try:
         from PySide6.QtCore import QObject, QTimer, QUrl, Signal, Slot, Qt
         from PySide6.QtGui import QCloseEvent
         from PySide6.QtWidgets import (
             QApplication, QFileDialog, QMainWindow, QMessageBox, QStyle, QSystemTrayIcon,
         )
-        from PySide6.QtWebEngineWidgets import QWebEngineView
     except ImportError as exc:
         raise RuntimeError(
             "桌面组件 PySide6 尚未安装，请先运行：pip install -r requirements.txt"
         ) from exc
 
-    server_module = importlib.import_module("backend.server")
-
     # Supplying an ASCII process name prevents Linux taskbars from falling back
     # to an incorrectly decoded Python/terminal process title.
+    # WebEngine is deliberately imported only after checking the graphics stack.
+    # Sharing contexts must be enabled before constructing QApplication.
+    if QApplication.instance() is None:
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication.instance() or QApplication([APP_PROCESS_NAME])
+    if input_method in {"fcitx", "fcitx5"}:
+        from desktop_input_method import fcitx_service_warning
+
+        warning = fcitx_service_warning()
+        if warning:
+            print(f"桌面输入法提示：{warning}", flush=True)
+    renderer = configure_desktop_rendering()
+    print(f"桌面渲染模式：{renderer}", flush=True)
+    if os.environ.get("QT_QUICK_BACKEND") == "software":
+        from PySide6.QtQuick import QQuickWindow
+
+        # QApplication can cache the scene-graph choice before our GL probe.
+        # Set the API as well as the environment, before the first Quick window.
+        QQuickWindow.setSceneGraphBackend("software")
+    try:
+        from PySide6.QtWebEngineWidgets import QWebEngineView
+    except ImportError as exc:
+        raise RuntimeError(
+            "桌面浏览器组件缺失，请重新安装 PySide6 或重新下载完整安装包。"
+        ) from exc
+    server_module = importlib.import_module("backend.server")
+
     app.setApplicationName(APP_PROCESS_NAME)
     app.setApplicationDisplayName(APP_DISPLAY_NAME)
     app.setDesktopFileName(APP_PROCESS_NAME)
@@ -86,10 +174,18 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
         def __init__(self, on_close: Callable[[], None]) -> None:
             super().__init__()
             self._on_close = on_close
+            self._confirming_close = False
 
         def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
-            self._on_close()
-            super().closeEvent(event)
+            if self._confirming_close:
+                event.ignore()
+                return
+            self._confirming_close = True
+            try:
+                if handle_desktop_close(event, self, self._on_close):
+                    super().closeEvent(event)
+            finally:
+                self._confirming_close = False
 
     server = server_module.create_server(port=port, static_dir=static_dir)
     server_thread = threading.Thread(

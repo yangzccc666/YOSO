@@ -14,7 +14,7 @@ from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .handlers import RunContext
@@ -28,8 +28,8 @@ from .task_manager import TaskCancelled
 from .platform_paths import platform_data_dir
 
 
-REMOTE_ULTRALYTICS_SOURCE = "/home/dell/lqy/lqy/code/ultralytics"
-REMOTE_YOLO26_MODEL = f"{REMOTE_ULTRALYTICS_SOURCE}/yolo26n.pt"
+REMOTE_ULTRALYTICS_SOURCE = ""
+REMOTE_YOLO26_MODEL = "yolo26n.pt"
 
 
 DEFAULT_TRAINING_VALUES: dict[str, Any] = {
@@ -87,7 +87,7 @@ DEFAULT_TRAINING_VALUES: dict[str, Any] = {
 
 TRAIN_ARGUMENT_ORDER = [
     "data", "model", "epochs", "patience", "imgsz", "batch", "workers",
-    "device", "project", "run_name",
+    "device", "project", "run_name", "amp",
 ]
 
 INTEGER_RANGES = {
@@ -148,10 +148,7 @@ def automatic_training_run_name(now: datetime | None = None) -> str:
 
 def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = True) -> dict[str, Any]:
     values = {**DEFAULT_TRAINING_VALUES, **{key: raw[key] for key in DEFAULT_TRAINING_VALUES if key in raw}}
-    # This streamlined workflow deliberately pins the source checkout and
-    # pretrained model so saved legacy profiles cannot silently switch them.
-    values["ultralytics_source"] = REMOTE_ULTRALYTICS_SOURCE
-    values["model"] = REMOTE_YOLO26_MODEL
+    # Keep saved per-user paths; new installs use the server's installed package.
     values["task"] = "detect"
     for key, bounds in INTEGER_RANGES.items():
         values[key] = _number(values[key], key, *bounds, integer=True)
@@ -179,8 +176,10 @@ def normalize_training_values(raw: dict[str, Any], *, generate_run_name: bool = 
         values["run_name"] = automatic_training_run_name()
     for key in ("yolo_executable", "ultralytics_source", "task", "data", "model", "project", "optimizer"):
         values[key] = str(values[key]).strip()
-        if not values[key] and (generate_run_name or key not in {"data", "model", "project"}):
+        if not values[key] and key != "ultralytics_source" and (generate_run_name or key not in {"data", "model", "project"}):
             raise ValueError(f"训练参数 {key} 不能为空。")
+        if any(char in values[key] for char in ("\0", "\r", "\n")):
+            raise ValueError(f"训练参数 {key} 不能包含空字符或换行。")
     values["device"] = str(values.get("device", "")).strip()
     if generate_run_name and not values["device"]:
         raise ValueError("训练设备 device 不能为空，请为本次训练手动填写 GPU 编号或 cpu。")
@@ -333,6 +332,7 @@ class TrainingSession:
     error: str | None = None
     result: dict[str, Any] | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
+    monitoring: bool = field(default=False, repr=False)
 
     def add_log(self, message: str) -> None:
         clean = str(message).strip()
@@ -490,9 +490,10 @@ def _check_remote_training_paths(client: Any, values: dict[str, Any]) -> None:
         f"test -f {shlex.quote(str(Path(source_path) / 'pyproject.toml'))} && "
         f"test -f {shlex.quote(str(Path(source_path) / 'ultralytics' / '__init__.py'))}"
     )
-    status, _output, _error = _remote_capture(client, source_check)
-    if status != 0:
-        raise ValueError(f"远程 Ultralytics 源码目录不存在或结构不完整：{source_path}")
+    if source_path:
+        status, _output, _error = _remote_capture(client, source_check)
+        if status != 0:
+            raise ValueError(f"远程 Ultralytics 源码目录不存在或结构不完整：{source_path}")
 
     data_path = str(values["data"])
     status, _output, _error = _remote_capture(client, f"test -f {shlex.quote(data_path)}")
@@ -676,16 +677,36 @@ class RemoteDetached(RuntimeError):
     """Local log connection was lost; the remote tmux job remains independent."""
 
 
+class RemoteTrainingFailed(RuntimeError):
+    """The remote process is confirmed to have exited, not just disconnected."""
+
+
+def _training_failure_message(lines: list[str], exit_code: str | None = None) -> str:
+    detail = f"退出码 {exit_code}" if exit_code else "tmux 会话已结束，未写入退出码"
+    text = "\n".join(lines[-100:])
+    if re.search(r"out\s+of\s+memory|outofmemoryerror|\boom\b|oom[-_ ]?kill|memoryerror|std::bad_alloc", text, re.I):
+        return f"远程 YOLO 训练异常结束（{detail}）；日志包含 OOM／内存或显存不足错误。建议降低 batch 或 imgsz，并检查服务器资源占用。已有权重和日志会保留。"
+    if exit_code == "137":
+        return "远程 YOLO 训练被 SIGKILL 终止（退出码 137）；可能是系统内存不足或外部强制终止，不能仅凭退出码确认 OOM。请检查训练日志及服务器系统日志。"
+    return f"远程 YOLO 训练异常结束（{detail}），请查看训练日志；已有权重和日志会保留。"
+
+
+def _training_directory_shell(raw: str) -> str:
+    if raw.startswith("$HOME/"):
+        return '"$HOME"/' + shlex.quote(raw[6:])
+    if raw.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(raw[2:])
+    if not PurePosixPath(raw).is_absolute() or "\x00" in raw:
+        raise ValueError("远端训练任务目录无效。")
+    return shlex.quote(raw)
+
+
 def _follow_remote_session(client: Any, session: TrainingSession, report: Callable[[str], None], stop_event: threading.Event | None) -> None:
     token = f"yolo-training-{session.id}"
-    directory = session.remote_dir
+    directory = _training_directory_shell(session.remote_dir)
     last_lines: list[str] = []
+    evidence = list(session.logs)[-100:]
     while True:
-        if stop_event is not None and stop_event.is_set():
-            _remote_capture(client, f"tmux send-keys -t {shlex.quote(token)} C-c")
-            time.sleep(0.3)
-            _remote_capture(client, f"tmux kill-session -t {shlex.quote(token)}")
-            raise TaskCancelled("远程训练已手动终止；已有结果保留在服务器。")
         status, output, error = _remote_capture(client, f"cd {directory} && tail -n 500 run.log 2>/dev/null")
         if status == 0:
             lines = output.splitlines()
@@ -693,15 +714,38 @@ def _follow_remote_session(client: Any, session: TrainingSession, report: Callab
             for line in lines[overlap:]:
                 report(line)
             last_lines = lines
+            evidence = (evidence + lines)[-100:]
         status, output, _ = _remote_capture(client, f"test -f {directory}/exit.code && cat {directory}/exit.code")
-        if status == 0:
+        if status == 0 and output.strip():
+            if not output.strip().isdigit():
+                raise RemoteDetached("远端退出状态内容异常，暂时不能确认训练结果，请重新检查。")
             if output.strip() != "0":
-                raise RuntimeError(f"远程 YOLO 训练异常结束（退出码 {output.strip()}），请查看训练日志。")
+                raise RemoteTrainingFailed(_training_failure_message(evidence, output.strip()))
             return
-        status, _, _ = _remote_capture(client, f"tmux has-session -t {shlex.quote(token)} 2>/dev/null")
+        status, _, error = _remote_capture(client, f"tmux has-session -t {shlex.quote(token)}")
+        if status == 1 and "permission denied" not in error.lower():
+            # Exit status may appear between the first read and session probe.
+            code_status, code, _ = _remote_capture(client, f"cat {directory}/exit.code 2>/dev/null")
+            if code_status == 0 and code.strip() == "0":
+                return
+            if code_status == 0 and code.strip() and not code.strip().isdigit():
+                raise RemoteDetached("远端退出状态内容异常，暂时不能确认训练结果。")
+            raise RemoteTrainingFailed(_training_failure_message(evidence, code.strip() if code_status == 0 and code.strip() else None))
         if status != 0:
-            raise RuntimeError("远程 tmux 会话已结束但未写入退出码，请检查远程训练日志。")
-        time.sleep(2)
+            raise RemoteDetached(f"暂时无法检查远端 tmux 状态：{error or status}；不会自动判定训练失败。")
+        # First inspect the existing result: an already OOM-exited task must
+        # not be reclassified as manually stopped merely because Stop was clicked.
+        if stop_event is not None and stop_event.is_set():
+            _remote_capture(client, f"tmux send-keys -t {shlex.quote(token)} C-c")
+            time.sleep(0.3)
+            kill_status, _, kill_error = _remote_capture(client, f"tmux kill-session -t {shlex.quote(token)}")
+            if kill_status:
+                raise RemoteDetached(f"终止命令未确认成功，请重新连接检查：{kill_error or kill_status}")
+            raise TaskCancelled("远程训练已手动终止；已有结果保留在服务器。")
+        if stop_event is not None:
+            stop_event.wait(2)
+        else:
+            time.sleep(2)
 
 
 def run_training(context: RunContext) -> dict[str, Any]:
@@ -762,8 +806,12 @@ class TrainingManager:
             except (KeyError, TypeError, ValueError):
                 continue
 
-    def reconnect(self, session_id: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    def reconnect(self, session_id: str, parameters: dict[str, Any],
+                  on_finished: Callable[[dict[str, Any]], None] | None = None,
+                  *, stop_requested: bool = False) -> dict[str, Any]:
         session = self.get(session_id)
+        if not isinstance(parameters, dict):
+            raise ValueError("SSH 连接参数格式不正确。")
         if not session.remote or not session.remote_dir:
             raise ValueError("该任务不是已启动的远程 tmux 训练。")
         if (str(parameters.get("remote_host", "")).strip(), int(parameters.get("remote_port", 22)),
@@ -775,43 +823,58 @@ class TrainingManager:
             "remember_password": parameters.get("remember_password", True),
         })
         paramiko = RemoteInferenceManager._load_paramiko()
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        try:
-            client.connect(hostname=session.host, port=session.port, username=session.username,
-                           password=connection["password"], look_for_keys=False, allow_agent=False, timeout=12)
-        finally:
-            connection["password"] = ""
-            client.close()
-        if session.status == "disconnected":
-            session.status = "running"
-            session.message = "已重新连接远程 tmux 训练。"
-            def follow() -> None:
-                connected = remote_connection_manager.resolve_connection({
-                    "host": session.host, "port": session.port, "username": session.username,
-                    "password": parameters.get("remote_password", ""), "remember_password": parameters.get("remember_password", True),
-                })
+        with self._lock:
+            if session.status != "disconnected" or session.monitoring:
+                connection["password"] = ""
+                raise ValueError("该任务正在监控或已经结束，请刷新状态，不要重复重连。")
+            session.monitoring = True
+            session.stop_event.clear()
+            if stop_requested:
+                session.stop_event.set()
+            session.status = "stopping" if stop_requested else "running"
+            session.message = "正在连接并检查原训练进程，仍在运行时才执行终止。" if stop_requested else "正在重新连接远程训练，检查日志和最终结果。"
+            session.error, session.finished_at = None, None
+            try:
+                self._save()
+            except Exception:
+                session.monitoring, session.status = False, "disconnected"
+                session.stop_event.clear()
+                connection["password"] = ""
+                raise
+
+        def follow() -> None:
+            ssh = None
+            status, message, error = "disconnected", "", None
+            try:
                 ssh = paramiko.SSHClient()
                 ssh.load_system_host_keys()
                 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                try:
-                    ssh.connect(hostname=session.host, port=session.port, username=session.username,
-                                password=connected["password"], look_for_keys=False, allow_agent=False, timeout=12)
-                    connected["password"] = ""
-                    _follow_remote_session(ssh, session, session.add_log, session.stop_event)
-                    session.status, session.message = "completed", "远程 YOLO 模型训练完成。"
-                except TaskCancelled as exc:
-                    session.status, session.message = "stopped", str(exc)
-                except Exception as exc:
-                    session.status, session.message = "disconnected", f"远程状态暂不可用：{exc}；训练未被停止。"
-                finally:
-                    connected["password"] = ""
+                ssh.connect(hostname=session.host, port=session.port, username=session.username,
+                            password=connection["password"], look_for_keys=False, allow_agent=False,
+                            timeout=12, banner_timeout=12, auth_timeout=12)
+                connection["password"] = ""
+                _follow_remote_session(ssh, session, session.add_log, session.stop_event)
+                status, message = "completed", "远程 YOLO 模型训练完成。"
+            except TaskCancelled as exc:
+                status, message = "stopped", str(exc)
+            except RemoteTrainingFailed as exc:
+                status, message, error = "failed", str(exc), str(exc)
+                session.add_log(f"错误：{exc}")
+            except Exception as exc:
+                message = f"远程状态暂不可用：{exc}；尚未确认训练结果，请重连检查或仅移除本地记录。"
+            finally:
+                connection["password"] = ""
+                if ssh is not None:
                     ssh.close()
-                    if session.status in {"completed", "stopped"}:
-                        session.finished_at = datetime.now().isoformat(timespec="seconds")
-                        self._save()
-            threading.Thread(target=follow, name=f"reconnect-training-{session.id}", daemon=True).start()
+                with self._lock:
+                    session.status, session.message, session.error = status, message, error
+                    session.finished_at = datetime.now().isoformat(timespec="seconds") if status in {"completed", "failed", "stopped"} else None
+                    session.monitoring = False
+                    session.stop_event.clear()
+                    self._save()
+                if status in {"completed", "failed", "stopped"} and on_finished is not None:
+                    on_finished(session.snapshot())
+        threading.Thread(target=follow, name=f"reconnect-training-{session.id}", daemon=True).start()
         return session.snapshot()
 
     def start(self, parameters: dict[str, Any], on_finished: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
@@ -855,6 +918,9 @@ class TrainingManager:
             except RemoteDetached as exc:
                 session.status = "disconnected"
                 session.message = str(exc)
+            except RemoteTrainingFailed as exc:
+                session.status, session.error, session.message = "failed", str(exc), str(exc)
+                session.add_log(f"错误：{exc}")
             except Exception as exc:
                 session.status = "failed"
                 session.error = str(exc)
@@ -862,7 +928,7 @@ class TrainingManager:
                 session.add_log(f"错误：{exc}")
             finally:
                 parameters["remote_password"] = ""
-                session.finished_at = datetime.now().isoformat(timespec="seconds")
+                session.finished_at = datetime.now().isoformat(timespec="seconds") if session.status in {"completed", "failed", "stopped"} else None
                 self._save()
                 if on_finished is not None:
                     on_finished(session.snapshot())
@@ -885,12 +951,13 @@ class TrainingManager:
             raise ValueError("训练任务不存在或已过期。")
         return session
 
-    def delete(self, session_id: str) -> None:
+    def delete(self, session_id: str, *, forget: bool = False) -> None:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise ValueError("训练任务不存在或已被删除。")
-            if session.status not in {"completed", "stopped", "failed"}:
+            if session.monitoring or (session.status not in {"completed", "stopped", "failed"}
+                                      and not (forget and session.status == "disconnected")):
                 raise ValueError("训练尚未结束，请先终止训练并等待停止完成，不能删除运行中的任务记录。")
             del self._sessions[session_id]
             try:
@@ -899,16 +966,21 @@ class TrainingManager:
                 self._sessions[session_id] = session
                 raise
 
-    def stop(self, session_id: str) -> dict[str, Any]:
-        session = self.get(session_id)
-        if session.status in {"completed", "stopped", "failed"}:
-            return session.snapshot()
-        if session.remote and session.status == "disconnected":
-            raise ValueError("远端连接已断开，请先重新连接，再手动终止训练。")
-        session.status = "stopping"
-        session.message = "正在终止训练……"
-        session.stop_event.set()
-        return session.snapshot()
+    def stop(self, session_id: str, parameters: dict[str, Any] | None = None,
+             on_finished: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
+        with self._lock:
+            session = self.get(session_id)
+            if session.status in {"completed", "stopped", "failed"}:
+                return session.snapshot()
+            disconnected = session.remote and session.status == "disconnected"
+            if not disconnected:
+                session.status = "stopping"
+                session.message = "正在终止训练……"
+                session.stop_event.set()
+                return session.snapshot()
+        if parameters is None:
+            raise ValueError("远端连接已断开，请使用“连接并终止任务”，或仅移除本地记录。")
+        return self.reconnect(session_id, parameters, on_finished=on_finished, stop_requested=True)
 
     def stop_all(self) -> None:
         with self._lock:

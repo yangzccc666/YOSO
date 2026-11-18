@@ -1,2 +1,4 @@
-# Optional only when not using the automatically detected Conda yolo26 environment.
-ultralytics>=8.3
+# Optional AI runtime; install in any venv/pip environment and select its Python in settings.
+ultralytics>=8.4,<9
+onnx>=1.16,<2
+onnxruntime>=1.18,<2

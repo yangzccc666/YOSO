@@ -1,4 +1,4 @@
-"""Local PT auto annotation with cancellable, isolated inference."""
+"""Local PT and SSH STAR annotation with shared XML policies."""
 from __future__ import annotations
 
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .handlers import RunContext, register_handler
 from .jetson_onnx_export import _resolve_python
+from .worker_runtime import worker_command
 from .annotation_process import supervise_annotation
 
 
@@ -16,9 +17,13 @@ def run_auto_annotation(context: RunContext) -> dict:
     weights = context.paths.get('weights_file')
     if not folder or not folder.is_dir():
         raise ValueError('请选择存在的本机图片文件夹。')
-    if not weights or not weights.is_file() or weights.suffix.lower() != '.pt':
-        raise ValueError('请选择存在的 PT 模型文件。')
     p = context.parameters
+    mode = p.get('annotation_mode', '本地 PT 标注')
+    if mode not in ('本地 PT 标注', '远程 STAR 标注'):
+        raise ValueError('请选择有效的自动标注模式。')
+    extension = '.star' if mode == '远程 STAR 标注' else '.pt'
+    if not weights or not weights.is_file() or weights.suffix.lower() != extension:
+        raise ValueError(f'请选择存在的本机 {extension} 模型文件。')
     config = {'folder': str(folder.resolve()), 'weights': str(weights.resolve()),
               'recursive': bool(p.get('recursive', True)), 'existing': p.get('existing', '跳过'),
               'empty_xml': bool(p.get('empty_xml', True)), 'device': str(p.get('device') or '').strip()}
@@ -29,7 +34,7 @@ def run_auto_annotation(context: RunContext) -> dict:
         if not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError(f'{field} 必须在 0–1 之间。')
         config[field] = value
-    size = float(p.get('imgsz', 640))
+    size = float(p.get('imgsz', 640)) if mode == '本地 PT 标注' else 640.0
     if not math.isfinite(size) or not size.is_integer() or not 32 <= size <= 4096 or size % 32:
         raise ValueError('推理尺寸必须是 32–4096 范围内的 32 的整数倍。')
     config['imgsz'] = int(size)
@@ -39,13 +44,16 @@ def run_auto_annotation(context: RunContext) -> dict:
             raise ValueError()
     except ValueError:
         raise ValueError('类别编号必须是用逗号分隔的非负整数。') from None
+    if mode == '远程 STAR 标注':
+        from .remote_star_annotation import run_remote_annotation
+        return run_remote_annotation(context, config)
     python = _resolve_python(p.get('python_path'))
     context.report(f'自动标注环境：{python}；XML 保存于原图片旁。')
     context.check_cancelled()
     with tempfile.TemporaryDirectory(prefix='yolo-annotation-') as temp:
         settings = Path(temp) / 'config.json'
         settings.write_text(json.dumps(config, ensure_ascii=False), encoding='utf-8')
-        result = supervise_annotation([str(python), '-u', '-B', str(Path(__file__).with_name('auto_annotation_worker.py')), str(settings)],
+        result = supervise_annotation(worker_command(python, Path(__file__).with_name('auto_annotation_worker.py'), [str(settings)]),
                                      context.report, context.check_cancelled)
     summary = f"生成 {result['written']} 份 XML，{result['objects']} 个目标；空标注 {result['empty']}，跳过 {result['skipped']}，失败 {result['failed']}。"
     context.report(summary)

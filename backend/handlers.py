@@ -18,6 +18,8 @@ class RunContext:
     report: Callable[[str], None]
     stop_event: threading.Event | None = None
     notify: Callable[[str, str], None] | None = None
+    checkpoint: Callable[[dict[str, Any]], None] | None = None
+    detach_event: threading.Event | None = None
 
     def check_cancelled(self) -> None:
         if self.stop_event is not None and self.stop_event.is_set():

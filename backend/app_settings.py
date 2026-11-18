@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -12,21 +13,23 @@ from pathlib import Path
 from typing import Any
 
 from .platform_paths import platform_config_dir
+from .work_clock import DEFAULT_WORK_CLOCK, calendar_payload, normalize_work_clock
 
 
 APP_DEFINITIONS: dict[str, dict[str, str]] = {
     "xanylabeling": {
         "name": "X-AnyLabeling", "description": "图片标注与人工校正",
-        "executable": "python", "workingDirectory": "", "arguments": "app.py",
-        "condaEnvironment": "xlabel", "condaExecutable": "",
-    },
-    "antigravity": {
-        "name": "Antigravity", "description": "打开本地开发工具",
         "executable": "", "workingDirectory": "", "arguments": "",
         "condaEnvironment": "", "condaExecutable": "",
     },
 }
 _ALLOWED_FIELDS = {"executable", "workingDirectory", "arguments", "condaEnvironment", "condaExecutable"}
+_APP_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
+
+
+def _app_defaults(app_id):
+    return {"name": "Antigravity" if app_id == "antigravity" else "", "description": "",
+            **{key: "" for key in _ALLOWED_FIELDS}, **APP_DEFINITIONS.get(app_id, {})}
 
 
 def _expand_path(value: str) -> Path:
@@ -76,40 +79,89 @@ class AppSettingsStore:
         with self._lock:
             saved = self._load()
             apps = []
-            for app_id, defaults in APP_DEFINITIONS.items():
-                apps.append({"id": app_id, **defaults, **saved.get(app_id, {})})
-            return {"externalApps": apps, "configFile": str(self.storage_file)}
+            for app_id, values in saved.items():
+                if _APP_ID.fullmatch(app_id) and isinstance(values, dict):
+                    apps.append({"id": app_id, **_app_defaults(app_id),
+                                 **{key: str(value) for key, value in values.items()
+                                    if key in _ALLOWED_FIELDS | {"name", "description"}}})
+            return {"externalApps": apps, "configFile": str(self.storage_file), "aiPython": self._ai_python()}
+
+    def _ai_python(self) -> str:
+        try:
+            raw = json.loads(self.storage_file.read_text(encoding="utf-8"))
+            return str(raw.get("aiPython", "")).strip() if isinstance(raw, dict) else ""
+        except (OSError, json.JSONDecodeError):
+            return ""
+
+    def _document(self) -> dict[str, Any]:
+        try:
+            raw = json.loads(self.storage_file.read_text(encoding="utf-8"))
+            return raw if isinstance(raw, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def work_clock_payload(self) -> dict[str, Any]:
+        with self._lock:
+            try:
+                settings = normalize_work_clock(self._document().get("workClock", {}))
+            except ValueError:
+                settings = deepcopy(DEFAULT_WORK_CLOCK)
+            return {"settings": settings, "calendar": calendar_payload()}
+
+    def update_work_clock(self, raw: dict[str, Any]) -> dict[str, Any]:
+        settings = normalize_work_clock(raw)
+        with self._lock:
+            document = self._document()
+            # Migrate the historical app-id-at-root form without losing paths.
+            if "externalApps" not in document:
+                document = {"externalApps": {key: document[key] for key in (*APP_DEFINITIONS, 'antigravity') if key in document},
+                            "aiPython": document.get("aiPython", "")}
+            document["workClock"] = settings
+            self._write_document(document)
+            return self.work_clock_payload()
 
     def update(self, raw: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("本机设置格式不正确。")
         apps = raw.get("externalApps")
-        if not isinstance(apps, list):
+        if not isinstance(apps, list) or len(apps) > 40:
             raise ValueError("外部工具设置格式不正确。")
         normalized: dict[str, dict[str, str]] = {}
         for item in apps:
             if not isinstance(item, dict):
-                continue
+                raise ValueError("外部工具设置格式不正确。")
             app_id = str(item.get("id", "")).strip()
-            if app_id not in APP_DEFINITIONS:
-                continue
+            if not _APP_ID.fullmatch(app_id):
+                raise ValueError("外部工具 ID 只能包含字母、数字、横线和下划线，长度不超过64。")
+            if app_id in normalized:
+                raise ValueError("外部工具 ID 重复，请重新添加工具。")
             values: dict[str, str] = {}
-            for key in _ALLOWED_FIELDS:
-                value = str(item.get(key, "")).strip()
-                if "\x00" in value:
-                    raise ValueError("外部工具设置不能包含空字符。")
+            for key in _ALLOWED_FIELDS | {'name', 'description'}:
+                value = str(item.get(key, _app_defaults(app_id).get(key, ""))).strip()
+                maximum = 80 if key == 'name' else 300 if key == 'description' else 8192
+                if "\x00" in value or len(value) > maximum or (key != 'arguments' and ('\n' in value or '\r' in value)):
+                    raise ValueError("外部工具设置包含无效字符或内容过长。")
                 values[key] = value
+            if not values['name']:
+                raise ValueError("请填写外部工具的显示名称。")
             normalized[app_id] = values
-        self._save(normalized)
+        ai_python = str(raw.get("aiPython", self._ai_python())).strip()
+        if "\x00" in ai_python or "\n" in ai_python or "\r" in ai_python:
+            raise ValueError("AI Python 路径包含无效字符。")
+        self._save(normalized, ai_python)
         return self.payload()
 
     def launch(self, app_id: str) -> dict[str, str]:
-        if app_id not in APP_DEFINITIONS:
+        if not isinstance(app_id, str) or not _APP_ID.fullmatch(app_id):
             raise ValueError("未知的外部工具。")
         with self._lock:
+            settings = next((item for item in self.payload()["externalApps"] if item["id"] == app_id), None)
+            if settings is None:
+                raise ValueError("外部工具未配置或已删除，请在本机设置中添加并保存。")
             process = self._processes.get(app_id)
-            name = APP_DEFINITIONS[app_id]["name"]
+            name = settings['name']
             if process is not None and process.poll() is None:
                 return {"message": f"{name} 已启动，请切换到其窗口。"}
-            settings = next(item for item in self.payload()["externalApps"] if item["id"] == app_id)
             executable_value = str(settings["executable"]).strip()
             environment_name = str(settings["condaEnvironment"]).strip()
             executable_path = _expand_path(os.path.expandvars(executable_value))
@@ -154,20 +206,34 @@ class AppSettingsStore:
 
     def _load(self) -> dict[str, dict[str, str]]:
         if not self.storage_file.is_file():
-            return {}
+            return {key: {} for key in APP_DEFINITIONS}
         try:
             content = json.loads(self.storage_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {}
+            return {key: {} for key in APP_DEFINITIONS}
         if not isinstance(content, dict):
-            return {}
+            return {key: {} for key in APP_DEFINITIONS}
         apps = content.get("externalApps", content)
-        return deepcopy(apps) if isinstance(apps, dict) else {}
+        if content.get('externalAppsVersion') == 2:
+            return deepcopy(apps) if isinstance(apps, dict) else {}
+        # Older versions always injected Antigravity. Hide that legacy entry
+        # without modifying the source file or the user's X-AnyLabeling paths.
+        return {key: deepcopy(apps.get(key, {})) if isinstance(apps, dict) else {} for key in APP_DEFINITIONS}
 
-    def _save(self, apps: dict[str, dict[str, str]]) -> None:
+    def _save(self, apps: dict[str, dict[str, str]], ai_python: str = "") -> None:
+        with self._lock:
+            document = self._document()
+            if document.get('externalAppsVersion') != 2:
+                previous = document.get('externalApps', document)
+                if isinstance(previous, dict) and isinstance(previous.get('antigravity'), dict):
+                    document.setdefault('hiddenLegacyExternalApps', {})['antigravity'] = previous['antigravity']
+            document.update({"externalApps": apps, "externalAppsVersion": 2, "aiPython": ai_python})
+            self._write_document(document)
+
+    def _write_document(self, document: dict[str, Any]) -> None:
         self.storage_file.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.storage_file.with_suffix(".tmp")
-        temporary.write_text(json.dumps({"externalApps": apps}, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.storage_file)
 
 

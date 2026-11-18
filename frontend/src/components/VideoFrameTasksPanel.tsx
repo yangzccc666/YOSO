@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import type { PlatformTaskStatus } from '../types'
+import { HelpTip } from './HelpTip'
 
 type Resources = { cpuCount: number; cpuPercent: number | null; availableMemoryMb: number | null; maxWorkers: number; recommendedWorkers: number; activeWorkers: number; warning: string }
 
@@ -23,8 +24,7 @@ export function VideoFrameTasksPanel({ tasks, onStop }: { tasks: PlatformTaskSta
   }, [])
 
   return <section className="workspace-section video-frame-tasks">
-    <div className="section-title"><h2>并行任务与机器资源</h2></div>
-    <p>可修改输入路径或参数后继续启动新任务；相同配置运行中不重复提交。每批的视频并行数按“同时处理的视频数”设置，0 为自动。</p>
+    <div className="section-title"><h2>并行任务与机器资源</h2><HelpTip label="抽帧并行任务说明">可修改输入路径或参数后继续启动新任务；相同配置运行中不重复提交。每批的视频并行数按“同时处理的视频数”设置，0 为自动。</HelpTip></div>
     {resources ? <div className="video-resource-summary" role="status">
       <span>CPU：{resources.cpuCount} 线程{resources.cpuPercent === null ? '' : ` · 占用 ${resources.cpuPercent}%`}</span>
       <span>可用内存：{resources.availableMemoryMb === null ? '未知' : `${(resources.availableMemoryMb / 1024).toFixed(1)} GB`}</span>

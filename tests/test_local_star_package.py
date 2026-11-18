@@ -112,6 +112,12 @@ class LocalStarPackageTests(unittest.TestCase):
         })
         self.assertTrue(any("packaged factory-line-a with 3 labels" in line for line in self.messages))
 
+    def test_blank_template_uses_integrated_template_without_external_toml(self) -> None:
+        result = run_local_star_package(self.context(template_file=""))
+        self.assertEqual(result["labelCount"], 3)
+        self.assertTrue(Path(result["outputFiles"][0]).is_file())
+        self.assertTrue(any("平台内置模板" in line for line in self.messages))
+
     def test_template_render_changes_supported_values_and_preserves_comment(self) -> None:
         config = {
             "title": "new-title", "hardware_name": "TensorRT", "architecture": "Ampere",

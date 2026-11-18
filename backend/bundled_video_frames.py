@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import os
+import json
+import math
+import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -72,12 +77,90 @@ def parse_video_paths(inputs: str | list[str], check_cancelled: Callable[[], Non
 
 def open_video(path: str):
     """Keep each FFmpeg decoder small instead of oversubscribing CPU threads."""
+    options = []
     if hasattr(cv2, "CAP_PROP_N_THREADS"):
-        capture = cv2.VideoCapture(path, cv2.CAP_FFMPEG, [cv2.CAP_PROP_N_THREADS, 1])
-        if capture.isOpened():
-            return capture
-        capture.release()
+        options.extend([cv2.CAP_PROP_N_THREADS, 1])
+    for name, milliseconds in (("CAP_PROP_OPEN_TIMEOUT_MSEC", 10000), ("CAP_PROP_READ_TIMEOUT_MSEC", 15000)):
+        if hasattr(cv2, name):
+            options.extend([getattr(cv2, name), milliseconds])
+    if options:
+        try:
+            capture = cv2.VideoCapture(path, cv2.CAP_FFMPEG, options)
+            if capture.isOpened():
+                return capture
+            capture.release()
+        except cv2.error:
+            pass  # Older OpenCV backends may reject optional open parameters.
     return cv2.VideoCapture(path)
+
+
+def _stream_frame_count(path: str, frame_count: int, fps: float,
+                        check_cancelled: Callable[[], None] | None,
+                        report: Callable[[str], None]) -> tuple[int, float]:
+    """Optional stream-only metadata, never the container/audio duration.
+
+    Packaged builds without ffprobe still use bounded sequential decoding.
+    Metadata inspection is cancellable, time-bounded and never changes input.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        report("未发现 ffprobe，使用解码器估算总帧数；以实际可解码范围为准。")
+        return frame_count, fps
+    process = None
+    try:
+        def probe(fields: str, count_packets: bool = False) -> dict[str, Any]:
+            nonlocal process
+            options = ["-count_packets"] if count_packets else []
+            process = subprocess.Popen([ffprobe, "-v", "error", "-select_streams", "v:0", *options,
+                "-show_entries", fields, "-of", "json", path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            deadline = time.monotonic() + 8
+            while True:
+                if check_cancelled:
+                    check_cancelled()
+                try:
+                    stdout, _ = process.communicate(timeout=.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        report("视频流信息检查超时，改用顺序解码，不会按异常元数据反复跳帧。")
+                        return {}
+            if process.returncode:
+                return {}
+            streams = json.loads(stdout).get("streams", [])
+            return streams[0] if streams else {}
+        stream = probe("stream=duration,nb_frames,avg_frame_rate")
+        if not stream:
+            return frame_count, fps
+        if fps <= 0:
+            numerator, denominator = str(stream.get("avg_frame_rate", "0/1")).split("/")
+            fps = float(numerator) / float(denominator)
+        exact = int(stream.get("nb_frames") or 0) if str(stream.get("nb_frames", "")).isdigit() else 0
+        duration = float(stream.get("duration") or 0) if str(stream.get("duration", "")) != "N/A" else 0
+        corrected = exact
+        if corrected <= 0 and math.isfinite(duration) and duration > 0 and fps > 0:
+            if frame_count <= 0 or abs(frame_count / fps - duration) > max(1.0, duration * .02):
+                corrected = math.ceil(duration * fps - 1e-6)
+                # NVR MP4 files may also contain timestamp gaps, so duration ×
+                # FPS can still overshoot. Demux sample packets only for these
+                # suspicious files; this does not decode or change the video.
+                report("发现视频时长元数据不一致，正在核对视频流采样数量（不重新编码）。")
+                counted = probe("stream=nb_read_packets", count_packets=True)
+                raw_count = str(counted.get("nb_read_packets", ""))
+                if raw_count.isdigit() and int(raw_count) > 0:
+                    corrected = int(raw_count)
+        if corrected > 0 and corrected != frame_count:
+            report(f"视频流校正：总帧数 {frame_count} → {corrected}；仅采用视频轨道信息，不采用容器总时长。")
+            frame_count = corrected
+        return frame_count, fps
+    except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError, AttributeError, OverflowError):
+        report("视频流元数据不可用，使用顺序解码，并在无法继续读取时及时结束。")
+        return frame_count, fps
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
 
 
 def vedio2img(
@@ -98,6 +181,7 @@ def vedio2img(
     background_fps: float = 5,
     check_cancelled: Callable[[], None] | None = None,
     report_progress: Callable[[int, int], None] | None = None,
+    report_status: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     Path(images_save_path).mkdir(parents=True, exist_ok=True)
     capture = open_video(vedio_path)
@@ -105,11 +189,16 @@ def vedio2img(
         capture.release()
         print(f"无法打开视频文件: {vedio_path}")
         return None
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
     prefix = str(filename_prefix or Path(vedio_path).stem)
     mixed = bool(priority_ranges)
     try:
+        raw_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_count = max(0, int(raw_count)) if math.isfinite(raw_count) else 0
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if not math.isfinite(source_fps) or source_fps < 0:
+            source_fps = 0.0
+        emit = report_status or (lambda _message: None)
+        frame_count, source_fps = _stream_frame_count(vedio_path, frame_count, source_fps, check_cancelled, emit)
         if mixed:
             if source_fps <= 0:
                 raise ValueError("无法读取源视频 FPS，不能使用工序时间段高密度抽帧")
@@ -193,27 +282,71 @@ def vedio2img(
             selected = candidates
 
         success = 0
-        errors = 0
+        read_errors = 0
+        write_errors = 0
+        skipped = 0
+        processed = 0
+        saved_indices: list[int] = []
+        warnings: list[str] = []
+        cursor = -1
+        last_status = 0.0
+        def warn(message: str) -> None:
+            warnings.append(message)
+            emit(message)
+        emit(f"顺序解码已开始，计划抽取 {len(selected)} 张；进度表示已处理计划项，不等于成功保存数量。")
         progress = selected if report_progress is not None else tqdm(selected)
         for position, frame_index in enumerate(progress, start=1):
             if check_cancelled is not None:
                 check_cancelled()
-            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-            ok, frame = capture.read()
-            if not ok or frame is None or frame.size == 0:
-                errors += 1
-                continue
-            time_tag = f"t{round(frame_index * 1000 / source_fps):09d}ms" if source_fps > 0 else "tunknown"
-            image = Path(images_save_path) / f"{prefix}_{filename_tag}_{time_tag}_f{frame_index:08d}.jpg"
-            if cv2.imwrite(str(image), frame):
-                success += 1
+            readable = True
+            # Advance once in source order. grab avoids converting skipped
+            # frames into full RGB arrays and eliminates repeated GOP seeks.
+            while cursor < frame_index:
+                if check_cancelled is not None:
+                    check_cancelled()
+                if not capture.grab():
+                    readable = False
+                    break
+                cursor += 1
+                now = time.monotonic()
+                if now - last_status >= 5:
+                    emit(f"正在顺序解码源帧 {cursor + 1}/{frame_count}；已保存 {success} 张，读取异常 {read_errors} 次，保存失败 {write_errors} 张。")
+                    last_status = now
+            processed = position
+            if not readable:
+                read_errors += 1
+                skipped = len(selected) - position
+                warn(f"在源帧 {cursor + 1} 无法继续解码，可能已提前到结尾或视频存在损坏；已停止本视频的无效读取，保留 {success} 张，剩余 {skipped} 个计划项未执行。")
             else:
-                errors += 1
+                ok, frame = capture.retrieve()
+                if not ok or frame is None or frame.size == 0:
+                    read_errors += 1
+                    if read_errors == 1:
+                        warn(f"源帧 {frame_index} 图像读取失败，将继续后续帧并持续更新进度。")
+                else:
+                    time_tag = f"t{round(frame_index * 1000 / source_fps):09d}ms" if source_fps > 0 else "tunknown"
+                    image = Path(images_save_path) / f"{prefix}_{filename_tag}_{time_tag}_f{frame_index:08d}.jpg"
+                    try:
+                        written = cv2.imwrite(str(image), frame)
+                    except cv2.error:
+                        written = False
+                    if written:
+                        success += 1
+                        saved_indices.append(frame_index)
+                    else:
+                        write_errors += 1
+                        if write_errors == 1:
+                            warn("图片保存失败，请检查输出磁盘空间、目录权限或路径；已保存图片不会删除。")
             if report_progress is not None:
                 report_progress(position, len(selected))
+            if not readable:
+                break
+        emit(f"本视频解码结束：计划 {len(selected)} 张，实际保存 {success} 张，读取异常 {read_errors} 次，保存失败 {write_errors} 张，未执行 {skipped} 项。")
         return {
-            "success_count": success, "error_count": errors, "candidate_count": len(candidates),
-            "selected_frame_indices": selected, "limit_applied": limit_applied,
+            "success_count": success, "error_count": read_errors + write_errors, "candidate_count": len(candidates),
+            "read_error_count": read_errors, "write_error_count": write_errors, "skipped_count": skipped,
+            "planned_count": len(selected), "processed_count": processed, "warnings": warnings,
+            "selected_frame_indices": saved_indices, "planned_frame_indices": selected, "limit_applied": limit_applied,
             "limit_strategy": limit_strategy, "start_frame": start_frame, "end_frame": end_frame,
             "start_time_sec": start_frame / source_fps if source_fps > 0 else 0,
             "end_time_sec": end_frame / source_fps if source_fps > 0 else None,

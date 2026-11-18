@@ -86,6 +86,25 @@ class VideoParallelTests(unittest.TestCase):
         self.assertEqual(len(set(paths)), 24)
         self.assertTrue(all(path.is_dir() for path in paths))
 
+    def test_same_folder_videos_actually_overlap_without_colliding_or_double_counting(self) -> None:
+        self.video("input/first.mp4")
+        self.video("input/second.mp4")
+        barrier = threading.Barrier(2)
+        original = bundled_video_frames.vedio2img
+        def tracked(**arguments):
+            barrier.wait(timeout=5)
+            return original(**arguments)
+        with patch.object(bundled_video_frames, 'vedio2img', side_effect=tracked):
+            result = run_video_frames(self.context(self.root / 'input', folder=True))
+        self.assertEqual(result['imageCount'], 4)
+        self.assertEqual([item['images'] for item in result['details']], [2, 2])
+        self.assertEqual(len(result['outputFolders']), 1)
+        names = [path.name for path in Path(result['outputFolders'][0]).glob('*.jpg')]
+        self.assertEqual(len(names), 4)
+        self.assertEqual(sum('video01_' in name for name in names), 2)
+        self.assertEqual(sum('video02_' in name for name in names), 2)
+        self.assertEqual(self.pool.status()['activeWorkers'], 0)
+
     def test_cancel_one_batch_preserves_its_images_and_other_batch(self) -> None:
         source = self.video("input.mp4")
         stop = threading.Event()

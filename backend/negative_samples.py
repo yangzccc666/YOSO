@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import xml.etree.ElementTree as ET
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +21,11 @@ def _has_voc_object(xml_file: Path) -> bool:
     return any(element.tag.rsplit("}", 1)[-1].lower() == "object" for element in root.iter())
 
 
-def _image_index(source: Path, recursive: bool) -> dict[tuple[Path, str], list[Path]]:
+def _image_index(source: Path, recursive: bool, context: RunContext) -> dict[tuple[Path, str], list[Path]]:
     iterator = source.rglob("*") if recursive else source.iterdir()
     index: dict[tuple[Path, str], list[Path]] = {}
     for path in iterator:
+        context.check_cancelled()
         if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
             continue
         relative_parent = path.parent.relative_to(source)
@@ -33,24 +35,47 @@ def _image_index(source: Path, recursive: bool) -> dict[tuple[Path, str], list[P
 
 def run_extract_negative_samples(context: RunContext) -> dict[str, Any]:
     source = context.paths.get("source_folder")
+    annotations = context.paths.get("xml_folder")
     destination = context.paths.get("negative_folder")
     if source is None or not source.expanduser().is_dir():
-        raise ValueError("请选择包含 JPG 和 XML 的有效输入文件夹。")
+        raise ValueError("请选择包含 JPG/JPEG 图片的有效输入文件夹。")
+    if annotations is not None and not annotations.expanduser().is_dir():
+        raise ValueError("XML 标注文件夹不存在或不是有效文件夹；混放时请留空。")
     if destination is None:
         raise ValueError("请选择负样本图片输出文件夹。")
     source = source.expanduser().resolve()
+    annotations = annotations.expanduser().resolve() if annotations is not None else source
     destination = destination.expanduser().resolve()
-    if destination == source or source in destination.parents:
-        raise ValueError("负样本输出目录不能与输入目录相同，也不能放在输入目录内部。")
+    if any(destination == folder or folder in destination.parents for folder in (source, annotations)):
+        raise ValueError("负样本输出目录不能与图片或 XML 输入目录相同，也不能放在任一输入目录内部。")
+    context.check_cancelled()
     destination.mkdir(parents=True, exist_ok=True)
 
     recursive = bool(context.parameters.get("recursive", False))
-    xml_iterator = source.rglob("*") if recursive else source.iterdir()
-    xml_files = sorted(
-        (path for path in xml_iterator if path.is_file() and path.suffix.lower() == ".xml"),
-        key=lambda path: str(path).casefold(),
-    )
-    images = _image_index(source, recursive)
+    xml_iterator = annotations.rglob("*") if recursive else annotations.iterdir()
+    xml_files = []
+    for path in xml_iterator:
+        context.check_cancelled()
+        if path.is_file() and path.suffix.lower() == ".xml":
+            xml_files.append(path)
+    xml_files.sort(key=lambda path: str(path).casefold())
+    images = _image_index(source, recursive, context)
+    by_stem: dict[str, list[Path]] = {}
+    for (_, stem), paths in images.items():
+        by_stem.setdefault(stem, []).extend(paths)
+    # Build all associations before moving anything. Multiple XML files pointing
+    # to one image must not let an empty XML remove a positively annotated image.
+    matches: dict[Path, list[Path]] = {}
+    for xml_file in xml_files:
+        context.check_cancelled()
+        relative_parent = xml_file.parent.relative_to(annotations)
+        candidates = images.get((relative_parent, xml_file.stem.casefold()), [])
+        if not candidates and annotations != source:
+            candidates = by_stem.get(xml_file.stem.casefold(), [])
+        matches[xml_file] = candidates
+    uses = Counter(paths[0] for paths in matches.values() if len(paths) == 1)
+    context.report(f"目录模式：{'图片与 XML 混放' if annotations == source else '图片与 XML 分开存放'}。")
+    context.report(f"图片目录：{source}；XML 目录：{annotations}")
     context.report(f"找到 {len(xml_files)} 个 XML，正在检查是否包含目标标注。")
 
     moved: list[str] = []
@@ -60,10 +85,11 @@ def run_extract_negative_samples(context: RunContext) -> dict[str, Any]:
 
     for index, xml_file in enumerate(xml_files, 1):
         context.check_cancelled()
-        relative_parent = xml_file.parent.relative_to(source)
-        candidates = images.get((relative_parent, xml_file.stem.casefold()), [])
-        if len(candidates) != 1:
-            reason = "未找到同名 JPG/JPEG" if not candidates else "找到多个同名 JPG/JPEG，无法确定对应图片"
+        candidates = matches[xml_file]
+        if len(candidates) != 1 or uses[candidates[0]] > 1:
+            reason = ("未找到同名 JPG/JPEG" if not candidates else
+                      "找到多个同名 JPG/JPEG，无法确定对应图片" if len(candidates) != 1 else
+                      "多个 XML 对应同一张图片，为避免误删已跳过")
             skipped.append({"xml": str(xml_file), "reason": reason})
             context.report(f"[{index}/{len(xml_files)}] 跳过 {xml_file.name}：{reason}")
             continue
@@ -78,7 +104,7 @@ def run_extract_negative_samples(context: RunContext) -> dict[str, Any]:
             continue
 
         image = candidates[0]
-        target_dir = destination / relative_parent if recursive else destination
+        target_dir = destination / image.parent.relative_to(source) if recursive else destination
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / image.name
         if target.exists():

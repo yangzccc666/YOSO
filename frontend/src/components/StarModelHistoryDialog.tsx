@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { confirmClose } from '../confirmActions'
 import { deleteStarModelHistory, getStarModelHistory, saveStarModelHistory } from '../api'
 import { icons } from '../icons'
 import { matchesStarModelHistory } from '../remoteStarModels'
@@ -11,6 +12,7 @@ type Props = {
 }
 
 export function StarModelHistoryDialog({ currentModels, onSelect, onClose }: Props) {
+  const requestClose = () => { if (confirmClose('历史模型库', '已保存的历史模型记录会保留。')) onClose() }
   const dialogRef = useRef<HTMLDialogElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
   const [records, setRecords] = useState<StarModelHistoryRecord[]>([])
@@ -67,12 +69,12 @@ export function StarModelHistoryDialog({ currentModels, onSelect, onClose }: Pro
 
   const visible = records.filter((record) => matchesStarModelHistory(record, query))
   return <dialog ref={dialogRef} className="history-modal model-history-modal" aria-modal="true" aria-labelledby="star-model-history-title"
-    onCancel={onClose} onClick={(event) => { if (event.target === event.currentTarget) {
+    onCancel={(event) => { event.preventDefault(); requestClose() }} onClick={(event) => { if (event.target === event.currentTarget) {
       const bounds = event.currentTarget.getBoundingClientRect()
-      if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose()
+      if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) requestClose()
     } }}>
     <header><div><h2 id="star-model-history-title">历史模型库</h2><p>启动推理时自动保存 · 长期保留全部模型配置，不受 5 条运行历史限制</p></div>
-      <button type="button" className="icon-button" aria-label="关闭历史模型库" onClick={onClose}><icons.X size={19} /></button></header>
+      <button type="button" className="icon-button" aria-label="关闭历史模型库" onClick={requestClose}><icons.X size={19} /></button></header>
     <div className="model-history-toolbar">
       <label className="model-history-search"><icons.Search size={17} /><input ref={searchRef} type="search" aria-label="搜索历史模型" placeholder="搜索模型文件名、路径或类别名称" value={query} onChange={(event) => { setQuery(event.target.value); setConfirmDelete('') }} /></label>
       <button type="button" disabled={busy || loading} onClick={() => void saveCurrent()}>保存当前配置</button>

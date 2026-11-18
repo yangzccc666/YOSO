@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .run_timing import elapsed_seconds, valid_elapsed
+
 
 class RunHistoryStore:
     LIMIT = 5
@@ -29,6 +31,10 @@ class RunHistoryStore:
             if (record.get("functionId") == "yolo_dataset_split"
                     and str(record.get("name", "")).startswith("YOLO 训练")):
                 record["functionId"] = "yolo_model_training"
+            # Read-time migration only: opening history never rewrites old files.
+            duration = valid_elapsed(record.get("elapsedSeconds"))
+            record["elapsedSeconds"] = duration if duration is not None else elapsed_seconds(
+                record.get("startedAt"), record.get("finishedAt"))
         return records
 
     def _limit_by_function(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -85,6 +91,8 @@ class RunHistoryStore:
     ) -> dict[str, Any]:
         if status not in {"completed", "failed", "stopped"}:
             raise ValueError("只能记录已结束的运行。")
+        finished_at = datetime.now().astimezone().isoformat(timespec="milliseconds")
+        duration = valid_elapsed(task.get("elapsedSeconds"))
         entry = {
             "id": str(task["id"]),
             "functionId": str(task["functionId"]),
@@ -92,7 +100,8 @@ class RunHistoryStore:
             "kind": str(task["kind"]),
             "status": status,
             "startedAt": str(task["startedAt"]),
-            "finishedAt": datetime.now().isoformat(timespec="seconds"),
+            "finishedAt": finished_at,
+            "elapsedSeconds": duration if duration is not None else elapsed_seconds(task.get("startedAt"), finished_at),
             "message": str(message)[:2000],
             "details": {str(key)[:80]: str(value)[:1000] for key, value in (details or {}).items() if str(value).strip()},
             "outputs": [str(value)[:1000] for value in (outputs or []) if str(value).strip()][:20],

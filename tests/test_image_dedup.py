@@ -65,10 +65,10 @@ class ImageDedupTests(unittest.TestCase):
         result = self._run()
         remaining = sorted(self.root.glob("*.jpg"))
         self.assertEqual(result["imageCount"], 30)
-        self.assertEqual(result["keptCount"], 6)
-        self.assertEqual(result["removedCount"], 24)
-        self.assertEqual(len(remaining), 6)
-        self.assertEqual(len(list(self.root.glob("*.txt"))), 6)
+        self.assertEqual(result["keptCount"], 3)
+        self.assertEqual(result["removedCount"], 27)
+        self.assertEqual(len(remaining), 3)
+        self.assertEqual(len(list(self.root.glob("*.txt"))), 3)
         # Every process scene still has at least one representative.
         colors = [cv2.imread(str(path))[50, 105].tolist() for path in remaining]
         self.assertTrue(any(color[1] > 150 for color in colors))
@@ -80,7 +80,7 @@ class ImageDedupTests(unittest.TestCase):
             parameters={"operation": "回滚最近一次"},
             report=lambda _message: None,
         ))
-        self.assertEqual(rollback["restoredCount"], 24)
+        self.assertEqual(rollback["restoredCount"], 27)
         self.assertEqual(len(list(self.root.glob("*.jpg"))), 30)
         self.assertEqual(len(list(self.root.glob("*.txt"))), 30)
 
@@ -96,10 +96,12 @@ class ImageDedupTests(unittest.TestCase):
         (self.root / "process_1.txt").write_text("1 0.5 0.5 0.2 0.2\n", encoding="utf-8")
         (self.root / "process_2.txt").write_text("0 0.5 0.5 0.2 0.2\n", encoding="utf-8")
         result = self._run(minimum_keep_ratio=0.1)
-        self.assertEqual(result["removedCount"], 0)
-        self.assertFalse((self.root.parent / f".{self.root.name}{BACKUP_FOLDER}").exists())
+        self.assertEqual(result["removedCount"], 1)
+        self.assertTrue((self.root / 'process_0.jpg').exists())
+        self.assertTrue((self.root / 'process_1.jpg').exists())
+        self.assertFalse((self.root / 'process_2.jpg').exists())
 
-    def test_strength_changes_how_small_brightness_differences_are_treated(self) -> None:
+    def test_automatic_mode_does_not_depend_on_legacy_strength_or_quotas(self) -> None:
         counts = {}
         base = self._scene(0)
         for strength in ("保守", "平衡（推荐）"):
@@ -118,7 +120,8 @@ class ImageDedupTests(unittest.TestCase):
                 report=lambda _message: None,
             ))
             counts[strength] = result["keptCount"]
-        self.assertGreater(counts["保守"], counts["平衡（推荐）"])
+        self.assertEqual(counts['保守'], counts['平衡（推荐）'])
+        self.assertEqual(counts['保守'], 2)
 
 
 if __name__ == "__main__":

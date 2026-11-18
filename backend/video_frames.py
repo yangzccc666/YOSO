@@ -1,4 +1,4 @@
-"""Adapter for tools/data_processing_toolkit/02-video_processing/batch_vedio2img.py."""
+"""Video extraction backed entirely by the platform's bundled implementation."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ from .video_frame_resources import DEFAULT_WORKER_MEMORY, MIB, resource_pool
 
 
 HANDLER_ID = "video.extract_frames"
+OUTPUT_BY_SOURCE = "按源文件夹分别保存"
+OUTPUT_MERGED = "全部视频合并保存"
+DECODER_HEARTBEAT_SECONDS = 5.0
 def _load_source_module() -> ModuleType:
     from . import bundled_video_frames
     return bundled_video_frames
@@ -132,11 +135,15 @@ def _english_identifier(value: Any, label: str) -> str:
     return identifier
 
 
+def _source_filename_component(name: str) -> str:
+    source = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", name).strip().rstrip(". ")
+    # Leave room for an explicit identifier, sampling tag, timestamps and frame index.
+    return source.encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip(". ") or "video"
+
+
 def _video_filename_identity(video: Path, project: str, scene: str, index: int) -> tuple[str, str, str]:
     """Resolve blank identifiers per video, keeping its original case and Chinese name."""
-    source = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", video.stem).strip().rstrip(". ")
-    # Leave room for an explicit identifier, sampling tag, timestamps and frame index.
-    source = source.encode("utf-8")[:96].decode("utf-8", errors="ignore").rstrip(". ") or "video"
+    source = _source_filename_component(video.stem)
     resolved_project, resolved_scene = project or source, scene or source
     parts = [resolved_project, resolved_scene] if project or scene else [source]
     return resolved_project, resolved_scene, f"{'_'.join(parts)}_video{index:02d}"
@@ -230,6 +237,10 @@ def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
 
 def run_video_frames(context: RunContext) -> dict[str, Any]:
     context.check_cancelled()
+    output_layout = str(context.parameters.get('output_layout', OUTPUT_BY_SOURCE))
+    if output_layout not in {OUTPUT_BY_SOURCE, OUTPUT_MERGED}:
+        raise ValueError('请选择有效的图片保存方式：按源文件夹分别保存或全部视频合并保存。')
+    merge_all = output_layout == OUTPUT_MERGED
     module = _load_source_module()
     videos = _resolve_videos(context, module)
     output_root = context.paths.get("output_folder")
@@ -297,8 +308,19 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         context.report(f"资源提示：设置并行数 {int(requested_workers)}，本次自动限制为 {workers}，避免占用过多 CPU 或内存。")
     context.report(f"本批最多同时处理 {workers} 个视频；所有批次共享资源限额，资源忙时自动等待。")
 
+    source_groups: dict[Path, list[Path]] = {}
+    for video in videos:
+        source_groups.setdefault(video.parent, []).append(video)
+    merged_parent = output_root or videos[0].parent
+    if merge_all:
+        context.report(f'图片保存方式：{OUTPUT_MERGED}。全部 {len(videos)} 个视频共用一个新结果目录，创建于：{merged_parent}；数量上限仍按每个视频计算。')
+    else:
+        context.report(f"图片保存方式：{OUTPUT_BY_SOURCE}。按视频实际所在文件夹分组，共 {len(source_groups)} 组；同一源文件夹中的视频共用一个图片目录，数量上限仍按每个视频计算。")
+
     stop_event = context.stop_event or threading.Event()
     report_lock = threading.RLock()
+    output_lock = threading.Lock()
+    group_outputs: dict[Path | None, Path] = {}
     def report(message: str) -> None:
         with report_lock:
             context.report(message)
@@ -307,7 +329,7 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
 
     def extract(index: int, video: Path) -> dict[str, Any]:
         worker_context.check_cancelled()
-        parent = output_root or video.parent
+        parent = merged_parent if merge_all else output_root or video.parent
         if shutil.disk_usage(parent).free < 256 * MIB:
             raise RuntimeError(f"输出磁盘可用空间不足 256 MB：{parent}。请释放磁盘空间。")
         if mode == "工序时间段高密度":
@@ -322,7 +344,22 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
                 module, video, target_fps, interval_sec, fallback_step,
             )
         video_project, video_scene, english_prefix = _video_filename_identity(video, project_code, scene_code, index)
-        output_folder = _unique_output_folder(parent, f"{english_prefix}_{sampling_tag}")
+        # A None key represents the single merged destination. Reserve it under
+        # the same lock used by source groups so parallel decoders cannot each
+        # create a separate output. Independent batches reserve fresh folders.
+        group_key = None if merge_all else video.parent
+        with output_lock:
+            if group_key not in group_outputs:
+                if merge_all:
+                    group_prefix = '_'.join(part for part in (project_code, scene_code) if part) or 'all_videos'
+                    stem = f'{group_prefix}_frames'
+                elif len(source_groups[video.parent]) == 1:
+                    stem = f"{english_prefix}_{sampling_tag}"
+                else:
+                    group_prefix = "_".join(part for part in (project_code, scene_code) if part) or _source_filename_component(video.parent.name)
+                    stem = f"{group_prefix}_frames"
+                group_outputs[group_key] = _unique_output_folder(parent, stem)
+            output_folder = group_outputs[group_key]
         report(f"[{index}/{len(videos)}] 正在处理：{video}\n输出目录：{output_folder}")
         probe = module.open_video(str(video))
         try:
@@ -332,37 +369,71 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             probe.release()
         memory_estimate = max(DEFAULT_WORKER_MEMORY, width * height * 3 * 16 + 128 * MIB)
         last_progress = 0.0
+        last_activity = time.monotonic()
+        def status(text: str) -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
+            report(f"[{index}/{len(videos)}] {video.name}：{text}")
         def progress(done: int, total: int) -> None:
-            nonlocal last_progress
+            nonlocal last_progress, last_activity
             now = time.monotonic()
+            last_activity = now
             if done == total or now - last_progress >= 1.0:
                 last_progress = now
                 report(f"[{index}/{len(videos)}] {video.name}：{done}/{total} 帧（{done / max(1, total):.0%}）")
                 if shutil.disk_usage(parent).free < 64 * MIB:
                     raise RuntimeError("输出磁盘即将写满，已停止该视频；已生成的图片会保留。")
         with resource_pool.acquire(worker_context, memory_estimate):
-            process_result = module.vedio2img(
-                vedio_path=str(video), images_save_path=str(output_folder),
-                target_fps=target_fps, interval_sec=interval_sec, fallback_step=fallback_step,
-                max_images=max_images, start_time_sec=start_time_sec, end_time_sec=end_time_sec,
-                limit_strategy=limit_strategy, priority_ranges=priority_ranges,
-                priority_fps=priority_fps or 25, background_fps=background_fps or 5,
-                filename_prefix=english_prefix, check_cancelled=worker_context.check_cancelled,
-                report_progress=progress,
-            )
+            finished_decode = threading.Event()
+            def heartbeat() -> None:
+                while not finished_decode.wait(DECODER_HEARTBEAT_SECONDS):
+                    idle = time.monotonic() - last_activity
+                    if idle >= DECODER_HEARTBEAT_SECONDS:
+                        state = "收到终止请求，等待当前解码调用返回" if stop_event.is_set() else "解码器尚未返回，任务线程仍在运行，请勿重复提交"
+                        report(f"[{index}/{len(videos)}] {video.name}：{state}；距上次解码反馈 {idle:.0f} 秒。")
+            monitor = threading.Thread(target=heartbeat, name=f"frame-heartbeat-{index}", daemon=True)
+            monitor.start()
+            try:
+                process_result = module.vedio2img(
+                    vedio_path=str(video), images_save_path=str(output_folder),
+                    target_fps=target_fps, interval_sec=interval_sec, fallback_step=fallback_step,
+                    max_images=max_images, start_time_sec=start_time_sec, end_time_sec=end_time_sec,
+                    limit_strategy=limit_strategy, priority_ranges=priority_ranges,
+                    priority_fps=priority_fps or 25, background_fps=background_fps or 5,
+                    filename_prefix=english_prefix, check_cancelled=worker_context.check_cancelled,
+                    report_progress=progress, report_status=status,
+                )
+            finally:
+                finished_decode.set()
+                monitor.join(timeout=1)
 
         selected_frame_indices = process_result.get("selected_frame_indices", []) if process_result else []
         _ensure_informative_filenames(
             output_folder, video, english_prefix, selected_frame_indices, sampling_tag, source_fps,
         )
-        image_count = len(list(output_folder.glob("*.jpg"))) if output_folder.exists() else 0
+        # A shared directory may already contain frames from other workers.
+        # Never use its total file count to classify/count this video's result.
+        if process_result and "success_count" in process_result:
+            image_count = int(process_result["success_count"])
+        elif process_result:
+            image_count = sum(1 for path in output_folder.iterdir() if path.is_file() and path.suffix.lower() == ".jpg"
+                              and ((not merge_all and len(source_groups[video.parent]) == 1) or path.name.startswith(english_prefix + "_")))
+        else:
+            image_count = 0
         if image_count == 0:
             raise RuntimeError(f"{video.name} 没有成功生成图片，请确认视频可以正常播放。")
-        limit_reached = bool(process_result and process_result.get("limit_applied"))
+        limit_reached = bool(max_images is not None and image_count >= max_images)
         detail = {
             "index": index,
             "video": str(video),
+            "sourceFolder": str(video.parent),
+            "outputLayout": output_layout,
             "images": image_count,
+            "plannedImages": process_result.get("planned_count", image_count) if process_result else image_count,
+            "readErrors": process_result.get("read_error_count", 0) if process_result else 0,
+            "writeErrors": process_result.get("write_error_count", 0) if process_result else 0,
+            "skippedImages": process_result.get("skipped_count", 0) if process_result else 0,
+            "warnings": list(process_result.get("warnings", [])) if process_result else [],
             "maxImages": max_images,
             "limitReached": limit_reached,
             "limitStrategy": limit_strategy,
@@ -427,10 +498,15 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         raise RuntimeError("所有视频均未成功抽帧：" + "；".join(f"{item['video']}：{item['error']}" for item in failures))
     details = sorted(completed, key=lambda item: item["index"])
     total_images = sum(item["images"] for item in details)
-    output_folders = [item["output"] for item in details]
-    message = f"视频切图完成：成功 {len(details)}/{len(videos)} 个视频，共生成 {total_images} 张图片。"
+    output_folders = list(dict.fromkeys(item["output"] for item in details))
+    message = f"视频切图完成：成功 {len(details)}/{len(videos)} 个视频，共生成 {total_images} 张图片，保存到 {len(output_folders)} 个结果文件夹。"
     if failures:
         message += f"失败 {len(failures)} 个，原因已在日志列出；成功结果已保留。"
+    warning_videos = [item for item in details if item["warnings"]]
+    if warning_videos:
+        message += f"其中 {len(warning_videos)} 个视频存在解码或保存异常，未必完成全部计划抽帧，请查看异常汇总。"
+        for item in warning_videos:
+            report(f"异常汇总：{Path(item['video']).name}；计划 {item['plannedImages']} 张，实际保存 {item['images']} 张，读取异常 {item['readErrors']} 次，保存失败 {item['writeErrors']} 张，未执行 {item['skippedImages']} 项。")
 
     return {
         "message": message,
@@ -440,8 +516,11 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         "projectCode": project_code or (details[0]["projectCode"] if len(videos) == 1 else ""),
         "sceneCode": scene_code or (details[0]["sceneCode"] if len(videos) == 1 else ""),
         "outputFolders": output_folders,
+        "sourceFolderCount": len(source_groups),
+        "outputLayout": output_layout,
         "details": details,
         "failedVideos": failures,
+        "warningVideoCount": len(warning_videos),
         "parallelWorkers": workers,
     }
 

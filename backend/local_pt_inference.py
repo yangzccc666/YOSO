@@ -1,4 +1,4 @@
-"""Local Ultralytics PT inference with the same live preview protocol as SSH inference."""
+"""Local PT / ONNX detection with the same live preview protocol as SSH inference."""
 
 from __future__ import annotations
 
@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import uuid
+import importlib.util
+import io
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +23,9 @@ import numpy as np
 from .remote_inference import RemoteInferenceSession, TERMINAL_STATES
 from .handlers import RunContext, register_handler
 from .local_pt_worker import receive as receive_worker_packet, send as send_worker_packet
+from .local_pt_worker import parse_label_text
+from .worker_runtime import worker_command
+from .local_image_dataset import collect_images, read_image, save_image, validate_image_paths
 from .remote_star_worker import (
     capture_frame_index,
     seek_video_frame,
@@ -34,14 +39,42 @@ VIDEO_SUFFIXES = {".mp4", ".avi", ".mov", ".mkv", ".m4v", ".webm", ".ts", ".mts"
 WORKER_SCRIPT = Path(__file__).with_name("local_pt_worker.py")
 
 
+def validate_model_path(value: Any) -> Path:
+    model = Path(str(value or "").strip()).expanduser()
+    if model.suffix.lower() not in {".pt", ".onnx"} or not model.is_file():
+        raise ValueError("请选择存在的本地 .pt 或 .onnx 模型文件。")
+    return model.resolve()
+
+
+def detect_local_model_labels(model_file: str) -> dict[str, Any]:
+    model = validate_model_path(model_file)
+    try:
+        result = subprocess.run(worker_command(_find_yolo_python(), WORKER_SCRIPT, [str(model), "--inspect"]),
+                                capture_output=True, timeout=90, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("读取模型类别超时（90 秒），请检查模型和 AI Python 环境。") from exc
+    try:
+        header, _ = receive_worker_packet(io.BytesIO(result.stdout))
+    except (EOFError, ValueError, OSError) as exc:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()[-1500:]
+        raise ValueError(f"无法读取模型类别：{detail or 'AI 工作进程没有返回有效信息'}") from exc
+    if result.returncode != 0 or header.get("type") != "metadata":
+        raise ValueError(f"读取模型类别失败：{header.get('message', 'AI 工作进程异常')}")
+    return {key: value for key, value in header.items() if key != "type"}
+
+
 def _find_yolo_python() -> Path:
-    override = os.environ.get("PROCESSING_VIEW_YOLO_PYTHON", "").strip()
+    from .app_settings import settings_store
+    override = os.environ.get("PROCESSING_VIEW_YOLO_PYTHON", "").strip() or settings_store.payload().get("aiPython", "")
     if override:
         candidate = Path(override).expanduser()
         if candidate.is_file():
             return candidate.resolve()
         raise RuntimeError(f"指定的 YOLO Python 不存在：{candidate}")
 
+    # Full AI builds and ordinary venv/pip installations need no named conda env.
+    if all(importlib.util.find_spec(name) is not None for name in ("ultralytics", "torch")):
+        return Path(sys.executable).resolve()
     roots = [Path(sys.executable).resolve().parent.parent]
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
@@ -56,8 +89,8 @@ def _find_yolo_python() -> Path:
             if candidate.is_file():
                 return candidate.resolve()
     raise RuntimeError(
-        "平台 Python 缺少 ultralytics/PyTorch，且未找到本机 yolo26 环境。"
-        "请设置 PROCESSING_VIEW_YOLO_PYTHON 为该环境的 python 路径。"
+        "当前版本未内置可用的 Ultralytics/PyTorch。请使用 AI 集成版，"
+        "或在本机设置中选择任意已安装这些库的 Python；不要求使用 conda 或固定环境名。"
     )
 
 
@@ -74,7 +107,7 @@ class _SubprocessYoloModel:
                  worker_script: Path = WORKER_SCRIPT) -> None:
         self._recent_errors: deque[str] = deque(maxlen=12)
         self._process = subprocess.Popen(
-            [str(python_path), "-u", "-B", str(worker_script), model_path],
+            worker_command(python_path, worker_script, [model_path]),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             bufsize=0,
         )
@@ -85,6 +118,9 @@ class _SubprocessYoloModel:
             if header.get("type") != "ready":
                 raise RuntimeError("YOLO 子进程启动响应异常。")
             self.names = header.get("names", {})
+            metadata = header.get("metadata", {})
+            if metadata.get("message"):
+                session.add_log(metadata["message"])
         except Exception:
             self.close()
             raise
@@ -163,17 +199,23 @@ def validate_local_payload(raw: dict[str, Any]) -> dict[str, Any]:
     params = raw.get("parameters", {})
     if not isinstance(paths, dict) or not isinstance(params, dict):
         raise ValueError("本地推理参数格式不正确。")
-    model = Path(str(paths.get("model_file", "")).strip()).expanduser()
-    video = Path(str(paths.get("video_file", "")).strip()).expanduser()
-    if model.suffix.lower() != ".pt" or not model.is_file():
-        raise ValueError("请选择存在的本地 .pt 权重文件。")
-    if video.suffix.lower() not in VIDEO_SUFFIXES or not video.is_file():
-        raise ValueError("请选择存在的本地视频文件。")
+    model = validate_model_path(paths.get("model_file", ""))
+    input_mode = str(params.get("input_mode", "视频检测")).strip() or "视频检测"
+    if input_mode not in {"视频检测", "图片文件夹检测"}:
+        raise ValueError("输入类型请选择视频检测或图片文件夹检测。")
     output_text = str(paths.get("output_folder", "")).strip()
-    output_folder = Path(output_text).expanduser() if output_text else None
-    if output_folder is not None and not output_folder.is_dir():
-        raise ValueError("带框视频输出文件夹不存在。")
-    output = output_folder / f"{video.stem}_detected.mp4" if output_folder is not None else None
+    video = None
+    image_folder = None
+    if input_mode == "图片文件夹检测":
+        image_folder, output_folder = validate_image_paths(str(paths.get("image_folder", "")), output_text)
+    else:
+        video = Path(str(paths.get("video_file", "")).strip()).expanduser()
+        if video.suffix.lower() not in VIDEO_SUFFIXES or not video.is_file():
+            raise ValueError("请选择存在的本地视频文件。")
+        output_folder = Path(output_text).expanduser() if output_text else None
+        if output_folder is not None and not output_folder.is_dir():
+            raise ValueError("带框视频输出文件夹不存在。")
+    output = output_folder / f"{video.stem}_detected.mp4" if output_folder is not None and video is not None else None
     if output is not None:
         if output.exists():
             raise ValueError(f"输出视频已存在：{output}。请更换输出文件夹或移走旧文件，以免覆盖。")
@@ -182,8 +224,15 @@ def validate_local_payload(raw: dict[str, Any]) -> dict[str, Any]:
     device = str(params.get("device", "auto")).strip() or "auto"
     if device != "auto" and device != "cpu" and not device.replace(",", "").isdigit():
         raise ValueError("推理设备请填写 auto、cpu 或 GPU 编号（如 0）。")
+    label_owner = str(params.get("labels_model_file", "")).strip()
+    # Labels copied from model A must never be reused for a newly selected model B.
+    labels = parse_label_text(str(params.get("labels", ""))) if not label_owner or Path(label_owner).expanduser().resolve() == model else []
     return {
-        "model": model.resolve(), "video": video.resolve(), "output": output.resolve() if output else None,
+        "model": model.resolve(), "video": video.resolve() if video else None, "output": output.resolve() if output else None,
+        "input_mode": "images" if image_folder else "video", "image_folder": image_folder,
+        "output_folder": output_folder.resolve() if output_folder else None,
+        "recursive_images": bool(params.get("recursive_images", True)),
+        "labels": labels,
         "conf": _number(params.get("conf", 0.5), "置信度阈值", 0, 1),
         "iou": _number(params.get("iou", 0.45), "NMS IoU 阈值", 0, 1),
         "max_det": int(_number(params.get("max_det", 300), "每帧最大检测框数", 1, 10000)),
@@ -197,11 +246,27 @@ def validate_local_payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 class LocalPTSession(RemoteInferenceSession):
     def __init__(self, session_id: str) -> None:
-        super().__init__(id=session_id, host="本机", username="", status="starting", message="正在加载本地 PT 模型……", stream_prefix="/api/local-pt-inference")
+        super().__init__(id=session_id, host="本机", username="", status="starting", message="正在加载本地 PT / ONNX 模型……", stream_prefix="/api/local-pt-inference")
         self.paused = False
         self.seek_target: float | None = None
         self.seek_frame: int | None = None
         self.worker: subprocess.Popen[bytes] | None = None
+        self.input_mode = "video"
+        self.total_images = 0
+        self.processed_images = 0
+        self.saved_images = 0
+        self.failed_images = 0
+        self.current_image = ""
+        self.output_folder = ""
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.condition:
+            return {**super().snapshot(), "inputMode": self.input_mode, "totalImages": self.total_images,
+                    "processedImages": self.processed_images, "savedImages": self.saved_images,
+                    "failedImages": self.failed_images, "currentImage": self.current_image,
+                    "outputFolder": self.output_folder,
+                    "result": {"outputFolders": [self.output_folder]} if self.input_mode == "images" and self.saved_images else {},
+                    "progressPercent": round(self.processed_images * 100 / self.total_images) if self.total_images else 0}
 
 
 class LocalPTInferenceManager:
@@ -220,6 +285,10 @@ class LocalPTInferenceManager:
     def start(self, raw: dict[str, Any], on_finished: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         config = validate_local_payload(raw)
         session = LocalPTSession(uuid.uuid4().hex[:16])
+        session.input_mode = config["input_mode"]
+        if session.input_mode == "images":
+            session.message = "正在扫描图片文件夹……"
+            session.output_folder = str(config["output_folder"])
         with self._lock:
             self._sessions[session.id] = session
         threading.Thread(target=self._run, args=(session, config, on_finished), name=f"local-pt-{session.id}", daemon=True).start()
@@ -249,6 +318,8 @@ class LocalPTInferenceManager:
 
     def set_paused(self, session_id: str, paused: bool) -> dict[str, Any]:
         session = self.get(session_id)
+        if session.input_mode == "images":
+            raise ValueError("图片批量检测不支持视频播放控制，可使用停止检测按钮终止。")
         if not isinstance(paused, bool):
             raise ValueError("暂停状态必须是布尔值。")
         with session.condition:
@@ -301,17 +372,27 @@ class LocalPTInferenceManager:
         model: Any = None
         output_created = False
         try:
+            images = []
+            if config["input_mode"] == "images":
+                images = collect_images(config["image_folder"], config["output_folder"], config["recursive_images"], session.stop_event)
+                if session.stop_event.is_set():
+                    self._finish_images(session)
+                    return
+                if not images:
+                    raise ValueError("图片文件夹中未找到支持的图片（JPG、JPEG、PNG、BMP、WEBP、TIF、TIFF）。请检查目录或开启包含子文件夹。")
+                with session.condition:
+                    session.total_images = len(images)
+                    session.message = f"找到 {len(images)} 张图片，正在加载模型……"
+                session.add_log(f"图片目录：{config['image_folder']}；共 {len(images)} 张，输出目录：{config['output_folder']}")
             if self._model_factory is None:
-                try:
-                    from ultralytics import YOLO
-                except ImportError:
-                    python_path = _find_yolo_python()
-                    session.add_log(f"平台环境缺少 Ultralytics，自动使用本机环境：{python_path}")
-                    model = _SubprocessYoloModel(python_path, str(config["model"]), session)
-                else:
-                    model = YOLO(str(config["model"]))
+                python_path = _find_yolo_python()
+                session.add_log(f"AI 运行环境：{python_path}")
+                model = _SubprocessYoloModel(python_path, str(config["model"]), session)
             else:
                 model = self._model_factory(str(config["model"]))
+            if config["input_mode"] == "images":
+                self._run_images(session, config, model, images)
+                return
             capture = cv2.VideoCapture(str(config["video"]))
             if not capture.isOpened():
                 raise RuntimeError("无法打开本地视频，请检查视频格式和文件权限。")
@@ -325,6 +406,10 @@ class LocalPTInferenceManager:
                 session.condition.notify_all()
             session.add_log(f"本地模型：{config['model'].name}；视频：{config['video'].name}")
             session.add_log(f"类别：{getattr(model, 'names', '由权重文件提供')}")
+            if config["labels"]:
+                session.add_log(f"本次标签采用填写的类别（按 ID 顺序）：{dict(enumerate(config['labels']))}")
+            if config["model"].suffix.lower() == ".onnx":
+                session.add_log("ONNX 使用 ONNX Runtime；auto 默认 CPU，指定 GPU 时要求已安装可用的 CUDA Execution Provider。")
             if config["realtime"] and fps > 0:
                 session.add_log("实时播放已开启：推理速度不足时会跳过落后的源帧，避免视频变成慢动作。")
             last_preview = 0.0
@@ -391,12 +476,8 @@ class LocalPTInferenceManager:
                     continue
                 source_index = capture_frame_index(capture, after_read=True)
                 position = source_index / fps if frame_target is not None and fps > 0 else video_position_seconds(capture, fps, source_index)
-                kwargs = {"conf": config["conf"], "iou": config["iou"], "max_det": config["max_det"], "verbose": False}
-                if config["device"] != "auto":
-                    kwargs["device"] = config["device"]
                 inference_started = time.perf_counter()
-                result = model.predict(frame, **kwargs)[0]
-                annotated = result.plot()
+                annotated = self._predict_frame(model, config, frame)
                 inference_elapsed = max(time.perf_counter() - inference_started, 1e-9)
                 inference_fps = 1.0 / inference_elapsed
                 inference_fps_ema = inference_fps if processed_frames == 0 else 0.9 * inference_fps_ema + 0.1 * inference_fps
@@ -450,7 +531,7 @@ class LocalPTInferenceManager:
             message = str(exc).strip() or exc.__class__.__name__
             with session.condition:
                 session.status = "stopped" if session.stop_event.is_set() else "failed"
-                session.message = "本地推理已停止。" if session.stop_event.is_set() else "本地 PT 推理失败。"
+                session.message = "本地推理已停止。" if session.stop_event.is_set() else "本地 PT / ONNX 推理失败。"
                 session.error = None if session.stop_event.is_set() else message
                 session.finished_at = datetime.now().isoformat(timespec="seconds")
                 session.logs.append(f"错误：{message}")
@@ -468,6 +549,72 @@ class LocalPTInferenceManager:
                     on_finished(session.snapshot())
                 except Exception:
                     pass
+
+    @staticmethod
+    def _predict_frame(model: Any, config: dict[str, Any], frame: np.ndarray) -> np.ndarray:
+        options = {"conf": config["conf"], "iou": config["iou"], "max_det": config["max_det"], "verbose": False}
+        if isinstance(model, _SubprocessYoloModel):
+            options["_class_names"] = config["labels"]
+        if config["device"] != "auto":
+            options["device"] = config["device"]
+        return model.predict(frame, **options)[0].plot()
+
+    @staticmethod
+    def _finish_images(session: LocalPTSession) -> None:
+        with session.condition:
+            session.status = "stopped" if session.stop_event.is_set() else "completed" if session.saved_images else "failed"
+            summary = f"已处理 {session.processed_images}/{session.total_images} 张，保存 {session.saved_images} 张，读取失败 {session.failed_images} 张。"
+            session.message = ("图片检测已停止。" if session.stop_event.is_set() else "图片检测完成。") + summary
+            if session.status == "failed":
+                session.error = "没有成功保存任何检测图片，请查看读取失败日志。"
+            session.finished_at = datetime.now().isoformat(timespec="seconds")
+            session.logs.append(session.message)
+            session.condition.notify_all()
+
+    def _run_images(self, session: LocalPTSession, config: dict[str, Any], model: Any, images: list[Path]) -> None:
+        output: Path = config["output_folder"]
+        output.mkdir(parents=True, exist_ok=True)
+        session.add_log(f"本地模型：{config['model'].name}；类别：{config['labels'] or getattr(model, 'names', {})}")
+        session.add_log("所有图片逐张检测并保存带框图片（无目标也保存），不修改原图；结果保留子目录结构，重名自动加后缀。")
+        last_preview = 0.0
+        with session.condition:
+            session.status = "stopping" if session.stop_event.is_set() else "running"
+        for index, path in enumerate(images):
+            if session.stop_event.is_set():
+                break
+            relative = path.relative_to(config["image_folder"])
+            with session.condition:
+                session.current_image = str(relative)
+                session.message = f"正在检测图片 {index + 1}/{len(images)}：{relative}"
+                session.condition.notify_all()
+            try:
+                frame = read_image(path)
+            except (OSError, ValueError, cv2.error) as exc:
+                with session.condition:
+                    session.failed_images += 1
+                    session.processed_images += 1
+                session.add_log(f"[{index + 1}/{len(images)}] 跳过无法读取的图片 {relative}：{exc}")
+                continue
+            annotated = self._predict_frame(model, config, frame)
+            if session.stop_event.is_set():
+                break
+            try:
+                saved = save_image(output / relative, annotated, output)
+            except (OSError, RuntimeError, cv2.error) as exc:
+                raise RuntimeError(f"保存带框图片失败：{relative}；{exc}。已保存结果予以保留。") from exc
+            with session.condition:
+                session.saved_images += 1
+                session.processed_images += 1
+            session.add_log(f"[{index + 1}/{len(images)}] 已保存：{saved.relative_to(output)}")
+            now = time.monotonic()
+            if config["preview_fps"] == 0 or now - last_preview >= 1 / config["preview_fps"] or index == len(images) - 1:
+                height, width = annotated.shape[:2]
+                preview = cv2.resize(annotated, (config["stream_width"], round(height * config["stream_width"] / width))) if width > config["stream_width"] else annotated
+                ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, config["jpeg_quality"]])
+                if ok:
+                    session.publish_frame(encoded.tobytes())
+                    last_preview = now
+        self._finish_images(session)
 
 
 manager = LocalPTInferenceManager()

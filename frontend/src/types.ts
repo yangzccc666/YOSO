@@ -16,7 +16,16 @@ export type FunctionParameter = {
 }
 
 export type RemoteInferenceStatus = {
+  inputMode?: 'video' | 'images'
+  totalImages?: number
+  processedImages?: number
+  savedImages?: number
+  failedImages?: number
+  currentImage?: string
+  outputFolder?: string
+  progressPercent?: number
   modelHistoryWarning?: string
+  videoHistoryWarning?: string
   id: string
   host: string
   username: string
@@ -135,6 +144,19 @@ export type PlatformTaskStatus = {
   logs?: string[]
 }
 
+export type TensorRTQueueItem = {
+  id: string; functionId: string; source: string; host: string; port: number; username: string; buildMode: string
+  status: 'queued' | 'running' | 'stopping' | 'disconnected' | 'completed' | 'failed' | 'stopped'
+  submittedAt: string; startedAt: string | null; finishedAt: string | null; taskId: string | null
+  message: string; logs: string[]; outputs: string[]
+  remoteDirectory?: string; reconnectable?: boolean
+}
+export type TensorRTQueueStatus = {
+  instanceId: string; version: number; paused: boolean; pauseReason: string; closed: boolean; queuedCount: number; runningCount: number; items: TensorRTQueueItem[]
+  disconnectedCount?: number
+}
+export type TensorRTQueueSubmission = TensorRTQueueStatus & { addedIds: string[]; skipped: string[]; message: string }
+
 export type RunHistoryRecord = {
   id: string
   functionId: string
@@ -143,6 +165,7 @@ export type RunHistoryRecord = {
   status: 'running' | 'completed' | 'failed' | 'stopped'
   startedAt: string
   finishedAt: string
+  elapsedSeconds?: number | null
   message: string
   details: Record<string, string>
   outputs: string[]
@@ -160,6 +183,7 @@ export type FunctionDefinition = {
   updatedAt: string
   groupId: string | null
   order: number
+  savedDefaults?: { values: WorkingValues; savedAt: string; revision: string } | null
 }
 
 export type GroupDefinition = {
@@ -193,4 +217,13 @@ export type ExternalAppSettings = {
 export type PlatformSettings = {
   externalApps: ExternalAppSettings[]
   configFile: string
+  aiPython?: string
+}
+
+export type PlatformDependencyReport = {
+  profile: string
+  system: string
+  checks: Array<{ name: string; status: string; detail: string }>
+  versions: Record<string, string>
+  note: string
 }

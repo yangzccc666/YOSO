@@ -1,0 +1,9 @@
+# Optional FULL AI build dependencies. Install in a clean packaging environment.
+# Review Ultralytics redistribution licensing before distributing this profile.
+-r requirements-build.txt
+torch>=2.2,<3
+torchvision>=0.17,<1
+ultralytics>=8.4,<9
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
+onnxslim>=0.1,<1

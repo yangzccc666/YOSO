@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getRunHistory, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, stopActiveTask, updateFunction } from './api'
+import { confirmClose, confirmStop } from './confirmActions'
+import { CLIP_REPLACE_SOURCE, videoReplacementConfirmation } from './videoClipOptions'
+import { choosePaths, createGroup, deleteFunction, deleteGroup, getActiveTask, getRunHistory, getWorkspace, moveFunction, renameGroup, reorderGroups, runFunction, saveFunctionDefaults, stopActiveTask, updateFunction } from './api'
 import { FunctionEditor } from './components/FunctionEditor'
 import { GroupDialog } from './components/GroupDialog'
 import { FunctionSidebar } from './components/FunctionSidebar'
@@ -7,13 +9,18 @@ import { FunctionWorkspace } from './components/FunctionWorkspace'
 import { RunHistoryDialog } from './components/RunHistoryDialog'
 import { WorkflowTodoDialog } from './components/WorkflowTodoDialog'
 import { PlatformSettingsDialog } from './components/PlatformSettingsDialog'
+import { SetupGuidanceDialog } from './components/SetupGuidanceDialog'
+import { SETUP_GUIDANCE_EVENT, setupGuideFor } from './setupGuidance'
+import type { SettingsSection, SetupGuide } from './setupGuidance'
 import { icons } from './icons'
 import { appendFolderPaths } from './multiFolderPaths'
+import { defaultValuesFor, withoutSecrets, workingValuesFor } from './functionDefaults'
 import { ExternalToolsMenu } from './components/ExternalToolsMenu'
-import { launchExternalApp } from './api'
+import { WorkClockPopover } from './components/WorkClockPopover'
+import { ApiRequestError, getPlatformSettings, launchExternalApp } from './api'
 import { parseStarModels, upsertStarModel } from './remoteStarModels'
 import { createWorkflowTodo, loadWorkflowTodos, saveWorkflowTodos } from './workflowTodos'
-import type { FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
+import type { ExternalAppSettings, FunctionDefinition, GroupDefinition, PlatformTaskStatus, WorkingValues, WorkspaceData, YoloTrainingRecommendation } from './types'
 import type { WorkflowTodo, WorkflowTodoPayload } from './workflowTodos'
 
 const storageKey = (id: string) => `processing-view:values:${id}`
@@ -169,23 +176,9 @@ function migrateVideoClipDefault(items: FunctionDefinition[]) {
   }
 }
 
-function withoutSecrets(item: FunctionDefinition, values: WorkingValues): WorkingValues {
-  const secretIds = new Set(item.parameters.filter((field) => field.type === 'password').map((field) => field.id))
-  return {
-    paths: values.paths,
-    parameters: Object.fromEntries(Object.entries(values.parameters).map(([key, value]) => [key, secretIds.has(key) ? '' : value])),
-  }
-}
-
 function defaultsFor(item: FunctionDefinition): WorkingValues {
-  const stored = localStorage.getItem(storageKey(item.id))
-  if (stored) {
-    try { return withoutSecrets(item, JSON.parse(stored) as WorkingValues) } catch { /* use defaults */ }
-  }
-  return {
-    paths: Object.fromEntries(item.pathFields.map((field) => [field.id, ''])),
-    parameters: Object.fromEntries(item.parameters.map((field) => [field.id, field.default])),
-  }
+  try { return workingValuesFor(item, localStorage.getItem(storageKey(item.id))) }
+  catch { return defaultValuesFor(item) }
 }
 
 export default function App() {
@@ -196,6 +189,9 @@ export default function App() {
   const [editing, setEditing] = useState<FunctionDefinition | null>(null)
   const [groupDraft, setGroupDraft] = useState<GroupDefinition | null | undefined>(undefined)
   const [working, setWorking] = useState<Record<string, WorkingValues>>({})
+  const [savingDefaults, setSavingDefaults] = useState(false)
+  const [defaultsVersions, setDefaultsVersions] = useState<Record<string, number>>({})
+  const [defaultsFeedback, setDefaultsFeedback] = useState<Record<string, string>>({})
   const [outputs, setOutputs] = useState<Record<string, string>>({})
   const [runningIds, setRunningIds] = useState<string[]>([])
   const [activeTasks, setActiveTasks] = useState<PlatformTaskStatus[]>([])
@@ -203,37 +199,41 @@ export default function App() {
   const [notice, setNotice] = useState('')
   const [historyOpen, setHistoryOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [launchingEditor, setLaunchingEditor] = useState(false)
-  const [launchingAntigravity, setLaunchingAntigravity] = useState(false)
-  const openAntigravity = async () => {
-    if (launchingAntigravity) return
-    setLaunchingAntigravity(true)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>()
+  const [setupGuides, setSetupGuides] = useState<SetupGuide[]>([])
+  const queueSetupGuide = useCallback((guide: SetupGuide) => {
+    setSetupGuides(current => current.some(item => item.code === guide.code) || current.length >= 5 ? current : [...current, guide])
+  }, [])
+  useEffect(() => {
+    const handle = (event: Event) => queueSetupGuide((event as CustomEvent<SetupGuide>).detail)
+    window.addEventListener(SETUP_GUIDANCE_EVENT, handle)
+    return () => window.removeEventListener(SETUP_GUIDANCE_EVENT, handle)
+  }, [queueSetupGuide])
+  const [externalApps, setExternalApps] = useState<ExternalAppSettings[]>([])
+  const [launchingApps, setLaunchingApps] = useState<string[]>([])
+  useEffect(() => {
+    let cancelled = false
+    getPlatformSettings().then(settings => { if (!cancelled) setExternalApps(settings.externalApps) })
+      .catch(reason => { if (!cancelled) setNotice(`外部工具加载失败，请打开本机设置重试：${String(reason)}`) })
+    return () => { cancelled = true }
+  }, [])
+  const openExternalApp = async (app: ExternalAppSettings) => {
+    if (launchingApps.includes(app.id)) return
+    setLaunchingApps(current => [...current, app.id])
     try {
-      const result = await launchExternalApp('antigravity')
+      const result = await launchExternalApp(app.id)
       setNotice(result.message)
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Antigravity 启动失败')
+      setNotice(error instanceof Error ? error.message : `${app.name} 启动失败`)
     } finally {
-      setLaunchingAntigravity(false)
-    }
-  }
-  const openAnnotationEditor = async () => {
-    if (launchingEditor) return
-    setLaunchingEditor(true)
-    try {
-      const result = await launchExternalApp('xanylabeling')
-      setNotice(result.message)
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'X-AnyLabeling 启动失败')
-    } finally {
-      setLaunchingEditor(false)
+      setLaunchingApps(current => current.filter(id => id !== app.id))
     }
   }
   const [workflowOpen, setWorkflowOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed)
   const [yoloTrainingRecommendation, setYoloTrainingRecommendation] = useState<YoloTrainingRecommendation | null>(null)
   const [workflowTodos, setWorkflowTodos] = useState<WorkflowTodo[]>(loadWorkflowTodos)
-  const closeHistory = useCallback(() => setHistoryOpen(false), [])
+  const closeHistory = useCallback(() => { if (confirmClose('全局运行历史')) setHistoryOpen(false) }, [])
 
   const selected = useMemo(() => functions.find((item) => item.id === selectedId) || null, [functions, selectedId])
   const values = selected ? (working[selected.id] || defaultsFor(selected)) : { paths: {}, parameters: {} }
@@ -268,7 +268,7 @@ export default function App() {
         const tasks = await getActiveTask()
         if (disposed) return
         for (const task of tasks) {
-          if (task.functionId === 'video_frames' && !backgroundTasks.current.has(task.id)) {
+          if ((task.functionId === 'video_frames' || task.kind === 'remote-build') && !backgroundTasks.current.has(task.id)) {
             backgroundTasks.current.set(task.id, { functionId: task.functionId, submittedAt: requestedAt })
           }
         }
@@ -295,6 +295,11 @@ export default function App() {
           const ids = new Set(ended.filter(([, entry]) => entry.functionId === functionId).map(([id]) => id))
           const records = history.filter((record) => ids.has(record.id))
           for (const id of ids) backgroundTasks.current.delete(id)
+          for (const record of records) {
+            if (record.status !== 'failed' || record.kind === 'remote-build') continue
+            const guide = setupGuideFor('run', record)
+            if (guide) queueSetupGuide(guide)
+          }
           if (records.length) setOutputs((current) => ({ ...current, [functionId]: records.map((record) => `${record.name}\n${record.logs.join('\n')}\n${record.message}`).join('\n\n') }))
         }))
       } catch {
@@ -342,6 +347,29 @@ export default function App() {
       setFunctions((current) => current.map((entry) => entry.id === item.id ? item : entry))
       setEditing(null)
     } catch (error) { setNotice(error instanceof Error ? error.message : '保存失败') }
+  }
+
+  const saveCurrentDefaults = async () => {
+    if (!selected || savingDefaults) return
+    const target = selected
+    setSavingDefaults(true)
+    try {
+      const item = await saveFunctionDefaults(target.id, withoutSecrets(target, values))
+      setFunctions(current => current.map(entry => entry.id === item.id ? item : entry))
+      setNotice('')
+      setDefaultsFeedback(current => ({ ...current, [item.id]: '已保存当前路径和参数，重新打开平台后自动使用。' }))
+    } catch (error) { setNotice(error instanceof Error ? error.message : '保存默认值失败') }
+    finally { setSavingDefaults(false) }
+  }
+
+  const loadCurrentDefaults = () => {
+    if (!selected) return
+    const next = defaultValuesFor(selected)
+    setWorking(current => ({ ...current, [selected.id]: next }))
+    setDefaultsVersions(current => ({ ...current, [selected.id]: (current[selected.id] || 0) + 1 }))
+    try { localStorage.setItem(storageKey(selected.id), JSON.stringify(next)) } catch { /* file-based defaults remain available */ }
+    setNotice('')
+    setDefaultsFeedback(current => ({ ...current, [selected.id]: `已载入${selected.savedDefaults ? '保存的' : '初始'}默认配置。` }))
   }
 
   const saveGroup = async (name: string) => {
@@ -510,6 +538,10 @@ export default function App() {
     if (!selected) return
     const item = selected
     const runValues = values
+    if (item.handlerId === 'video.clip' && runValues.parameters.clip_save_mode === CLIP_REPLACE_SOURCE) {
+      if (!window.confirm(videoReplacementConfirmation(runValues.paths))) return
+      parameterOverrides = { ...parameterOverrides, clip_replace_confirmed: true }
+    }
     setRunningIds((current) => [...current, item.id])
     const started = new Date().toLocaleTimeString('zh-CN', { hour12: false })
     setOutputs((current) => ({ ...current, [item.id]: `[${started}] 正在准备运行……` }))
@@ -555,6 +587,9 @@ export default function App() {
           queued += 1
         })
         if (queued) lines.push('', `已加入 ${queued} 条 Docker ONNX 量化待办，当前量化配置没有被覆盖。`)
+        if (result.result.deploymentPrecision === 'FP16' || result.result.deploymentPrecision === 'FP32') {
+          lines.push('', `高精度部署目标：${result.result.deploymentPrecision}。未创建 INT8 量化待办；请将导出的未量化 FP32 ONNX 放到盒子上，在“远程 TensorRT 引擎构建”中选择 ${result.result.deploymentPrecision}。打包 STAR 时精度声明也应与实际引擎一致。`)
+        }
       }
       const remoteInferenceDefaults = result.result.remoteInferenceDefaults
       if (item.handlerId === 'model.package_star' && remoteInferenceDefaults && typeof remoteInferenceDefaults === 'object') {
@@ -575,13 +610,15 @@ export default function App() {
       }
       const operation = parameterOverrides.operation ?? runValues.parameters.operation
       const consumedWorkflowTodo = item.handlerId !== 'yolo.split_dataset'
+        && !(item.handlerId === 'image.smart_dedup' && operation === '仅分析（不移动文件）')
         && !(item.handlerId === 'docker.quantize_onnx' && operation === '测试 Docker 环境')
         && !(item.handlerId === 'remote.build_tensorrt' && operation === '检查远程环境')
       if (consumedWorkflowTodo) completeWorkflowTarget(String(item.handlerId || ''))
       setOutputs((current) => ({ ...current, [item.id]: lines.join('\n') }))
     } catch (error) {
       const message = error instanceof Error ? error.message : '运行失败'
-      setOutputs((current) => ({ ...current, [item.id]: `[${started}] ${message}` }))
+      const logs = error instanceof ApiRequestError ? error.messages : []
+      setOutputs((current) => ({ ...current, [item.id]: [...logs, `[${started}] ${message}`].join('\n') }))
     } finally {
       setRunningIds((current) => {
         const index = current.indexOf(item.id)
@@ -591,6 +628,8 @@ export default function App() {
   }
 
   const stopRunningTask = async (taskId: string) => {
+    const target = activeTasks.find((task) => task.id === taskId)
+    if (!target || target.status === 'stopping' || !confirmStop(target.name)) return
     try {
       const task = await stopActiveTask(taskId)
       setActiveTasks((current) => current.map((entry) => entry.id === task.id ? task : entry))
@@ -627,16 +666,13 @@ export default function App() {
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <header className="topbar">
         <div className="top-left"><div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
-          <ExternalToolsMenu tools={[
-            { id: 'xanylabeling', name: 'X-AnyLabeling', description: '图片标注与人工校正', busy: launchingEditor, onLaunch: () => void openAnnotationEditor() },
-            { id: 'antigravity', name: 'Antigravity', description: '打开本地开发工具', busy: launchingAntigravity, onLaunch: () => void openAntigravity() },
-          ]} />
+          <ExternalToolsMenu tools={externalApps.map(app => ({ ...app, busy: launchingApps.includes(app.id), onLaunch: () => void openExternalApp(app) }))} onSettings={() => setSettingsOpen(true)} />
         </div>
         <div className="top-actions">
           <button className="history-trigger workflow-trigger" onClick={() => setWorkflowOpen(true)} aria-label={`工作流待办 ${workflowTodos.length} 条`}><icons.FolderInput size={17} /><span>待办 {workflowTodos.length}</span></button>
           <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="全局运行历史"><icons.Clock3 size={17} /><span>运行历史</span></button>
           {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><button className="task-overview-link" onClick={(event) => openRunningTask(task, event.currentTarget.closest('details'))} title={`转到 ${task.name}`}><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></button><button className="task-overview-stop" onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
-          <span className="local-status"><i />本地运行</span><button onClick={() => setSettingsOpen(true)} aria-label="本机设置" title="本机设置"><icons.Settings size={18} /></button><button aria-label="帮助"><icons.CircleHelp size={18} /></button>
+          <span className="local-status"><i />本地运行</span><button onClick={() => setSettingsOpen(true)} aria-label="本机设置" title="本机设置"><icons.Settings size={18} /></button><WorkClockPopover />
         </div>
       </header>
       <FunctionSidebar
@@ -662,6 +698,11 @@ export default function App() {
         running={selected ? runningIds.includes(selected.id) : false}
         activeTasks={activeTasks}
         onEdit={() => selected && setEditing(selected)}
+        onSaveDefaults={saveCurrentDefaults}
+        onLoadDefaults={loadCurrentDefaults}
+        savingDefaults={savingDefaults}
+        defaultsVersion={selected ? defaultsVersions[selected.id] || 0 : 0}
+        defaultsFeedback={selected ? defaultsFeedback[selected.id] || '' : ''}
         onBrowse={browse}
         onPathChange={updatePathValue}
         onParameterChange={updateParameterValue}
@@ -675,12 +716,14 @@ export default function App() {
         onDeleteWorkflowTodo={deleteWorkflowTodo}
         onWorkflowComplete={completeWorkflowTarget}
       />
-      <FunctionEditor item={editing} onClose={() => setEditing(null)} onSave={save} onDelete={remove} />
-      <GroupDialog group={groupDraft} onClose={() => setGroupDraft(undefined)} onSave={saveGroup} />
+      <FunctionEditor item={editing} onClose={() => { if (confirmClose('编辑功能', '未保存的修改将不会保留。')) setEditing(null) }} onSave={save} onDelete={remove} />
+      <GroupDialog group={groupDraft} onClose={() => { if (confirmClose('分组设置', '未保存的分组名称将不会保留。')) setGroupDraft(undefined) }} onSave={saveGroup} />
       {historyOpen ? <RunHistoryDialog onClose={closeHistory} /> : null}
-      {workflowOpen ? <WorkflowTodoDialog items={workflowTodos} onApply={applyWorkflowTodoFromDialog} onDelete={deleteWorkflowTodo} onClose={() => setWorkflowOpen(false)} /> : null}
-      <PlatformSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} onSaved={setNotice} />
-      {notice ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => setNotice('')} aria-label="关闭提示">×</button></div> : null}
+      {workflowOpen ? <WorkflowTodoDialog items={workflowTodos} onApply={applyWorkflowTodoFromDialog} onDelete={deleteWorkflowTodo} onClose={() => { if (confirmClose('工作流待办', '待办会保留，正在运行的任务不受影响。')) setWorkflowOpen(false) }} /> : null}
+      <PlatformSettingsDialog open={settingsOpen} focusSection={settingsSection} onClose={() => { setSettingsOpen(false); setSettingsSection(undefined) }} onSaved={(message, settings) => { setNotice(message); setExternalApps(settings.externalApps) }} />
+      <SetupGuidanceDialog guide={settingsOpen ? undefined : setupGuides[0]} onClose={() => setSetupGuides(current => current.slice(1))}
+        onSettings={section => { setSetupGuides(current => current.slice(1)); setSettingsSection(section); setSettingsOpen(true) }} />
+      {notice && !settingsOpen ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => { if (confirmClose('提示', '仅关闭这条提示。')) setNotice('') }} aria-label="关闭提示">×</button></div> : null}
     </div>
   )
 }

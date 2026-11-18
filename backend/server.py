@@ -9,22 +9,31 @@ import subprocess
 import sys
 import threading
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
 from .catalog import FunctionCatalog
 from .licensing import license_store
-from .external_apps import launch_xanylabeling, launch_antigravity
 from .app_settings import settings_store
+from .overtime import OvertimeStore
+from .history_summary import history_parameters
+from .function_defaults import defaults_store
 from .groups import GroupCatalog
 from .handlers import RunContext, execute, has_handler
 from .remote_inference import manager as remote_inference_manager
-from .local_pt_inference import manager as local_pt_inference_manager
+from .local_pt_inference import manager as local_pt_inference_manager, detect_local_model_labels
 from .local_star_package import detect_plan_labels
+from .package_naming import package_naming_store
 from .platform_paths import platform_data_dir
 from .run_history import RunHistoryStore
+from .run_timing import elapsed_seconds
 from .star_model_history import StarModelHistoryStore
+from .inference_video_history import InferenceVideoHistoryStore
+from .platform_paths import platform_config_dir
+from .star_labels import detect_star_labels
+from .distribution import dependency_report
 from .remote_yolo_dataset import (
     forget_remote_yolo_password,
     is_remote_yolo_parameters,
@@ -33,6 +42,7 @@ from .remote_yolo_dataset import (
 )
 from .remote_calib_dataset import is_remote_calib_parameters
 from .task_manager import ActiveTask, TaskCancelled, manager as platform_task_manager
+from .tensorrt_build_queue import TensorRTBuildQueue
 from .yolo_training import (
     TrainingProfileStore,
     normalize_training_values,
@@ -54,13 +64,24 @@ from . import negative_samples as _negative_samples  # noqa: F401
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = platform_data_dir()
+overtime_store = OvertimeStore(DATA_DIR / 'overtime.json', lambda: settings_store.work_clock_payload()['settings'])
 catalog = FunctionCatalog(DATA_DIR / "functions.json")
 group_catalog = GroupCatalog(DATA_DIR / "groups.json")
 training_profile_store = TrainingProfileStore(DATA_DIR / "training_profiles.json")
 run_history = RunHistoryStore(DATA_DIR / "run_history.json")
 star_model_history = StarModelHistoryStore(DATA_DIR / "star_model_history.json")
+inference_video_history = InferenceVideoHistoryStore(platform_config_dir() / 'inference_video_history.json')
 _path_chooser: Callable[[str], list[str]] | None = None
 _system_notifier: Callable[[str, str], None] | None = None
+
+
+def remember_inference_video(payload, snapshot, *, remote=False):
+    try:
+        inference_video_history.remember_payload(payload, remote=remote)
+    except Exception as exc:
+        # A preference-library failure must never kill an accepted inference session.
+        snapshot['videoHistoryWarning'] = f'推理已启动，但测试视频记录保存失败：{exc}'
+        print(f"[YOLO数据处理平台] {snapshot['videoHistoryWarning']}", file=sys.stderr)
 
 
 def set_system_notifier(notifier: Callable[[str, str], None] | None) -> None:
@@ -87,9 +108,11 @@ def record_finished_run(
     logs: list[str] | None = None,
     details: dict[str, str] | None = None,
     outputs: list[str] | None = None,
-) -> None:
+) -> bool:
+    history_saved = False
     try:
         run_history.add(task.snapshot(), status=status, message=message, logs=logs, details=details, outputs=outputs)
+        history_saved = True
     except Exception as exc:
         # A history disk error must not turn a successful data-processing run into a failure.
         print(f"[YOLO数据处理平台] 无法保存运行历史：{exc}", file=sys.stderr)
@@ -99,12 +122,44 @@ def record_finished_run(
     manually_stopped = task.status == "stopping" or task.stop_event.is_set()
     if status in {"completed", "finished"} and not manually_stopped:
         notify_system(f"{task.name} 已完成", message or "任务已成功完成。")
+    return history_saved
+
+
+def record_trt_queue_run(task: ActiveTask, snapshot: dict[str, Any]) -> bool:
+    return record_finished_run(task, status=snapshot["status"], message=snapshot["message"],
+                        logs=snapshot["logs"], outputs=snapshot["outputs"],
+                        details={"远程服务器": f"{snapshot['username']}@{snapshot['host']}:{snapshot['port']}",
+                                 "ONNX 模型": snapshot["source"], "构建精度": snapshot["buildMode"]})
+
+
+trt_build_queue = TensorRTBuildQueue(platform_task_manager, on_finished=record_trt_queue_run,
+                                   storage=DATA_DIR / "tensorrt_build_queue.json",
+                                   history_contains=lambda task_id: any(record["id"] == task_id for record in run_history.list()))
+
+
+def enqueue_trt_request(item: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    if item.get("handlerId") != "remote.build_tensorrt":
+        raise ValueError("该功能不支持 TensorRT 构建队列。")
+    paths, parameters = payload.get("paths", {}), payload.get("parameters", {})
+    if not isinstance(paths, dict) or not isinstance(parameters, dict):
+        raise ValueError("构建队列参数格式不正确。")
+    defaults = {str(field["id"]): field.get("default") for field in item.get("parameters", []) if field.get("id")}
+    return trt_build_queue.enqueue(str(item["id"]), str(item["name"]),
+                                   {key: Path(str(value)) for key, value in paths.items() if str(value).strip()},
+                                   {**defaults, **parameters})
 
 
 def finish_async_run(task: ActiveTask, snapshot: dict[str, Any], details: dict[str, str]) -> None:
     try:
+        # An SSH disconnect is not the end of a detached training job.
+        if snapshot.get("status") not in {"completed", "failed", "stopped"}:
+            return
         result = snapshot.get("result") or {}
         outputs = [str(Path(str(result["project"])) / str(result["name"]))] if result.get("project") and result.get("name") else []
+        outputs.extend(str(path) for path in result.get("outputFolders", []))
+        if snapshot.get("inputMode") == "images":
+            details = {**details, "图片总数": str(snapshot.get("totalImages", 0)),
+                       "已保存图片": str(snapshot.get("savedImages", 0)), "读取失败": str(snapshot.get("failedImages", 0))}
         record_finished_run(
             task,
             status=str(snapshot["status"]),
@@ -148,6 +203,7 @@ def active_training_history_records() -> list[dict[str, Any]]:
             "status": "running",
             "startedAt": str(session.get("startedAt", "")),
             "finishedAt": "",
+            "elapsedSeconds": elapsed_seconds(session.get("startedAt"), datetime.now().astimezone().isoformat()),
             "message": str(session.get("message") or state_message),
             "details": {
                 "训练状态": state_message,
@@ -162,10 +218,35 @@ def active_training_history_records() -> list[dict[str, Any]]:
     return records
 
 
+def record_restored_training(snapshot: dict[str, Any]) -> None:
+    """Terminal results discovered after reconnect retain the original start."""
+    session_id = str(snapshot["id"])
+    task = ActiveTask(id=f"training-{session_id}", function_id="yolo_model_training",
+                      name=f"YOLO 训练 · {Path(str(snapshot.get('output', session_id))).name}",
+                      kind="remote-training", task_key=f"training-{session_id}",
+                      started_at=str(snapshot.get("startedAt", "")), started_monotonic=None)
+    finish_async_run(task, snapshot, {"模型权重": str(snapshot.get("model", "")),
+                                    "训练输出": str(snapshot.get("output", "")),
+                                    "设备": str(snapshot.get("host", ""))})
+
+
+def active_run_history_records() -> list[dict[str, Any]]:
+    """Include all live functions; training sessions also survive SSH reconnects."""
+    records = active_training_history_records()
+    for task in platform_task_manager.active():
+        if task["kind"] == "remote-training":
+            continue  # Already represented by its persistent training session.
+        records.append({**task, "status": "running", "finishedAt": "",
+                        "message": "任务正在终止。" if task["status"] == "stopping" else "任务正在运行。",
+                        "details": task.get("details", {}), "outputs": []})
+    return records
+
+
 def workspace_payload() -> dict[str, Any]:
     functions = catalog.list()
     for item in functions:
         item["handlerReady"] = has_handler(item.get("handlerId"))
+        item["savedDefaults"] = defaults_store.get(item["id"])
     return {
         "groups": group_catalog.list_groups(),
         "functions": group_catalog.decorate(functions),
@@ -174,6 +255,7 @@ def workspace_payload() -> dict[str, Any]:
 
 def decorated_function(item: dict[str, Any]) -> dict[str, Any]:
     item["handlerReady"] = has_handler(item.get("handlerId"))
+    item["savedDefaults"] = defaults_store.get(item["id"])
     return next(
         entry for entry in group_catalog.decorate([item]) if entry["id"] == item["id"]
     )
@@ -274,11 +356,20 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self.send_json({"ok": True, "name": "YOLO数据处理平台"})
             return
+        if parsed.path == "/api/dependencies":
+            self.send_json(dependency_report())
+            return
         if parsed.path == "/api/star-model-history":
             try:
                 self.send_json({"models": star_model_history.list()})
             except Exception as exc:
                 self.send_json({"error": f"无法读取历史模型：{exc}"}, 500)
+            return
+        if parsed.path == '/api/inference-video-history':
+            try:
+                self.send_json({'videos': inference_video_history.list()})
+            except (ValueError, OSError) as exc:
+                self.send_json({'error': str(exc)}, 400)
             return
         if parsed.path == "/api/video-frames/resources":
             self.send_json(_video_frames.resource_pool.status())
@@ -295,8 +386,29 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/settings":
             self.send_json(settings_store.payload())
             return
+        if parsed.path == '/api/local-star-package/naming':
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                self.send_json(package_naming_store.payload(query.get('line', [''])[0], query.get('station', [''])[0]))
+            except (ValueError, OSError) as exc:
+                self.send_json({'error': str(exc)}, 400)
+            return
+        if parsed.path == "/api/work-clock":
+            self.send_json(settings_store.work_clock_payload())
+            return
+        if parsed.path == '/api/overtime':
+            try:
+                self.send_json(overtime_store.request())
+            except (ValueError, OSError) as exc:
+                self.send_json({'error': str(exc)}, 400)
+            return
         if parsed.path == "/api/tasks/active":
+            trt_build_queue.start_pending()
             self.send_json({"active": platform_task_manager.active()})
+            return
+        if parsed.path == "/api/tensorrt-build/queue":
+            trt_build_queue.start_pending()
+            self.send_json(trt_build_queue.snapshot())
             return
         if parsed.path == "/api/ssh/connections":
             self.send_json(remote_inference_manager.connection_history())
@@ -305,13 +417,14 @@ class AppHandler(BaseHTTPRequestHandler):
             try:
                 parameters = urllib.parse.parse_qs(parsed.query)
                 function_id = str(parameters.get("functionId", [""])[0]).strip()
-                active_records = active_training_history_records()
+                active_records = active_run_history_records()
                 if function_id:
                     active_records = [record for record in active_records if record["functionId"] == function_id]
                     finished_records = run_history.list(function_id)
                 else:
                     finished_records = run_history.list()[: run_history.LIMIT]
-                self.send_json({"history": [*active_records, *finished_records]})
+                finished_ids = {record["id"] for record in finished_records}
+                self.send_json({"history": [*(record for record in active_records if record["id"] not in finished_ids), *finished_records]})
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 self.send_json({"error": f"读取运行历史失败：{exc}"}, 500)
             return
@@ -390,12 +503,64 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path == "/api/dialog":
                 self.send_json({"paths": choose_path(str(payload.get("mode", "multiple")))})
                 return
+            if self.path == '/api/image-dedup/region-preview':
+                from .image_process_dedup import preview_regions
+                self.send_json(preview_regions(payload))
+                return
+            if self.path.startswith('/api/overtime/'):
+                self.send_json(overtime_store.request(self.path.rsplit('/', 1)[-1], payload))
+                return
             if self.path == "/api/local-star-package/detect-labels":
                 self.send_json(detect_plan_labels(str(payload.get("modelFile", ""))))
+                return
+            if self.path == "/api/remote-inference/detect-labels":
+                self.send_json(detect_star_labels(str(payload.get("modelFile", ""))))
+                return
+            if self.path == "/api/local-pt-inference/detect-labels":
+                self.send_json(detect_local_model_labels(str(payload.get("modelFile", ""))))
+                return
+            if self.path == "/api/jetson-onnx-export/detect-labels":
+                self.send_json(_jetson_onnx_export.detect_export_labels(payload))
+                return
+            if self.path == "/api/tensorrt-build/queue":
+                item = catalog.get(str(payload.get("functionId", "remote_tensorrt_build")))
+                if item is None:
+                    raise ValueError("TensorRT 构建功能不存在。")
+                self.send_json(enqueue_trt_request(item, payload), 202)
+                return
+            if self.path == "/api/tensorrt-build/queue/pause":
+                parameters = payload.get("parameters")
+                if parameters is not None and not isinstance(parameters, dict):
+                    raise ValueError("SSH 参数格式不正确。")
+                self.send_json(trt_build_queue.set_paused(payload.get("paused"), parameters=parameters)
+                               if parameters is not None else trt_build_queue.set_paused(payload.get("paused")))
+                return
+            if self.path == "/api/tensorrt-build/queue/discover":
+                parameters = payload.get("parameters", {})
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 参数格式不正确。")
+                self.send_json(trt_build_queue.discover(str(payload.get("functionId", "remote_tensorrt_build")),
+                    "远程 TensorRT 引擎构建", parameters))
+                return
+            if self.path.startswith("/api/tensorrt-build/queue/") and self.path.endswith("/reconnect"):
+                parameters = payload.get("parameters", {})
+                if not isinstance(parameters, dict):
+                    raise ValueError("SSH 参数格式不正确。")
+                self.send_json(trt_build_queue.reconnect(self.path.split("/")[-2], parameters))
+                return
+            if self.path == "/api/tensorrt-build/queue/clear":
+                self.send_json(trt_build_queue.clear_waiting())
+                return
+            if self.path.startswith("/api/tensorrt-build/queue/") and self.path.endswith("/stop"):
+                self.send_json(trt_build_queue.stop(self.path.split("/")[-2]))
                 return
             if self.path == "/api/star-model-history":
                 star_model_history.remember(payload.get("models"), require_files=True)
                 self.send_json({"models": star_model_history.list()})
+                return
+            if self.path == '/api/inference-video-history':
+                inference_video_history.remember(payload.get('path'), payload.get('scene'), payload.get('station'))
+                self.send_json({'videos': inference_video_history.list()})
                 return
             if self.path == "/api/remote-inference/test-connection":
                 parameters = payload.get("parameters", payload)
@@ -403,15 +568,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     raise ValueError("SSH 连接参数格式不正确。")
                 self.send_json(remote_inference_manager.test_connection(parameters))
                 return
-            if self.path == "/api/apps/xanylabeling/launch":
-                self.send_json(launch_xanylabeling())
-                return
-            if self.path == "/api/apps/antigravity/launch":
-                self.send_json(launch_antigravity())
-                return
-            if self.path.startswith("/api/apps/") and self.path.endswith("/launch"):
-                app_id = urllib.parse.unquote(self.path.strip("/").split("/")[2])
-                self.send_json(settings_store.launch(app_id))
+            if self.path.startswith('/api/apps/') and self.path.endswith('/launch'):
+                parts = self.path.strip('/').split('/')
+                if len(parts) != 4:
+                    raise ValueError('外部工具启动路径不正确。')
+                self.send_json(settings_store.launch(parts[2]))
                 return
             if self.path == "/api/remote-inference/credential-status":
                 parameters = payload.get("parameters", payload)
@@ -461,10 +622,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 details: dict[str, str] = {}
                 try:
                     details = {
+                        **history_parameters(values),
                         "数据配置": str(parameters.get("data", "")),
                         "模型权重": str(parameters.get("model", "")),
                         "训练输出": str(Path(str(parameters.get("project", ""))) / str(parameters.get("run_name", ""))) if parameters.get("project") else "",
                         "设备": str(parameters.get("remote_host", "")) if is_remote else "本地",
+                        "训练计算精度": "AMP 自动混合精度" if values['amp'] else "FP32（关闭 AMP）",
                     }
                     snapshot = yolo_training_manager.start(
                         parameters,
@@ -484,11 +647,15 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.path.startswith("/api/yolo-training/") and self.path.endswith("/reconnect"):
                 session_id = self.path.strip("/").split("/")[2]
                 parameters = payload.get("parameters", payload)
-                self.send_json(yolo_training_manager.reconnect(session_id, parameters))
+                self.send_json(yolo_training_manager.reconnect(session_id, parameters, on_finished=record_restored_training))
                 return
             if self.path.startswith("/api/yolo-training/") and self.path.endswith("/stop"):
                 session_id = self.path.strip("/").split("/")[2]
-                self.send_json(yolo_training_manager.stop(session_id))
+                parameters = payload.get("parameters")
+                if parameters is not None and not isinstance(parameters, dict):
+                    raise ValueError("SSH 连接参数格式不正确。")
+                self.send_json(yolo_training_manager.stop(session_id, parameters=parameters, on_finished=record_restored_training)
+                               if parameters is not None else yolo_training_manager.stop(session_id))
                 return
             if self.path == "/api/remote-inference/start":
                 task = platform_task_manager.start(
@@ -499,11 +666,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     paths = payload.get("paths", {})
                     parameters = payload.get("parameters", {})
                     details = {
+                        **history_parameters(parameters),
                         "模型文件": str(paths.get("local_model_file", "")),
                         "视频文件": str(paths.get("local_video_file", "")),
                         "推理设备": str(parameters.get("host", "")),
                         "远端保存": str(parameters.get("save_path", "")),
                     }
+                    raw_models = parameters.get('star_models', [])
+                    try:
+                        models = json.loads(raw_models) if isinstance(raw_models, str) else raw_models
+                        if isinstance(models, list):
+                            model_paths = [str(model.get('path', '')) for model in models if isinstance(model, dict) and model.get('path')]
+                            if model_paths: details['模型文件'] = '\n'.join(model_paths)
+                    except (ValueError, TypeError):
+                        pass
+                    task.history_details = dict(details)
                     snapshot = remote_inference_manager.start(
                         payload,
                         on_finished=lambda finished: finish_async_run(task, finished, details),
@@ -514,6 +691,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         # Disk/history failures must not terminate an accepted inference task.
                         snapshot["modelHistoryWarning"] = f"推理已启动，但历史模型保存失败：{history_error}"
                         print(f"[YOLO数据处理平台] {snapshot['modelHistoryWarning']}", file=sys.stderr)
+                    remember_inference_video(payload, snapshot, remote=True)
                     session_id = str(snapshot["id"])
                     platform_task_manager.set_stop_callback(
                         task.id,
@@ -526,13 +704,20 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json(snapshot, 201)
                 return
             if self.path == "/api/local-pt-inference/start":
-                task = platform_task_manager.start("local_pt_inference", "本地 PT 视频检测", "local")
+                parameters = payload.get("parameters", {})
                 paths = payload.get("paths", {})
-                details = {"模型文件": str(paths.get("model_file", "")), "视频文件": str(paths.get("video_file", "")), "保存位置": str(paths.get("output_folder", ""))}
+                if not isinstance(parameters, dict) or not isinstance(paths, dict):
+                    raise ValueError("本地推理参数格式不正确。")
+                image_mode = parameters.get("input_mode") == "图片文件夹检测"
+                task = platform_task_manager.start("local_pt_inference", "本地 PT / ONNX 图片检测" if image_mode else "本地 PT / ONNX 视频检测", "local")
+                source_key = "image_folder" if image_mode else "video_file"
+                details = {**history_parameters(parameters), "模型文件": str(paths.get("model_file", "")), "图片文件夹" if image_mode else "视频文件": str(paths.get(source_key, "")), "保存位置": str(paths.get("output_folder", ""))}
+                task.history_details = dict(details)
                 try:
                     snapshot = local_pt_inference_manager.start(
                         payload, on_finished=lambda finished: finish_async_run(task, finished, details),
                     )
+                    remember_inference_video(payload, snapshot)
                     session_id = str(snapshot["id"])
                     platform_task_manager.set_stop_callback(task.id, lambda: local_pt_inference_manager.stop(session_id))
                 except Exception as exc:
@@ -596,7 +781,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
                 parameters = payload.get("parameters", {})
                 is_remote_calib = handler_id == "calib.select_dataset" and is_remote_calib_parameters(parameters)
+                is_remote_annotation = handler_id == "dataset.auto_annotate" and parameters.get("annotation_mode") == "远程 STAR 标注"
                 is_remote_trt = handler_id == "remote.build_tensorrt"
+                if is_remote_trt and str(parameters.get("operation") or "构建 TensorRT 引擎") == "构建 TensorRT 引擎":
+                    queued = enqueue_trt_request(item, payload)
+                    self.send_json({"ok": True, "messages": [queued["message"]],
+                                    "result": {"background": True, "queued": True, "message": queued["message"]}}, 202)
+                    return
                 is_video_frames = handler_id == _video_frames.HANDLER_ID
                 path_values = {
                     key: Path(value) if is_remote_yolo else Path(value).expanduser()
@@ -621,14 +812,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     task_name += f" · {source_name} · {run_parameters.get('scene_code') or '按视频名命名'}"
                 task = platform_task_manager.start(
                     item_id, task_name,
-                    "remote-build" if is_remote_trt else "remote" if is_remote_yolo or is_remote_calib else "local",
+                    "remote-build" if is_remote_trt else "remote" if is_remote_yolo or is_remote_calib or is_remote_annotation else "local",
                     task_key=_video_frames.video_frame_task_key(item_id, path_values, run_parameters) if is_video_frames else None,
                 )
                 details = {
-                    str(field["label"]): str(payload.get("paths", {}).get(field["id"], ""))
+                    ("STAR 模型" if is_remote_annotation and field.get("id") == "weights_file" else str(field["label"])): str(payload.get("paths", {}).get(field["id"], ""))
                     for field in item.get("pathFields", [])
                     if field.get("id")
                 }
+                details.update(history_parameters(run_parameters))
+                if handler_id == "dataset.auto_annotate":
+                    details["自动标注模式"] = str(run_parameters.get("annotation_mode", "本地 PT 标注"))
+                    if is_remote_annotation:
+                        details["执行位置"] = f"{parameters.get('remote_username', '')}@{parameters.get('remote_host', '')}"
+                if handler_id == 'model.export_jetson_onnx':
+                    details['ONNX 导出精度'] = 'FP32（未量化）'
+                    details['后续部署精度'] = str(run_parameters.get('deployment_precision') or 'INT8')
                 if handler_id == "calib.select_dataset":
                     details.update({
                         "图片目录": str(parameters.get("image_dirs", "")),
@@ -649,6 +848,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         normalized_onnx_files = [str(path).strip() for path in onnx_files if str(path).strip()]
                         details["ONNX 模型"] = "\n".join(normalized_onnx_files)
                         details["模型数量"] = str(len(normalized_onnx_files))
+                if is_video_frames:
+                    details['图片保存方式'] = str(run_parameters.get('output_layout', _video_frames.OUTPUT_BY_SOURCE))
+                task.history_details = dict(details)
                 if is_video_frames:
                     def background_frames() -> None:
                         status = "failed"
@@ -716,7 +918,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 except Exception as exc:
                     message = str(exc)
-                    raise
+                    self.send_json({"error": message, "messages": messages[-500:]},
+                                   400 if isinstance(exc, (ValueError, RuntimeError)) else 500)
+                    return
                 finally:
                     record_finished_run(task, status=status, message=message, logs=messages, details=details, outputs=outputs)
                     platform_task_manager.finish(task.id)
@@ -742,8 +946,27 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         try:
             payload = self.read_json()
+            if self.path == "/api/work-clock":
+                try:
+                    self.send_json(settings_store.update_work_clock(payload))
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 400)
+                return
             if self.path == "/api/settings":
                 self.send_json(settings_store.update(payload))
+                return
+            if self.path.startswith("/api/functions/") and self.path.endswith("/defaults"):
+                item_id = self.path.split("/")[3]
+                item = catalog.get(item_id)
+                if item is None:
+                    self.send_json({"error": "功能不存在。"}, 404)
+                    return
+                try:
+                    defaults_store.save(item, payload)
+                except ValueError as exc:
+                    self.send_json({"error": str(exc)}, 400)
+                    return
+                self.send_json(decorated_function(item))
                 return
             if self.path.startswith("/api/groups/"):
                 group_id = self.path.rsplit("/", 1)[-1]
@@ -768,10 +991,19 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/tensorrt-build/queue/"):
+                entry_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+                forget = urllib.parse.parse_qs(parsed.query).get("forget") == ["true"]
+                self.send_json(trt_build_queue.remove(entry_id, forget=True) if forget else trt_build_queue.remove(entry_id))
+                return
             if parsed.path.startswith("/api/star-model-history/"):
                 record_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).strip()
                 star_model_history.delete(record_id)
                 self.send_json({"ok": True})
+                return
+            if parsed.path.startswith('/api/inference-video-history/'):
+                inference_video_history.delete(urllib.parse.unquote(parsed.path.rsplit('/', 1)[-1]))
+                self.send_json({'ok': True})
                 return
             if parsed.path.startswith("/api/tasks/history/"):
                 record_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]).strip()
@@ -779,8 +1011,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
                 return
             if self.path.startswith("/api/yolo-training/sessions/"):
-                session_id = self.path.rsplit("/", 1)[-1]
-                yolo_training_manager.delete(session_id)
+                session_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+                forget = urllib.parse.parse_qs(parsed.query).get("forget") == ["true"]
+                yolo_training_manager.delete(session_id, forget=True) if forget else yolo_training_manager.delete(session_id)
                 self.send_json({"ok": True})
                 return
             if self.path.startswith("/api/groups/"):
@@ -855,6 +1088,7 @@ class AppServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def server_close(self) -> None:
+        trt_build_queue.close()
         platform_task_manager.stop_all()
         remote_inference_manager.stop_all()
         local_pt_inference_manager.stop_all()

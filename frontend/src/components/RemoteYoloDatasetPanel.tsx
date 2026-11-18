@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { forgetYoloRemotePassword, getYoloRemoteCredentialStatus, testYoloRemoteConnection } from '../api'
 import { icons } from '../icons'
+import { HelpTip } from './HelpTip'
 import { REMEMBERED_PASSWORD_VALUE } from '../types'
 import type { PlatformTaskStatus, WorkingValues, YoloConnectionTestResult } from '../types'
 
@@ -145,7 +146,7 @@ export function RemoteYoloDatasetPanel({ values, output, running, platformTask, 
           {platformTask ? '正在运行' : running ? '正在启动' : remoteRequested ? '执行远程划分' : '本地一键运行'}
         </button>
         <span className={`remote-status ${status.className}`}><i />{status.label}</span>
-        <small>{remoteRequested ? (rememberPassword ? '密码默认记住；连接参数变化后需要重新测试。' : '密码不会保存；请先测试连接再执行。') : 'SSH 信息为空，数据将在本机处理。'}</small>
+        <HelpTip label="数据集划分运行位置说明">{remoteRequested ? (rememberPassword ? '密码默认记住；连接参数变化后需要重新测试。' : '密码不会保存；请先测试连接再执行。') : 'SSH 信息为空，数据将在本机处理。'}</HelpTip>
         {remoteRequested && rememberPassword ? <button className="forget-password-button" onClick={forgetPassword} disabled={submitting || testingConnection}>清除已保存密码</button> : null}
       </div>
 

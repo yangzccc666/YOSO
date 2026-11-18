@@ -19,6 +19,8 @@ from typing import Any
 
 from .handlers import RunContext, register_handler
 from .task_manager import TaskCancelled
+from .package_template import DEFAULT_TRT_TEMPLATE
+from .package_naming import package_naming_store
 
 
 HANDLER_ID = "model.package_star"
@@ -269,13 +271,11 @@ def _configuration(context: RunContext) -> dict[str, Any]:
     if not os.access(tool, os.X_OK):
         raise ValueError(f"\u6253\u5305\u5de5\u5177\u4e0d\u53ef\u6267\u884c\uff1a{tool}\u3002\u8bf7\u5148\u6dfb\u52a0\u6267\u884c\u6743\u9650\u3002")
     template_value = str(context.parameters.get("template_file") or DEFAULT_TEMPLATE).strip()
-    if not template_value:
-        raise ValueError("请填写当前电脑的 trt.toml 模板路径。")
-    template = Path(os.path.expandvars(template_value)).expanduser()
-    if not template.is_file() or template.suffix.lower() != ".toml":
+    template = Path(os.path.expandvars(template_value)).expanduser() if template_value else None
+    if template is not None and (not template.is_file() or template.suffix.lower() != ".toml"):
         raise ValueError(f"TOML \u6a21\u677f\u4e0d\u5b58\u5728\u6216\u683c\u5f0f\u4e0d\u6b63\u786e\uff1a{template}")
     try:
-        tomllib.loads(template.read_text(encoding="utf-8"))
+        tomllib.loads(template.read_text(encoding="utf-8") if template else DEFAULT_TRT_TEMPLATE)
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise ValueError(f"TOML \u6a21\u677f\u65e0\u6cd5\u89e3\u6790\uff1a{exc}") from exc
     title = _text(context.parameters.get("title"), "\u6253\u5305\u540d\u79f0 title")
@@ -287,7 +287,7 @@ def _configuration(context: RunContext) -> dict[str, Any]:
     return {
         "plan": plan.expanduser().resolve(),
         "tool": tool.resolve(),
-        "template": template.resolve(),
+        "template": template.resolve() if template else None,
         "title": title,
         "labels": _labels(context.parameters.get("labels")),
         "hardware_name": _text(context.parameters.get("hardware_name"), "\u786c\u4ef6\u5e73\u53f0", "TensorRT"),
@@ -458,7 +458,7 @@ def _run_process(command: list[str], cwd: Path, context: RunContext) -> list[str
 
 def run_local_star_package(context: RunContext) -> dict[str, Any]:
     config = _configuration(context)
-    template_text = config["template"].read_text(encoding="utf-8")
+    template_text = config["template"].read_text(encoding="utf-8") if config["template"] else DEFAULT_TRT_TEMPLATE
     rendered = _render_template(template_text, config)
     folders = {config["tool"].parent, config["plan"].parent}
     before = _snapshot_stars(folders)
@@ -472,8 +472,10 @@ def run_local_star_package(context: RunContext) -> dict[str, Any]:
             stream.write(rendered)
             temporary = Path(stream.name)
         context.report(f"\u6253\u5305\u5de5\u5177\uff1a{config['tool']}")
-        context.report(f"TOML \u6a21\u677f\uff1a{config['template']}")
+        context.report(f"TOML 模板：{config['template'] or '平台内置模板（无需外部文件）'}")
         context.report(f"PLAN \u6a21\u578b\uff1a{config['plan']}")
+        precision_name = next(name for name, value in PRECISIONS.items() if value == config['precision'])
+        context.report(f'引擎精度声明：{precision_name}，仅写入元数据，不改变 PLAN 计算精度。')
         context.report(f"\u6253\u5305\u540d\u79f0\uff1a{config['title']}\uff1b\u7c7b\u522b\u6570\uff1a{len(config['labels'])}")
         context.report(f"\u6267\u884c\u547d\u4ee4\uff1a./{config['tool'].name} {temporary.name}")
         _run_process([str(config["tool"]), temporary.name], config["tool"].parent, context)
@@ -496,12 +498,20 @@ def run_local_star_package(context: RunContext) -> dict[str, Any]:
         context.report(f"STAR \u5df2\u79fb\u52a8\u5230 PLAN \u540c\u7ea7\u76ee\u5f55\u3002")
     size_mb = output.stat().st_size / 1024 / 1024
     context.report(f"STAR \u6253\u5305\u5b8c\u6210\uff1a{output}\uff08{size_mb:.1f} MB\uff09")
+    naming_warning = ''
+    try:
+        if package_naming_store.remember(config['title'], config['plan'], output, config['labels'], context.parameters.get('package_change_note', '')):
+            context.report('命名版本已记录；该台账独立保存，不受最近5条运行历史限制。')
+    except (ValueError, OSError) as exc:
+        naming_warning = f'模型已成功打包，但版本记录保存失败：{exc}'
+        context.report(naming_warning)
     return {
         "message": f"STAR \u6253\u5305\u5b8c\u6210\uff1a{output.name}\u3002",
         "outputFiles": [str(output)],
         "outputFolders": [str(output.parent)],
         "title": config["title"],
         "labelCount": len(config["labels"]),
+        "namingWarning": naming_warning,
         "remoteInferenceDefaults": {
             "modelFile": str(output),
             "labels": config["labels"],

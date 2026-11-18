@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import io
 import math
 import os
 import queue
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -16,7 +18,9 @@ from typing import Any
 
 from .handlers import RunContext, register_handler
 from .local_pt_inference import _find_yolo_python
+from .local_pt_worker import receive as receive_worker_packet
 from .task_manager import TaskCancelled
+from .worker_runtime import worker_command
 
 
 HANDLER_ID = "model.export_jetson_onnx"
@@ -30,6 +34,53 @@ TASKS = {
 }
 PLATFORMS = {"Jetson / TensorRT（NCHW）": "jetson", "RKNN（NHWC）": "rknn"}
 MODEL_FAMILIES = {"YOLO26", "YOLOv5"}
+LABEL_WORKER_SCRIPT = Path(__file__).with_name("model_labels_worker.py")
+
+
+def _model_repository(family: str, parameters: dict[str, Any]) -> Path | None:
+    if family not in MODEL_FAMILIES:
+        raise ValueError("请选择有效的模型版本。")
+    if family != "YOLOv5":
+        return None
+    text = str(parameters.get("yolov5_repo") or "").strip()
+    if not text:
+        raise ValueError("YOLOv5 模型需要填写源码仓库目录；该目录应包含 export.py 和 models 文件夹。")
+    repo = Path(text).expanduser().resolve()
+    if not (repo / "export.py").is_file() or not (repo / "models").is_dir():
+        raise ValueError(f"YOLOv5 仓库不完整：{repo}。需要包含 export.py 和 models 文件夹。")
+    return repo
+
+
+def detect_export_labels(raw: dict[str, Any]) -> dict[str, Any]:
+    parameters = raw.get("parameters", {})
+    if not isinstance(parameters, dict):
+        raise ValueError("模型读取参数格式不正确。")
+    model = Path(str(raw.get("modelFile") or "").strip()).expanduser()
+    if model.suffix.lower() != ".pt" or not model.is_file():
+        raise ValueError(f"请选择存在的本地 PT 权重文件：{model}")
+    family = str(parameters.get("model_family") or "YOLO26")
+    repository = _model_repository(family, parameters)
+    python = _resolve_python(parameters.get("python_path"))
+    if family == "YOLOv5" and getattr(sys, "frozen", False) and python == Path(sys.executable).resolve():
+        raise ValueError("经典 YOLOv5 类别读取依赖其原始源码及专用环境，请选择独立 Python。")
+    arguments = ["--weights", str(model.resolve()), "--family", family]
+    if repository:
+        arguments.extend(["--repository", str(repository)])
+    try:
+        result = subprocess.run(worker_command(python, LABEL_WORKER_SCRIPT, arguments),
+                                capture_output=True, timeout=90, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError("读取 PT 类别超时（90 秒），请检查模型及该页的 YOLO Python 配置。") from exc
+    except OSError as exc:
+        raise ValueError(f"无法启动该页配置的 YOLO Python：{python}；{exc}") from exc
+    try:
+        header, _ = receive_worker_packet(io.BytesIO(result.stdout))
+    except (EOFError, OSError, ValueError) as exc:
+        details = result.stderr.decode("utf-8", errors="replace").strip()[-1500:]
+        raise ValueError(f"类别读取进程未返回有效数据：{details or '请检查 YOLO Python 是否具备模型所需依赖'}") from exc
+    if result.returncode != 0 or header.get("type") != "metadata":
+        raise ValueError(f"读取 PT 类别失败：{header.get('message', '未知错误')}。请确认模型版本、Python 环境和源码与权重匹配。")
+    return {key: value for key, value in header.items() if key != "type"}
 
 
 def _integer(raw: Any, label: str, default: int, minimum: int, maximum: int) -> int:
@@ -105,22 +156,19 @@ def _configuration(
     platform_name = str(context.parameters.get("target_platform", "Jetson / TensorRT（NCHW）"))
     if platform_name not in PLATFORMS:
         raise ValueError("请选择有效的目标平台。")
+    deployment_precision = str(context.parameters.get('deployment_precision') or 'INT8')
+    if deployment_precision not in {'INT8', 'FP16', 'FP32'}:
+        raise ValueError('后续部署精度只能选择 INT8、FP16 或 FP32。')
+    if PLATFORMS[platform_name] != 'jetson':
+        deployment_precision = 'INT8'
     image_size = _integer(context.parameters.get("imgsz"), "输入尺寸 imgsz", 640, 32, 4096)
     if image_size % 32:
         raise ValueError("输入尺寸 imgsz 必须是 32 的整数倍。")
     model_family = str(context.parameters.get("model_family") or "YOLO26")
-    if model_family not in MODEL_FAMILIES:
-        raise ValueError("请选择有效的模型版本。")
-    yolov5_repo: Path | None = None
     if model_family == "YOLOv5":
         if task_name != "目标检测":
             raise ValueError("当前 YOLOv5 导出仅支持目标检测模型。")
-        raw_repo = str(context.parameters.get("yolov5_repo") or "").strip()
-        if not raw_repo:
-            raise ValueError("YOLOv5 模型需要填写源码仓库目录；该目录应包含 export.py 和 models 文件夹。")
-        yolov5_repo = Path(raw_repo).expanduser().resolve()
-        if not (yolov5_repo / "export.py").is_file() or not (yolov5_repo / "models").is_dir():
-            raise ValueError(f"YOLOv5 仓库不完整：{yolov5_repo}。需要包含 export.py 和 models 文件夹。")
+    yolov5_repo = _model_repository(model_family, context.parameters)
     return {
         "weights": weights.expanduser().resolve(),
         "output": output,
@@ -133,6 +181,7 @@ def _configuration(
         "opset": _integer(context.parameters.get("opset"), "ONNX opset", 12, 11, 20),
         "model_family": model_family,
         "yolov5_repo": yolov5_repo,
+        "deployment_precision": deployment_precision,
     }
 
 
@@ -198,6 +247,8 @@ def _export_one(config: dict[str, Any], context: RunContext) -> None:
         temporary_output = work / "export.onnx"
         shutil.copy2(config["weights"], temporary_weights)
         if config["model_family"] == "YOLOv5":
+            if getattr(sys, 'frozen', False) and config["python"] == Path(sys.executable).resolve():
+                raise ValueError("经典 YOLOv5 导出依赖其原始源码及专用环境，请选择独立 Python；不要将桌面程序作为 Python。")
             context.report(f"使用 YOLOv5 仓库：{config['yolov5_repo']}")
             command = [
                 str(config["python"]), "-u", "-B", str(config["yolov5_repo"] / "export.py"),
@@ -206,15 +257,14 @@ def _export_one(config: dict[str, Any], context: RunContext) -> None:
                 "--batch-size", "1", "--device", "cpu", "--simplify",
             ]
         else:
-            command = [
-                str(config["python"]), "-u", "-B", str(WORKER_SCRIPT),
+            command = worker_command(config["python"], WORKER_SCRIPT, [
                 "--weights", str(temporary_weights),
                 "--output", str(temporary_output),
                 "--imgsz", str(config["imgsz"]),
                 "--opset", str(config["opset"]),
                 "--task", config["task"],
                 "--platform", config["platform"],
-            ]
+            ])
         _run_process(command, context)
         if config["model_family"] == "YOLOv5":
             exported = temporary_weights.with_suffix(".onnx")
@@ -232,7 +282,10 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
     if len(set(output_paths)) != len(output_paths):
         raise ValueError("多个 PT 会生成同名 ONNX，请选择不同的输出文件夹，或调整 PT 文件名后重试。")
     first = configs[0]
+    precision = first['deployment_precision']
     context.report(f"使用 YOLO 环境：{first['python']}")
+    context.report(f'ONNX 按 FP32 导出，后续部署目标：{precision}。' + (
+        '下一步为 INT8 量化。' if precision == 'INT8' else f'跳过 Docker 量化，将未量化 ONNX 传到盒子后选择 {precision} 构建引擎。'))
     context.report(
         f"共 {len(configs)} 个 PT 等待导出；模型版本：{first['model_family']}；"
         f"任务：{first['task_name']}；平台：{first['platform_name']}；"
@@ -285,8 +338,9 @@ def run_jetson_onnx_export(context: RunContext) -> dict[str, Any]:
         "imgsz": first["imgsz"],
         "opset": first["opset"],
         "modelFamily": first["model_family"],
-        "onnxQuantDefaults": {"inputOnnx": outputs[0]},
-        "onnxQuantDefaultsList": [{"inputOnnx": output} for output in outputs],
+        "deploymentPrecision": precision,
+        "onnxQuantDefaults": {"inputOnnx": outputs[0]} if precision == 'INT8' else None,
+        "onnxQuantDefaultsList": [{"inputOnnx": output} for output in outputs] if precision == 'INT8' else [],
     }
 
 

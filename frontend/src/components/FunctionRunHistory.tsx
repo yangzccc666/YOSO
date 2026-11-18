@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { deleteRunHistory, getRunHistory } from '../api'
 import { icons } from '../icons'
 import type { RunHistoryRecord } from '../types'
+import { RunDuration } from './RunDuration'
+import { HelpTip } from './HelpTip'
+import { RunHistoryHeading } from './RunHistoryHeading'
+import { runHistoryLabel } from '../runHistoryLabel'
 
 const statusLabels = { running: '正在运行', completed: '已完成', failed: '失败', stopped: '已终止' }
 
@@ -50,7 +54,7 @@ export function FunctionRunHistory({ functionId }: { functionId: string }) {
   }, [refresh])
 
   const remove = async (record: RunHistoryRecord) => {
-    if (!window.confirm(`确定删除“${record.name}”的这条运行历史吗？\n只删除历史记录，不会删除任务输出文件。`)) return
+    if (!window.confirm(`确定删除“${runHistoryLabel(record).title}”的这条运行历史吗？\n只删除历史记录，不会删除任务输出文件。`)) return
     setDeletingId(record.id)
     try {
       await deleteRunHistory(record.id)
@@ -65,7 +69,7 @@ export function FunctionRunHistory({ functionId }: { functionId: string }) {
 
   return <section className="workspace-section function-history-section">
     <header className="function-history-header">
-      <div className="section-title"><icons.Clock3 size={21} /><h2>本功能运行历史</h2><span>{runningCount ? `进行中 ${runningCount} · ` : ''}已结束 {finishedCount}/5 条</span></div>
+      <div className="section-title"><icons.Clock3 size={21} /><h2>本功能运行历史</h2><HelpTip label="运行历史保留与计时说明">运行中任务不占名额；已结束任务独立保留最近 5 条。耗时含准备、传输和运行中暂停，不含排队等待。</HelpTip><span>{runningCount ? `进行中 ${runningCount} · ` : ''}已结束 {finishedCount}/5 条</span></div>
       <button type="button" onClick={() => void refresh()} disabled={loading}>刷新</button>
     </header>
     {error ? <div className="history-error" role="alert"><span>{error}</span><button onClick={() => void refresh()}>重试</button></div> : null}
@@ -74,13 +78,14 @@ export function FunctionRunHistory({ functionId }: { functionId: string }) {
         <details className="history-entry">
           <summary>
             <span className={`history-status ${record.status}`}>{statusLabels[record.status]}</span>
-            <span className="history-heading"><strong>{record.name}</strong><small>{record.status === 'running' ? `开始于 ${displayTime(record.startedAt)}` : displayTime(record.finishedAt)} · {executionLabel(record.kind)}</small></span>
+            <RunHistoryHeading record={record}>{record.status === 'running' ? `开始于 ${displayTime(record.startedAt)}` : displayTime(record.finishedAt)} · {executionLabel(record.kind)} · <RunDuration record={record} /></RunHistoryHeading>
             <icons.ChevronDown size={17} />
           </summary>
           <div className="history-detail">
             <p>{record.message || statusLabels[record.status]}</p>
             <div><span>开始</span><strong>{displayTime(record.startedAt)}</strong></div>
             {record.status !== 'running' ? <div><span>结束</span><strong>{displayTime(record.finishedAt)}</strong></div> : null}
+            <div><span>{record.status === 'running' ? '已运行' : '总耗时'}</span><strong><RunDuration record={record} showLabel={false} /></strong></div>
             {Object.entries(record.details).map(([label, value]) => <div key={label}><span>{label}</span><strong title={value}>{value}</strong></div>)}
             {record.outputs.length ? <div><span>输出位置</span><strong>{record.outputs.join('\n')}</strong></div> : null}
             <details className="history-log"><summary>查看运行日志（{record.logs.length} 条）</summary><pre>{record.logs.length ? record.logs.join('\n') : record.message || '没有更多日志'}</pre></details>
@@ -88,6 +93,5 @@ export function FunctionRunHistory({ functionId }: { functionId: string }) {
         </details>
         {record.status !== 'running' ? <button className="history-delete" type="button" onClick={() => void remove(record)} disabled={deletingId === record.id} aria-label={`删除 ${record.name} 的这条运行历史`} title="只删除历史记录"><icons.Trash2 size={15} />{deletingId === record.id ? '删除中' : '删除'}</button> : <span className="history-running-note">不占历史名额</span>}
       </li>)}</ol>}
-    <p className="function-history-note">正在进行的模型训练会持续保留且不占名额；已结束任务独立保留最近 5 条。</p>
   </section>
 }

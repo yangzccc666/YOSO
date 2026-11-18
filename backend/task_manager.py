@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable
+
+from .run_timing import elapsed_seconds
 
 
 class TaskCancelled(RuntimeError):
@@ -22,10 +25,12 @@ class ActiveTask:
     kind: str
     task_key: str
     status: str = "running"
-    started_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    started_at: str = field(default_factory=lambda: datetime.now().astimezone().isoformat(timespec="milliseconds"))
+    started_monotonic: float | None = field(default_factory=lambda: time.monotonic(), repr=False)
     stop_event: threading.Event = field(default_factory=threading.Event)
     stop_callback: Callable[[], Any] | None = None
     logs: deque[str] = field(default_factory=lambda: deque(maxlen=500))
+    history_details: dict[str, str] = field(default_factory=dict, repr=False)
 
     def add_log(self, message: str) -> None:
         self.logs.append(str(message))
@@ -38,7 +43,11 @@ class ActiveTask:
             "kind": self.kind,
             "status": self.status,
             "startedAt": self.started_at,
+            "elapsedSeconds": round(max(0.0, time.monotonic() - self.started_monotonic), 3)
+            if self.started_monotonic is not None else elapsed_seconds(
+                self.started_at, datetime.now().astimezone().isoformat()),
             "logs": list(self.logs),
+            "details": dict(self.history_details),
         }
 
 

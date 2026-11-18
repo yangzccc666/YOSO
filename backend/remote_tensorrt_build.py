@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import time
 import uuid
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .handlers import RunContext, register_handler
@@ -19,8 +20,33 @@ DEFAULT_TRTEXEC = "/usr/src/tensorrt/bin/trtexec"
 DEFAULT_REMOTE_ROOT = "~/.local/state/yolo-processing/tensorrt"
 
 
+class RemoteBuildDisconnected(RuntimeError):
+    """Monitoring ended, not necessarily the independently running build."""
+
+
+class RemoteBuildFailed(RuntimeError):
+    """A definite remote exit failure or invalid result, not an SSH interruption."""
+
+
+def validate_remote_job(raw: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("远端构建任务信息必须是对象。")
+    source = PurePosixPath(str(raw.get("source", "")))
+    directory = PurePosixPath(str(raw.get("remoteDirectory", "")))
+    token = str(raw.get("token", ""))
+    if (not source.is_absolute() or source.suffix.lower() != ".onnx"
+            or not re.fullmatch(r"yolo-trt-[0-9a-f]{12}", token)
+            or not directory.is_absolute() or directory.name != f"{source.stem}-{token[9:]}"
+            or raw.get("launcher") not in {"tmux", "setsid"}
+            or any("\x00" in str(value) for value in raw.values())):
+        raise ValueError("远端构建任务信息无效，不能安全重连。")
+    return {"source": str(source), "plan": str(source.with_suffix(".plan")),
+            "log": str(source.with_suffix(".trtexec.log")), "remoteDirectory": str(directory),
+            "token": token, "launcher": raw["launcher"], "keepRemote": raw.get("keepRemote") is not False}
+
+
 def _remote_capture(client: Any, command: str) -> tuple[int, str, str]:
-    _stdin, stdout, stderr = client.exec_command(command, get_pty=False)
+    _stdin, stdout, stderr = client.exec_command(command, get_pty=False, timeout=20)
     output = stdout.read().decode("utf-8", errors="replace").strip()
     error = stderr.read().decode("utf-8", errors="replace").strip()
     return stdout.channel.recv_exit_status(), output, error
@@ -37,7 +63,7 @@ def _configuration(context: RunContext, *, require_paths: bool) -> dict[str, Any
     mode_flags = {
         "自动最佳（--best）": ["--best"],
         "FP16": ["--fp16"],
-        "FP32": [],
+        "FP32": ["--noTF32"],
     }
     if mode not in mode_flags:
         raise ValueError("请选择有效的 TensorRT 构建精度。")
@@ -68,7 +94,7 @@ def _configuration(context: RunContext, *, require_paths: bool) -> dict[str, Any
         legacy_source = context.paths.get("input_onnx")
         source_values = [str(legacy_source)] if legacy_source else []
     if not isinstance(source_values, list) or not 1 <= len(source_values) <= 50:
-        raise ValueError("请至少填写 1 个、最多填写 50 个量化 ONNX 文件路径，每行一个。")
+        raise ValueError("请至少填写 1 个、最多填写 50 个远端 ONNX 文件路径，每行一个。")
     sources: list[PurePosixPath] = []
     seen_sources: set[PurePosixPath] = set()
     for index, value in enumerate(source_values, 1):
@@ -80,7 +106,7 @@ def _configuration(context: RunContext, *, require_paths: bool) -> dict[str, Any
             seen_sources.add(source)
             sources.append(source)
     if not sources:
-        raise ValueError("请至少填写一个量化 ONNX 文件路径。")
+        raise ValueError("请至少填写一个远端 ONNX 文件路径。")
     jobs: list[dict[str, PurePosixPath]] = []
     planned_outputs: set[PurePosixPath] = set()
     for source in sources:
@@ -116,7 +142,7 @@ def _connect(parameters: dict[str, Any]) -> tuple[Any, dict[str, Any]]:
     except Exception as exc:
         connection["password"] = ""
         client.close()
-        raise ValueError(RemoteInferenceManager._connection_error(
+        raise RemoteBuildDisconnected(RemoteInferenceManager._connection_error(
             exc, paramiko, connection["host"], connection["port"]
         )) from exc
     connection["password"] = ""
@@ -160,6 +186,22 @@ def _validate_remote_jobs(client: Any, config: dict[str, Any], report: Any) -> N
                 raise ValueError(f"第 {index} 个远端 ONNX 文件不存在或无权访问：{source}") from exc
             if getattr(attributes, "st_size", 0) <= 0:
                 raise ValueError(f"第 {index} 个远端 ONNX 文件为空：{source}")
+            if config["mode"] in {"FP16", "FP32"}:
+                probe = Path(__file__).with_name('onnx_precision_probe.py').read_text(encoding='utf-8')
+                status, output, error = _remote_capture(client, shlex.join(['python3', '-c', probe, source]))
+                if status:
+                    raise ValueError(f"无法检查远端 ONNX 精度：{source}；{error or output}。FP16/FP32 构建需盒子可运行 python3（无需 onnx 包）。")
+                try:
+                    precision = json.loads(output)
+                    if not isinstance(precision, dict) or type(precision.get('quantized')) is not bool or not isinstance(precision.get('reducedFloatTypes'), list):
+                        raise ValueError('invalid probe response')
+                except (ValueError, TypeError) as exc:
+                    raise ValueError('远端 ONNX 精度检查未返回有效结果，已停止构建。') from exc
+                if precision['quantized']:
+                    raise ValueError(f"{source} 含量化算子 {precision.get('quantizedOps')}，不能通过选择 {config['mode']} 恢复精度。请使用 PT 直接导出的未量化 FP32 ONNX，跳过 Docker ONNX 量化。")
+                if config['mode'] == 'FP32' and precision['reducedFloatTypes']:
+                    raise ValueError(f"{source} 已含低精度浮点张量，不能保证 FP32 构建。请从原 PT 重新导出 FP32 ONNX。")
+                report(f"精度检查通过：未发现量化算子；{config['mode']} 构建，FP32 时禁用 TF32。最终层精度请以引擎检查为准。")
             if not config["overwrite"]:
                 for output in (job["output_plan"], job["output_log"]):
                     try:
@@ -202,6 +244,8 @@ def _follow_job(
 ) -> None:
     previous: list[str] = []
     while True:
+        if context.detach_event is not None and context.detach_event.is_set():
+            raise RemoteBuildDisconnected("平台已关闭，已断开日志监控；远端构建未被终止，可重新连接。")
         if context.stop_event is not None and context.stop_event.is_set():
             if launcher == "tmux":
                 _remote_capture(client, f"tmux send-keys -t {shlex.quote(token)} C-c 2>/dev/null || true")
@@ -228,9 +272,11 @@ def _follow_job(
         status, exit_code, _ = _remote_capture(
             client, f"test -f {shlex.quote(remote_dir + '/exit.code')} && cat {shlex.quote(remote_dir + '/exit.code')}"
         )
-        if status == 0:
+        if status == 0 and exit_code.strip():
+            if not exit_code.strip().isdigit():
+                raise RemoteBuildDisconnected("远端退出状态内容异常，请检查任务目录后重连。")
             if exit_code.strip() != "0":
-                raise RuntimeError(f"远端 TensorRT 构建失败（退出码 {exit_code.strip()}），请查看 trtexec 日志。")
+                raise RemoteBuildFailed(f"远端 TensorRT 构建失败（退出码 {exit_code.strip()}），请查看 trtexec 日志。")
             return
         if launcher == "tmux":
             status, _, _ = _remote_capture(client, f"tmux has-session -t {shlex.quote(token)} 2>/dev/null")
@@ -238,8 +284,106 @@ def _follow_job(
             pid_file = shlex.quote(remote_dir + "/launcher.pid")
             status, _, _ = _remote_capture(client, f"test -f {pid_file} && kill -0 $(cat {pid_file}) 2>/dev/null")
         if status:
-            raise RuntimeError("远端后台任务已结束，但没有生成退出状态；请检查远端日志。")
-        time.sleep(2)
+            # The wrapper may have finished between the exit-file check and
+            # the liveness check. Re-read before declaring the state unknown.
+            status, exit_code, _ = _remote_capture(client, f"cat {shlex.quote(remote_dir + '/exit.code')} 2>/dev/null")
+            if status == 0 and exit_code.strip() == "0":
+                return
+            if status == 0 and exit_code.strip():
+                if not exit_code.strip().isdigit():
+                    raise RemoteBuildDisconnected("远端退出状态内容异常，请检查任务目录后重连。")
+                raise RemoteBuildFailed(f"远端 TensorRT 构建失败（退出码 {exit_code.strip()}）。")
+            raise RemoteBuildDisconnected("远端会话未找到且没有退出状态，无法确认是否完成；请检查日志后重连，不会自动重新构建。")
+        if context.detach_event is not None:
+            context.detach_event.wait(2)
+        else:
+            time.sleep(2)
+
+
+def _follow_existing_job(client: Any, state: dict[str, Any], context: RunContext) -> dict[str, Any]:
+    state = validate_remote_job(state)
+    _follow_job(client, state["token"], state["remoteDirectory"], state["log"],
+                state["plan"], state["launcher"], context)
+    status, size_text, error = _remote_capture(
+        client, f"test -s {shlex.quote(state['plan'])} && "
+        f"test \"$(head -c 4 {shlex.quote(state['plan'])})\" = ftrt && stat -c %s {shlex.quote(state['plan'])}")
+    if status:
+        raise RemoteBuildFailed(f"trtexec 已结束但没有生成有效 .plan：{error or state['plan']}")
+    size = int(size_text.strip())
+    context.report(f"TensorRT 引擎已在远端生成：{state['plan']}（{size / 1024 / 1024:.2f} MB）")
+    # Retain the recovery metadata even when users opt to clean task files:
+    # an exit.code + job.json is tiny and allows post-restart status lookup.
+    return {"message": "TensorRT 构建完成。", "outputFiles": [state["plan"], state["log"]],
+            "outputFolders": [str(PurePosixPath(state["source"]).parent)], "engineSize": size}
+
+
+def reconnect_remote_build(context: RunContext, state: dict[str, Any]) -> dict[str, Any]:
+    state = validate_remote_job(state)
+    client = None
+    try:
+        client, _ = _connect(context.parameters)
+        context.report(f"重新接管远端任务：{state['token']}；只读取状态和日志，不重新执行构建。")
+        return _follow_existing_job(client, state, context)
+    finally:
+        context.parameters["password"] = ""
+        if client is not None:
+            client.close()
+
+
+def discover_remote_builds(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Read only: recover metadata, or legacy directories matching supplied ONNX paths."""
+    context = RunContext("remote_tensorrt_build", {}, parameters, lambda _: None)
+    config = _configuration(context, require_paths=False)
+    candidates: dict[str, PurePosixPath] = {}
+    if str(parameters.get("onnx_files", "")).strip() not in {"", "[]"}:
+        for job in _configuration(context, require_paths=True)["jobs"]:
+            source = job["source"]
+            if source.stem in candidates and candidates[source.stem] != source:
+                raise ValueError("旧任务查找时请勿填写文件名相同、目录不同的 ONNX，请分开查找。")
+            candidates[source.stem] = source
+    client, _ = _connect(parameters)
+    sftp = None
+    found, skipped = [], 0
+    try:
+        sftp = client.open_sftp()
+        root = _resolved_remote_root(sftp, config["remote_root"])
+        try:
+            entries = sorted(sftp.listdir_attr(str(root)), key=lambda entry: getattr(entry, "st_mtime", 0), reverse=True)[:500]
+        except OSError as exc:
+            raise ValueError(f"无法读取远端任务目录 {root}，请确认使用原任务根目录且有读取权限。") from exc
+        candidate_sources = {str(source) for source in candidates.values()}
+        for entry in entries:
+            name = entry.filename
+            match = re.fullmatch(r"(.+)-([0-9a-f]{12})", name)
+            if not match:
+                continue
+            directory = str(root / name)
+            try:
+                with sftp.open(directory + "/job.json", "r") as handle:
+                    raw = json.loads(handle.read(65537))
+                state = validate_remote_job(raw)
+                if state["remoteDirectory"] != directory:
+                    raise ValueError("任务目录不匹配")
+            except (OSError, ValueError, TypeError, KeyError):
+                source = candidates.get(match[1])
+                if source is None:
+                    skipped += 1
+                    continue
+                try:
+                    sftp.stat(directory + "/launcher.pid")
+                    launcher = "setsid"
+                except OSError:
+                    launcher = "tmux"
+                state = validate_remote_job({"source": str(source), "remoteDirectory": directory,
+                    "token": "yolo-trt-" + match[2], "launcher": launcher, "keepRemote": True})
+            if candidates and state["source"] not in candidate_sources:
+                continue  # A targeted lookup must not import unrelated models.
+            found.append(state)
+        return {"jobs": found, "skipped": skipped}
+    finally:
+        if sftp is not None:
+            sftp.close()
+        client.close()
 
 
 def _trtexec_arguments(config: dict[str, Any], remote_input: str, remote_plan: str) -> list[str]:
@@ -290,6 +434,20 @@ def _run_one_job(
         f"printf '%s\\n' \"$result\" > {shlex.quote(remote_exit)}; exit \"$result\""
     )
     token = f"yolo-trt-{job_id}"
+    state = validate_remote_job({"source": remote_input, "remoteDirectory": remote_dir,
+        "token": token, "launcher": config["launcher"], "keepRemote": config["keep_remote"]})
+    # Save before executing SSH launch: a crash after command acceptance must
+    # never lead to automatically re-executing the same model on restart.
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(remote_dir + "/job.json", "w") as handle:
+            handle.write(json.dumps(state, ensure_ascii=False))
+    finally:
+        sftp.close()
+    if context.checkpoint is not None:
+        context.checkpoint(state)
+    if context.detach_event is not None and context.detach_event.is_set():
+        raise RemoteBuildDisconnected("平台已关闭，未继续提交远端启动命令；请重连确认状态。")
     if config["launcher"] == "tmux":
         launch = (
             f"tmux new-session -d -s {shlex.quote(token)} "
@@ -303,7 +461,7 @@ def _run_one_job(
         )
     status, _, error = _remote_capture(client, launch)
     if status:
-        raise RuntimeError(
+        raise RemoteBuildFailed(
             f"第 {index}/{total} 个模型启动远程后台构建失败：{error or f'退出码 {status}'}"
         )
     launcher_message = (
@@ -311,38 +469,8 @@ def _run_one_job(
     )
     context.report(f"[{index}/{total}] 已在远程{launcher_message}中启动。")
     context.report(f"[{index}/{total}] TensorRT 命令：{command}")
-    try:
-        _follow_job(
-            client, token, remote_dir, remote_log, remote_plan,
-            config["launcher"], context,
-        )
-    except (RuntimeError, TaskCancelled) as exc:
-        context.report(f"[{index}/{total}] 请检查远端日志：{remote_log}")
-        if isinstance(exc, TaskCancelled):
-            raise
-        raise RuntimeError(
-            f"第 {index}/{total} 个模型 {source.name} 构建失败：{exc}"
-        ) from exc
-
-    status, size_text, error = _remote_capture(
-        client,
-        f"test -s {shlex.quote(remote_plan)} && "
-        f"test \"$(head -c 4 {shlex.quote(remote_plan)})\" = ftrt && "
-        f"stat -c %s {shlex.quote(remote_plan)}",
-    )
-    if status:
-        raise RuntimeError(
-            f"第 {index}/{total} 个模型的 trtexec 已结束但未在远端生成有效 .plan："
-            f"{error or remote_plan}"
-        )
-    remote_size = int(size_text.strip())
-    context.report(
-        f"[{index}/{total}] TensorRT 引擎已在远端生成：{remote_plan}"
-        f"（{remote_size / 1024 / 1024:.2f} MB）"
-    )
-    if not config["keep_remote"]:
-        _remote_capture(client, f"rm -rf -- {shlex.quote(remote_dir)}")
-        context.report(f"[{index}/{total}] 远程任务目录已清理。")
+    result = _follow_existing_job(client, state, context)
+    remote_size = result["engineSize"]
     return {
         "source": str(source),
         "plan": remote_plan,
