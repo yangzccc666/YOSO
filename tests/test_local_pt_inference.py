@@ -6,6 +6,7 @@ import unittest
 import json
 import io
 import subprocess
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -158,6 +159,7 @@ class LocalPTInferenceTests(unittest.TestCase):
             with self.subTest(options=options), patch.dict("sys.modules", {"onnx": fake}), self.assertRaises(ValueError):
                 inspect_model_file("fixture.onnx")
 
+    @patch.dict("os.environ", {"PROCESSING_VIEW_YOLO_PYTHON": sys.executable})
     def test_label_detection_worker_protocol_error_and_timeout(self):
         stream = io.BytesIO()
         send_worker_packet(stream, {"type": "metadata", "labels": ["MARK"], "found": True})
