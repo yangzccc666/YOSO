@@ -156,11 +156,8 @@ def _sampling_filename_info(
     interval_sec: float | None,
     fallback_step: int,
 ) -> tuple[str, float]:
-    capture = module.open_video(str(video))
-    try:
+    with module.open_video(str(video)) as capture:
         source_fps = float(capture.get(module.cv2.CAP_PROP_FPS) or 0.0)
-    finally:
-        capture.release()
     if source_fps > 0:
         if target_fps is not None:
             step_frames = max(1, int(round(source_fps / min(target_fps, source_fps))))
@@ -334,11 +331,8 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             raise RuntimeError(f"输出磁盘可用空间不足 256 MB：{parent}。请释放磁盘空间。")
         if mode == "工序时间段高密度":
             sampling_tag = f"priority{_filename_number(priority_fps or 25)}_bg{_filename_number(background_fps or 5)}"
-            capture = module.open_video(str(video))
-            try:
+            with module.open_video(str(video)) as capture:
                 source_fps = float(capture.get(module.cv2.CAP_PROP_FPS) or 0.0)
-            finally:
-                capture.release()
         else:
             sampling_tag, source_fps = _sampling_filename_info(
                 module, video, target_fps, interval_sec, fallback_step,
@@ -361,12 +355,9 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
                 group_outputs[group_key] = _unique_output_folder(parent, stem)
             output_folder = group_outputs[group_key]
         report(f"[{index}/{len(videos)}] 正在处理：{video}\n输出目录：{output_folder}")
-        probe = module.open_video(str(video))
-        try:
+        with module.open_video(str(video)) as probe:
             width = max(0, int(probe.get(module.cv2.CAP_PROP_FRAME_WIDTH)))
             height = max(0, int(probe.get(module.cv2.CAP_PROP_FRAME_HEIGHT)))
-        finally:
-            probe.release()
         memory_estimate = max(DEFAULT_WORKER_MEMORY, width * height * 3 * 16 + 128 * MIB)
         last_progress = 0.0
         last_activity = time.monotonic()
@@ -421,7 +412,15 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         else:
             image_count = 0
         if image_count == 0:
-            raise RuntimeError(f"{video.name} 没有成功生成图片，请确认视频可以正常播放。")
+            result = process_result or {}
+            warnings = result.get("warnings", [])
+            if result.get("write_error_count"):
+                first_failure = next((message for message in warnings if message.startswith("图片保存失败")), "")
+                raise RuntimeError(f"视频已解码，但保存图片失败 {result['write_error_count']} 张。{first_failure}")
+            if result.get("read_error_count"):
+                first_failure = warnings[0] if warnings else ""
+                raise RuntimeError(f"视频已打开，但未成功解码所选帧。{first_failure}")
+            raise RuntimeError("该视频未生成图片，请检查抽帧设置和运行输出。")
         limit_reached = bool(max_images is not None and image_count >= max_images)
         detail = {
             "index": index,

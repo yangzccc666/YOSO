@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import cv2
@@ -42,6 +43,12 @@ class Capture:
 
     def release(self):
         self.released = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.release()
 
 
 class VideoProgressTests(unittest.TestCase):
@@ -88,12 +95,20 @@ class VideoProgressTests(unittest.TestCase):
         self.assertTrue(any('可能已提前到结尾或视频存在损坏' in line for line in status))
 
     def test_write_failures_are_separate_and_progress_continues(self):
-        with patch.object(frames.cv2, 'imwrite', side_effect=[False, cv2.error('write failed')] + [True] * 18):
-            result, updates, _ = self.run_capture(Capture())
+        save_jpeg = frames._save_jpeg
+        attempts = iter((PermissionError('拒绝访问'), cv2.error('JPEG error')))
+        def write(path, frame):
+            failure = next(attempts, None)
+            if failure:
+                raise failure
+            save_jpeg(path, frame)
+        with patch.object(frames, '_save_jpeg', side_effect=write):
+            result, updates, status = self.run_capture(Capture())
         self.assertEqual(result['write_error_count'], 2)
         self.assertEqual(result['read_error_count'], 0)
         self.assertEqual(result['success_count'], 18)
         self.assertEqual(updates[-1], (20, 20))
+        self.assertTrue(any('图片保存失败' in line and '拒绝访问' in line for line in status))
 
     def test_cancellation_during_skipped_frame_decoding_releases_capture(self):
         checks = 0
@@ -174,6 +189,56 @@ class StreamMetadataTests(unittest.TestCase):
 
 
 class AdapterProgressTests(unittest.TestCase):
+    def test_chinese_video_and_output_paths_use_stream_reading_and_binary_jpeg_writes(self):
+        if 'open(source, apiPreference, params)' not in cv2.VideoCapture.open.__doc__:
+            self.skipTest('This OpenCV build predates the VideoCapture stream overload')
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            temporary = root / 'fixture.mp4'
+            writer = cv2.VideoWriter(str(temporary), cv2.VideoWriter_fourcc(*'mp4v'), 10, (64, 48))
+            self.assertTrue(writer.isOpened())
+            for index in range(10):
+                writer.write(np.full((48, 64, 3), index * 10, dtype=np.uint8))
+            writer.release()
+            input_folder = root / '渗透线源视频'
+            input_folder.mkdir()
+            source = temporary.rename(input_folder / '渗透2号线-工位1_beike_20261116.mp4')
+            destination = root / '抽帧结果'
+            open_capture = frames.cv2.VideoCapture
+            opened_streams = []
+            def reject_filename_capture(source_or_path, *args):
+                if isinstance(source_or_path, str):
+                    raise AssertionError("The decoder must receive a stream for the Windows Unicode path")
+                opened_streams.append(source_or_path)
+                return open_capture(source_or_path, *args)
+            with patch.object(frames, 'sys', SimpleNamespace(platform='win32')), \
+                 patch.object(frames.cv2, 'VideoCapture', side_effect=reject_filename_capture), \
+                 patch.object(frames.cv2, 'imwrite', side_effect=AssertionError("Use Python's Unicode file IO")):
+                result = adapter.run_video_frames(RunContext('video_frames', {'video_file': source, 'output_folder': destination},
+                    {'target_fps': 5, 'parallel_workers': 1}, lambda _: None))
+            pictures = sorted(Path(result['outputFolders'][0]).glob('*.jpg'))
+            self.assertEqual(result['imageCount'], 5)
+            self.assertEqual(len(pictures), 5)
+            self.assertTrue(opened_streams and all(stream.closed for stream in opened_streams))
+            self.assertTrue(all('渗透2号线' in path.name and path.is_relative_to(destination) for path in pictures))
+            for path in pictures:
+                decoded = cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
+                self.assertEqual(decoded.shape, (48, 64, 3))
+
+    def test_decode_and_write_failures_have_different_final_errors(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            source = Path(scratch) / 'fixture.mp4'
+            source.touch()
+            context = RunContext('video_frames', {'video_file': source}, {'target_fps': 5, 'parallel_workers': 1}, lambda _: None)
+            with patch.object(frames, '_stream_frame_count', side_effect=lambda path, count, fps, *_: (count, fps)):
+                with patch.object(frames, 'open_video', side_effect=lambda _: Capture(bad=range(100))):
+                    with self.assertRaisesRegex(RuntimeError, '未成功解码所选帧'):
+                        adapter.run_video_frames(context)
+                with patch.object(frames, 'open_video', side_effect=lambda _: Capture()), \
+                     patch.object(frames, '_save_jpeg', side_effect=PermissionError('输出目录拒绝访问')):
+                    with self.assertRaisesRegex(RuntimeError, '视频已解码.*输出目录拒绝访问'):
+                        adapter.run_video_frames(context)
+
     def test_early_end_warning_reaches_summary_and_history_payload(self):
         with tempfile.TemporaryDirectory() as scratch:
             source = Path(scratch) / 'fixture.mp4'

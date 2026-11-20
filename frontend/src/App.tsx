@@ -17,6 +17,7 @@ import { appendFolderPaths } from './multiFolderPaths'
 import { defaultValuesFor, withoutSecrets, workingValuesFor } from './functionDefaults'
 import { ExternalToolsMenu } from './components/ExternalToolsMenu'
 import { WorkClockPopover } from './components/WorkClockPopover'
+import { CountdownControl } from './components/CountdownControl'
 import { ApiRequestError, getPlatformSettings, launchExternalApp } from './api'
 import { parseStarModels, upsertStarModel } from './remoteStarModels'
 import { createWorkflowTodo, loadWorkflowTodos, saveWorkflowTodos } from './workflowTodos'
@@ -672,6 +673,7 @@ export default function App() {
           <button className="history-trigger workflow-trigger" onClick={() => setWorkflowOpen(true)} aria-label={`工作流待办 ${workflowTodos.length} 条`}><icons.FolderInput size={17} /><span>待办 {workflowTodos.length}</span></button>
           <button className="history-trigger" onClick={() => setHistoryOpen(true)} aria-label="全局运行历史"><icons.Clock3 size={17} /><span>运行历史</span></button>
           {activeTasks.length ? <details className="task-overview"><summary>运行中 {activeTasks.length} 项</summary><div className="task-overview-list">{activeTasks.map((task) => <div key={task.id}><button className="task-overview-link" onClick={(event) => openRunningTask(task, event.currentTarget.closest('details'))} title={`转到 ${task.name}`}><strong>{task.name}</strong><small>{task.status === 'stopping' ? '正在终止' : task.kind === 'remote-build' ? '远端后台构建中' : task.kind === 'remote-training' ? '远程训练中' : task.kind === 'remote' ? '远程运行中' : '本地运行中'}</small></button><button className="task-overview-stop" onClick={() => stopRunningTask(task.id)} disabled={task.status === 'stopping'} aria-label={`终止 ${task.name}`}>终止</button></div>)}</div></details> : null}
+          <CountdownControl />
           <span className="local-status"><i />本地运行</span><button onClick={() => setSettingsOpen(true)} aria-label="本机设置" title="本机设置"><icons.Settings size={18} /></button><WorkClockPopover />
         </div>
       </header>

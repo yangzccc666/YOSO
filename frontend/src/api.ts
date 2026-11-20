@@ -73,6 +73,13 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
 export const getPackageNaming = (line = '', station = '') => request<import('./packageNaming').PackageNamingHistory>(`/api/local-star-package/naming?line=${encodeURIComponent(line)}&station=${encodeURIComponent(station)}`)
 
 export const getWorkClock = () => request<import('./workClock').WorkClockPayload>('/api/work-clock')
+export type Countdown = { id: string; note: string; deadlineMs: number }
+export type CountdownPayload = { timers: Countdown[]; nativeNotifications: boolean }
+export const getCountdowns = (signal: AbortSignal) => request<CountdownPayload>('/api/countdowns', { signal })
+export const startCountdown = (note: string, durationSeconds: number) => request<CountdownPayload>('/api/countdowns', {
+  method: 'POST', body: JSON.stringify({ note, durationSeconds }),
+})
+export const removeCountdown = (id: string) => request<CountdownPayload>(`/api/countdowns/${encodeURIComponent(id)}`, { method: 'DELETE' })
 export const getOvertime = () => request<import('./overtime').OvertimeStatus>('/api/overtime')
 export const updateOvertime = (action: string, values: Record<string, unknown>) => request<import('./overtime').OvertimeStatus>(`/api/overtime/${action}`, { method: 'POST', body: JSON.stringify(values) })
 export const saveWorkClock = (settings: import('./workClock').WorkClockSettings) => request<import('./workClock').WorkClockPayload>('/api/work-clock', { method: 'PUT', body: JSON.stringify(settings) })

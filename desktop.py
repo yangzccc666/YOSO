@@ -212,6 +212,8 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             hot_reloader = None
         server_module.set_path_chooser(None)
         server_module.set_system_notifier(None)
+        server_module.set_countdown_notifier(None)
+        countdown_popup.hide()
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=3)
@@ -303,6 +305,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             # Some Linux desktops expose no system tray. Keep a non-modal,
             # auto-closing fallback so task completion is still visible.
             popup = QMessageBox(QMessageBox.Icon.Information, title, message, parent=window)
+            popup.setTextFormat(Qt.TextFormat.PlainText)
             popup.setModal(False)
             popup.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
             popup.setWindowFlag(Qt.WindowType.WindowDoesNotAcceptFocus, True)
@@ -321,6 +324,11 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
 
     notifier = QtSystemNotifier()
     server_module.set_system_notifier(notifier.notify)
+
+    from desktop_countdown import CountdownPopup
+
+    countdown_popup = CountdownPopup(lambda key: server_module.countdown_store.remove(key))
+    server_module.set_countdown_notifier(countdown_popup.reminders_changed.emit)
 
     web_view = QWebEngineView(window)
     window.setCentralWidget(web_view)
@@ -370,11 +378,13 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             fresh_module = import_fresh_server_module()
             fresh_module.set_path_chooser(chooser.choose)
             fresh_module.set_system_notifier(notifier.notify)  # type: ignore[union-attr]
+            fresh_module.set_countdown_notifier(countdown_popup.reminders_changed.emit)
         except Exception as exc:
             return False, f"后台代码加载失败，仍保留当前版本：{exc}"
 
         old_module.set_path_chooser(None)
         old_module.set_system_notifier(None)
+        old_module.set_countdown_notifier(None)
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=3)
@@ -387,6 +397,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             try:
                 old_module.set_path_chooser(chooser.choose)
                 old_module.set_system_notifier(notifier.notify)  # type: ignore[union-attr]
+                old_module.set_countdown_notifier(countdown_popup.reminders_changed.emit)
                 fallback_server = old_module.create_server(port=actual_port, static_dir=static_dir)
                 fallback_thread = threading.Thread(
                     target=fallback_server.serve_forever,

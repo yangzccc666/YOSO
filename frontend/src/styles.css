@@ -65,6 +65,42 @@ button { cursor: pointer; }
 .top-actions button { width: 30px; height: 30px; display: grid; place-items: center; border: 0; border-radius: 6px; background: transparent; color: #54627a; }
 .top-actions button:hover { background: var(--soft); color: var(--blue); }
 .top-actions .history-trigger { width: auto; display: flex; align-items: center; gap: 6px; padding: 0 9px; }
+.countdown-control { position: relative; flex-shrink: 0; }
+.countdown-trigger[aria-expanded="true"] { background: var(--soft); color: var(--blue); }
+.top-actions .countdown-trigger.due { border: 1px solid #e6a0aa; background: #ffe9ec; color: #9c182e; font-weight: 650; }
+.top-actions .countdown-trigger.due:hover { background: #ffdae1; }
+.countdown-count { min-width: 17px; padding: 2px 4px; border-radius: 10px; background: var(--soft); color: var(--blue); text-align: center; font-size: 10px; }
+.countdown-count.due { background: #ac2239; color: #fff; }
+.countdown-panel { position: absolute; z-index: 2; top: calc(100% + 10px); right: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); width: min(370px, calc(100vw - 28px)); max-height: calc(100vh - 84px); border: 1px solid var(--border); border-radius: 10px; background: #fff; box-shadow: 0 16px 45px #23344c26; }
+.countdown-panel > header { display: flex; justify-content: space-between; align-items: center; padding: 11px 15px; border-bottom: 1px solid var(--border); font-size: 15px; }
+.countdown-panel-body { padding: 14px 15px; overflow-y: auto; overscroll-behavior: contain; }
+.countdown-panel form, .countdown-panel label { display: grid; gap: 6px; }
+.countdown-panel form { gap: 12px; }
+.countdown-panel label { min-width: 0; color: #45546c; font-size: 12px; }
+.countdown-panel input { width: 100%; min-width: 0; height: 34px; padding: 0 8px; border: 1px solid #cbd8ea; border-radius: 5px; color: #253650; background: #fff; font: inherit; }
+.countdown-panel input:focus-visible { outline: 2px solid #91b9ff; outline-offset: 1px; }
+.countdown-duration { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.countdown-panel .countdown-start { width: fit-content; display: inline-flex; align-items: center; gap: 5px; padding: 0 10px; background: var(--blue); color: #fff; }
+.countdown-panel .countdown-start:not(:disabled):hover { background: #0959db; color: #fff; }
+.countdown-panel button:disabled, .countdown-alert button:disabled { opacity: .55; cursor: default; }
+.countdown-list { display: grid; gap: 5px; margin: 13px 0 0; padding: 10px 0 0; border-top: 1px solid var(--border); list-style: none; }
+.countdown-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px; min-height: 34px; padding-inline: 6px; overflow: hidden; border-radius: 5px; }
+.countdown-list li.due { background: #ffedf0; box-shadow: inset 3px 0 #b92b43; }
+.countdown-list button, .countdown-error button { width: auto; padding-inline: 6px; font-size: 12px; }
+.countdown-note { color: #2a3e57; overflow-wrap: anywhere; }
+.countdown-remaining { color: #245db5; font-variant-numeric: tabular-nums; }
+.countdown-remaining.due { color: #a11c33; font-weight: 650; }
+.countdown-error { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: #af3447; }
+.countdown-empty { margin: 12px 0 0; color: var(--muted); }
+.countdown-alert { position: fixed; z-index: 65; right: 20px; top: 74px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 12px; width: min(435px, calc(100vw - 40px)); padding: 16px; border: 1px solid #e294a3; border-left: 5px solid #ad2437; border-radius: 9px; background: #fff1f3; color: #88172b; box-shadow: 0 12px 35px #3c182b29; font-size: 14px; }
+.countdown-alert strong { font-size: 17px; }
+.countdown-alert.below-panel { top: auto; bottom: 20px; }
+.countdown-alert p { margin: 4px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.countdown-alert button { padding: 6px 9px; border: 1px solid #ad2437; border-radius: 5px; background: #ad2437; color: #fff; white-space: nowrap; }
+@media (max-width: 1050px) {
+  .countdown-trigger-label { display: none; }
+  .countdown-panel { position: fixed; top: 62px; right: 14px; }
+}
 .local-status { display: flex; align-items: center; gap: 7px; margin-right: 6px; }
 .local-status i { width: 7px; height: 7px; border-radius: 50%; background: #25ae6f; box-shadow: 0 0 0 3px #dcf4e8; }
 .work-clock { position: relative; flex-shrink: 0; }

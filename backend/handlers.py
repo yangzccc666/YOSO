@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Callable, Protocol
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Mapping, Protocol
 
 from .task_manager import TaskCancelled
 
@@ -13,7 +13,7 @@ from .task_manager import TaskCancelled
 @dataclass
 class RunContext:
     function_id: str
-    paths: dict[str, Path]
+    paths: Mapping[str, Path | PurePosixPath]
     parameters: dict[str, Any]
     report: Callable[[str], None]
     stop_event: threading.Event | None = None

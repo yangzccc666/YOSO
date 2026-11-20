@@ -7,7 +7,9 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -75,6 +77,18 @@ def parse_video_paths(inputs: str | list[str], check_cancelled: Callable[[], Non
     return result
 
 
+def _ffmpeg_capture(source, options: list[int]):
+    try:
+        capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG, options)
+    except cv2.error:
+        return None  # Older builds may reject extra options or file objects.
+    if capture.isOpened():
+        return capture
+    capture.release()
+    return None
+
+
+@contextmanager
 def open_video(path: str):
     """Keep each FFmpeg decoder small instead of oversubscribing CPU threads."""
     options = []
@@ -83,15 +97,43 @@ def open_video(path: str):
     for name, milliseconds in (("CAP_PROP_OPEN_TIMEOUT_MSEC", 10000), ("CAP_PROP_READ_TIMEOUT_MSEC", 15000)):
         if hasattr(cv2, name):
             options.extend([getattr(cv2, name), milliseconds])
-    if options:
+    if sys.platform == "win32" and not path.isascii():
+        # Open non-ASCII Windows paths through Python. The decoder receives
+        # a seekable file stream and never needs to interpret the filename.
+        with Path(path).open("rb") as source:
+            capture = _ffmpeg_capture(source, options)
+            if capture is None and options:
+                source.seek(0)
+                capture = _ffmpeg_capture(source, [])
+            if capture is not None:
+                try:
+                    yield capture
+                finally:
+                    capture.release()
+                return
+    capture = _ffmpeg_capture(path, options) if options else None
+    if capture is None:
+        capture = cv2.VideoCapture(path)
+    try:
+        yield capture
+    finally:
+        capture.release()
+
+
+def _save_jpeg(path: Path, frame) -> None:
+    ok, encoded = cv2.imencode(".jpg", frame)
+    if not ok:
+        raise ValueError("JPEG 编码失败")
+    stream = path.open("xb")
+    try:
+        with stream:
+            stream.write(encoded)
+    except OSError:
         try:
-            capture = cv2.VideoCapture(path, cv2.CAP_FFMPEG, options)
-            if capture.isOpened():
-                return capture
-            capture.release()
-        except cv2.error:
-            pass  # Older OpenCV backends may reject optional open parameters.
-    return cv2.VideoCapture(path)
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass  # Preserve the original write error.
+        raise
 
 
 def _stream_frame_count(path: str, frame_count: int, fps: float,
@@ -113,7 +155,7 @@ def _stream_frame_count(path: str, frame_count: int, fps: float,
             options = ["-count_packets"] if count_packets else []
             process = subprocess.Popen([ffprobe, "-v", "error", "-select_streams", "v:0", *options,
                 "-show_entries", fields, "-of", "json", path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             deadline = time.monotonic() + 8
             while True:
@@ -182,16 +224,13 @@ def vedio2img(
     check_cancelled: Callable[[], None] | None = None,
     report_progress: Callable[[int, int], None] | None = None,
     report_status: Callable[[str], None] | None = None,
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
     Path(images_save_path).mkdir(parents=True, exist_ok=True)
-    capture = open_video(vedio_path)
-    if not capture.isOpened():
-        capture.release()
-        print(f"无法打开视频文件: {vedio_path}")
-        return None
     prefix = str(filename_prefix or Path(vedio_path).stem)
     mixed = bool(priority_ranges)
-    try:
+    with open_video(vedio_path) as capture:
+        if not capture.isOpened():
+            raise RuntimeError("无法打开输入视频。请确认文件可读取，且视频编码受当前解码器支持。")
         raw_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         frame_count = max(0, int(raw_count)) if math.isfinite(raw_count) else 0
         source_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -199,6 +238,8 @@ def vedio2img(
             source_fps = 0.0
         emit = report_status or (lambda _message: None)
         frame_count, source_fps = _stream_frame_count(vedio_path, frame_count, source_fps, check_cancelled, emit)
+        if frame_count <= 0:
+            raise RuntimeError("视频已打开，但未读到有效的总帧数。请检查视频轨道或重新导出该视频。")
         if mixed:
             if source_fps <= 0:
                 raise ValueError("无法读取源视频 FPS，不能使用工序时间段高密度抽帧")
@@ -327,16 +368,14 @@ def vedio2img(
                     time_tag = f"t{round(frame_index * 1000 / source_fps):09d}ms" if source_fps > 0 else "tunknown"
                     image = Path(images_save_path) / f"{prefix}_{filename_tag}_{time_tag}_f{frame_index:08d}.jpg"
                     try:
-                        written = cv2.imwrite(str(image), frame)
-                    except cv2.error:
-                        written = False
-                    if written:
-                        success += 1
-                        saved_indices.append(frame_index)
-                    else:
+                        _save_jpeg(image, frame)
+                    except (cv2.error, OSError, ValueError) as exc:
                         write_errors += 1
                         if write_errors == 1:
-                            warn("图片保存失败，请检查输出磁盘空间、目录权限或路径；已保存图片不会删除。")
+                            warn(f"图片保存失败（源帧 {frame_index}）：{image}。原因：{exc}")
+                    else:
+                        success += 1
+                        saved_indices.append(frame_index)
             if report_progress is not None:
                 report_progress(position, len(selected))
             if not readable:
@@ -353,5 +392,3 @@ def vedio2img(
             "filename_tag": filename_tag, "priority_candidate_count": len(priority_candidates),
             "background_candidate_count": len(background_candidates),
         }
-    finally:
-        capture.release()

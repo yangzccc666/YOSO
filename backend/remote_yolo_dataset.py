@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import threading
 import time
@@ -137,6 +138,8 @@ def _remote_path(context: RunContext, field_id: str, label: str, required: bool 
     value = str(context.paths.get(field_id, "")).strip()
     if required and not value:
         raise ValueError(f"请填写远程服务器上的{label}。")
+    if value.startswith("\\") or re.match(r"^[A-Za-z]:[/\\\\]", value):
+        raise ValueError(f"远程{label}请使用服务器上的 Linux 路径，例如 /home/user/dataset。")
     return value
 
 

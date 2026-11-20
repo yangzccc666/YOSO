@@ -12,7 +12,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules, copy_metada
 
 ROOT = Path(SPECPATH).parent
 APP_NAME = "YOLO-Data-Platform"
-VERSION = os.environ.get("RELEASE_VERSION", "v26.1.6").removeprefix("v")
+VERSION = os.environ.get("RELEASE_VERSION", "v26.1.7").removeprefix("v")
 PROFILE = os.environ.get("YOLO_BUILD_PROFILE", "standard").strip()
 AI_MODULES = ("torch", "torchvision", "ultralytics", "onnx", "onnxruntime", "onnxslim")
 if PROFILE not in {"standard", "ai"}:

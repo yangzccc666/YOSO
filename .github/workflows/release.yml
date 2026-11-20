@@ -32,8 +32,8 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
-      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.6' }}
-      ASSET_NAME: YOLO-Data-Platform-${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.6' }}-${{ matrix.asset }}
+      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.7' }}
+      ASSET_NAME: YOLO-Data-Platform-${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.7' }}-${{ matrix.asset }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -82,6 +82,10 @@ jobs:
       - name: Test annotation subprocess encoding and cancellation
         if: runner.os != 'Linux'
         run: python -m unittest tests.test_annotation_process tests.test_auto_annotation -q
+
+      - name: Test video extraction and SSH dataset paths on Windows
+        if: runner.os == 'Windows'
+        run: python -m unittest tests.test_video_progress tests.test_remote_yolo_paths -q
 
       - name: Build desktop application
         run: python -m PyInstaller --noconfirm --clean packaging/yolo_data_platform.spec

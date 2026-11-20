@@ -5,16 +5,19 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import urllib.parse
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .catalog import FunctionCatalog
+from .countdowns import Countdown, CountdownStore
 from .licensing import license_store
 from .app_settings import settings_store
 from .overtime import OvertimeStore
@@ -65,6 +68,7 @@ from . import negative_samples as _negative_samples  # noqa: F401
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = platform_data_dir()
 overtime_store = OvertimeStore(DATA_DIR / 'overtime.json', lambda: settings_store.work_clock_payload()['settings'])
+countdown_store = CountdownStore(platform_config_dir() / "countdowns.sqlite3")
 catalog = FunctionCatalog(DATA_DIR / "functions.json")
 group_catalog = GroupCatalog(DATA_DIR / "groups.json")
 training_profile_store = TrainingProfileStore(DATA_DIR / "training_profiles.json")
@@ -73,6 +77,7 @@ star_model_history = StarModelHistoryStore(DATA_DIR / "star_model_history.json")
 inference_video_history = InferenceVideoHistoryStore(platform_config_dir() / 'inference_video_history.json')
 _path_chooser: Callable[[str], list[str]] | None = None
 _system_notifier: Callable[[str, str], None] | None = None
+_countdown_notifier: Callable[[list[Countdown]], None] | None = None
 
 
 def remember_inference_video(payload, snapshot, *, remote=False):
@@ -98,6 +103,15 @@ def notify_system(title: str, message: str) -> None:
     except Exception as exc:
         # Notification failures must never change processing results.
         print(f"[YOLO数据处理平台] 系统通知显示失败：{exc}", file=sys.stderr)
+
+
+def set_countdown_notifier(notifier: Callable[[list[Countdown]], None] | None) -> None:
+    global _countdown_notifier
+    _countdown_notifier = notifier
+
+
+def countdown_payload() -> dict[str, Any]:
+    return {"timers": countdown_store.list(), "nativeNotifications": _countdown_notifier is not None}
 
 
 def record_finished_run(
@@ -396,6 +410,12 @@ class AppHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/work-clock":
             self.send_json(settings_store.work_clock_payload())
             return
+        if parsed.path == "/api/countdowns":
+            try:
+                self.send_json(countdown_payload())
+            except sqlite3.Error:
+                self.send_json({"error": "无法读取本机倒计时，请重试。"}, 500)
+            return
         if parsed.path == '/api/overtime':
             try:
                 self.send_json(overtime_store.request())
@@ -509,6 +529,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if self.path.startswith('/api/overtime/'):
                 self.send_json(overtime_store.request(self.path.rsplit('/', 1)[-1], payload))
+                return
+            if self.path == "/api/countdowns":
+                countdown_store.start(payload.get("note"), payload.get("durationSeconds"))
+                self.send_json(countdown_payload(), 201)
                 return
             if self.path == "/api/local-star-package/detect-labels":
                 self.send_json(detect_plan_labels(str(payload.get("modelFile", ""))))
@@ -790,7 +814,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 is_video_frames = handler_id == _video_frames.HANDLER_ID
                 path_values = {
-                    key: Path(value) if is_remote_yolo else Path(value).expanduser()
+                    key: PurePosixPath(value.strip()) if is_remote_yolo else Path(value).expanduser()
                     for key, value in payload.get("paths", {}).items()
                     if str(value).strip() and not (is_video_frames and key == "video_folder")
                 }
@@ -991,6 +1015,10 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/countdowns/"):
+                countdown_store.remove(parsed.path.rsplit("/", 1)[-1])
+                self.send_json(countdown_payload())
+                return
             if parsed.path.startswith("/api/tensorrt-build/queue/"):
                 entry_id = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
                 forget = urllib.parse.parse_qs(parsed.query).get("forget") == ["true"]
@@ -1086,6 +1114,30 @@ class AppHandler(BaseHTTPRequestHandler):
 class AppServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    _next_countdown_check = 0.0
+    _last_overdue: tuple[Countdown, ...] | None = None
+
+    def service_actions(self) -> None:
+        super().service_actions()
+        now = time.monotonic()
+        notifier = _countdown_notifier
+        if notifier is None or now < self._next_countdown_check:
+            return
+        self._next_countdown_check = now + 0.5
+        try:
+            overdue = countdown_store.list(overdue=True)
+        except (sqlite3.Error, OSError):
+            self._next_countdown_check = now + 2
+            return
+        snapshot = tuple(overdue)
+        if snapshot != self._last_overdue:
+            try:
+                notifier(overdue)
+            except RuntimeError as exc:
+                print(f"[YOLO数据处理平台] 倒计时提醒显示失败：{exc}", file=sys.stderr)
+                self._next_countdown_check = now + 2
+                return
+            self._last_overdue = snapshot
 
     def server_close(self) -> None:
         trt_build_queue.close()
