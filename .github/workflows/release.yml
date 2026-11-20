@@ -32,8 +32,8 @@ jobs:
     env:
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
-      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.7' }}
-      ASSET_NAME: YOLO-Data-Platform-${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.7' }}-${{ matrix.asset }}
+      RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.8' }}
+      ASSET_NAME: YOLO-Data-Platform-${{ github.ref_type == 'tag' && github.ref_name || 'v26.1.8' }}-${{ matrix.asset }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4

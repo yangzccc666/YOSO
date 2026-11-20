@@ -220,8 +220,10 @@ class AdapterProgressTests(unittest.TestCase):
             self.assertEqual(result['imageCount'], 5)
             self.assertEqual(len(pictures), 5)
             self.assertTrue(opened_streams and all(stream.closed for stream in opened_streams))
-            self.assertTrue(all('渗透2号线' in path.name and path.is_relative_to(destination) for path in pictures))
+            destination = destination.resolve()
             for path in pictures:
+                self.assertIn('渗透2号线', path.name)
+                self.assertTrue(path.resolve().is_relative_to(destination), str(path))
                 decoded = cv2.imdecode(np.frombuffer(path.read_bytes(), dtype=np.uint8), cv2.IMREAD_COLOR)
                 self.assertEqual(decoded.shape, (48, 64, 3))
 
