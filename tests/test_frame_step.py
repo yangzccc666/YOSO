@@ -230,8 +230,7 @@ class FrameStepIntegrationTests(unittest.TestCase):
         finally:
             capture.release()
 
-    @unittest.skipIf(sys.platform == "win32", "Pipe select is POSIX-only")
-    def test_remote_worker_steps_one_source_frame_without_realtime_skips(self):
+    def remote_worker_command(self):
         script = self.root / "fake_script.py"
         script.write_text(textwrap.dedent('''
             import cv2
@@ -247,11 +246,30 @@ class FrameStepIntegrationTests(unittest.TestCase):
                 def infer(self, _tensor): return []
                 def close(self): pass
         '''), encoding="utf-8")
-        process = subprocess.Popen([
+        return [
             sys.executable, "-u", str(Path(__file__).resolve().parents[1] / "backend/remote_star_worker.py"),
             "--script", str(script), "--model", str(self.model), "--source", str(self.video), "--labels", "object",
-            "--session-token", "frame-step-test", "--realtime", "--preview-fps", "1", "--replay-grace-seconds", "5",
-        ], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+            "--session-token", "frame-step-test", "--preview-fps", "1",
+        ]
+
+    def test_remote_worker_limits_model_input_independently_of_preview(self):
+        command = self.remote_worker_command() + ["--replay-grace-seconds", "0"]
+        for options, expected in (([], 67), (["--detection-fps", "12"], 40), (["--detection-fps", "0"], 100)):
+            with self.subTest(options=options):
+                result = subprocess.run(command + options, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, timeout=10)
+                log = result.stderr.decode("utf-8", errors="replace")
+                self.assertEqual(result.returncode, 0, log)
+                self.assertIn(f"Processed {expected} frames; skipped 0 late source frames", log)
+                if expected < 100:
+                    self.assertIn(f"Skipped {100 - expected} source frames by target-rate sampling", log)
+
+    @unittest.skipIf(sys.platform == "win32", "Pipe select is POSIX-only")
+    def test_remote_worker_steps_one_source_frame_without_realtime_skips(self):
+        process = subprocess.Popen(
+            self.remote_worker_command() + ["--realtime", "--detection-fps", "1", "--replay-grace-seconds", "5"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0,
+        )
         decoder = PreviewPacketDecoder()
         def read_frames(generation, timeout=2):
             found = []

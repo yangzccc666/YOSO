@@ -22,6 +22,7 @@ from .video_frame_resources import DEFAULT_WORKER_MEMORY, MIB, resource_pool
 
 
 HANDLER_ID = "video.extract_frames"
+OUTPUT_BY_VIDEO = "每个视频单独保存"
 OUTPUT_BY_SOURCE = "按源文件夹分别保存"
 OUTPUT_MERGED = "全部视频合并保存"
 DECODER_HEARTBEAT_SECONDS = 5.0
@@ -105,14 +106,18 @@ def video_frame_task_key(function_id: str, paths: dict[str, Path], parameters: d
 
 
 def normalize_video_folder_paths(value: Any) -> list[Path]:
-    """Read newline-separated folder paths without treating spaces as separators."""
+    return normalize_video_paths(value)
+
+
+def normalize_video_paths(value: Any) -> list[Path]:
+    """Normalize explicit video or folder paths without splitting on spaces."""
     if value is not None and not isinstance(value, (str, Path, list)):
-        raise ValueError("视频文件夹路径必须是文字，每行一个文件夹。")
+        raise ValueError("视频路径必须是文字，每行一个路径。")
     values = value if isinstance(value, list) else str(value or "").splitlines()
     paths: dict[str, Path] = {}
     for raw in values:
         if not isinstance(raw, (str, Path)):
-            raise ValueError("视频文件夹路径必须是文字，每行一个文件夹。")
+            raise ValueError("视频路径必须是文字，每行一个路径。")
         text = str(raw).strip()
         if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
             text = text[1:-1].strip()
@@ -205,9 +210,9 @@ def _ensure_informative_filenames(
 
 def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
     folders = normalize_video_folder_paths(context.parameters.get("_video_folder_paths", context.paths.get("video_folder", "")))
-    video_file = context.paths.get("video_file")
-    if not folders and not video_file:
-        raise ValueError("请填写一个或多个视频文件夹（每行一个），或者选择一个 MP4 视频。")
+    files = normalize_video_paths(context.parameters.get("_video_file_paths", context.paths.get("video_file", "")))
+    if not folders and not files:
+        raise ValueError("请填写一个或多个视频文件夹（每行一个），或者选择一个或多个 MP4 视频。")
     roots: list[Path] = []
     for folder in sorted(folders, key=lambda path: (len(path.parts), str(path).casefold())):
         context.check_cancelled()
@@ -224,8 +229,12 @@ def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
         scanned = module.parse_video_paths([str(folder)], check_cancelled=context.check_cancelled)
         found.update(Path(value).resolve() for value in scanned)
         context.report(f"[扫描 {index}/{len(roots)}] 找到 {len(scanned)} 个 MP4 视频。")
-    if video_file:
-        found.update(Path(value).resolve() for value in module.parse_video_paths([str(video_file)], check_cancelled=context.check_cancelled))
+    for video in files:
+        context.check_cancelled()
+        if video.is_file() and video.suffix.lower() == ".mp4":
+            found.add(video)
+        else:
+            context.report(f"[跳过视频] 路径不存在或不是 MP4 文件：{video}")
     videos = sorted(found, key=lambda path: str(path).casefold())
     if not videos:
         raise ValueError("没有找到可处理的 MP4 视频，请检查输入路径。")
@@ -234,9 +243,9 @@ def _resolve_videos(context: RunContext, module: ModuleType) -> list[Path]:
 
 def run_video_frames(context: RunContext) -> dict[str, Any]:
     context.check_cancelled()
-    output_layout = str(context.parameters.get('output_layout', OUTPUT_BY_SOURCE))
-    if output_layout not in {OUTPUT_BY_SOURCE, OUTPUT_MERGED}:
-        raise ValueError('请选择有效的图片保存方式：按源文件夹分别保存或全部视频合并保存。')
+    output_layout = str(context.parameters.get('output_layout', OUTPUT_BY_VIDEO))
+    if output_layout not in {OUTPUT_BY_VIDEO, OUTPUT_BY_SOURCE, OUTPUT_MERGED}:
+        raise ValueError('请选择有效的图片保存方式：每个视频单独保存、按源文件夹分别保存或全部视频合并保存。')
     merge_all = output_layout == OUTPUT_MERGED
     module = _load_source_module()
     videos = _resolve_videos(context, module)
@@ -311,6 +320,8 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
     merged_parent = output_root or videos[0].parent
     if merge_all:
         context.report(f'图片保存方式：{OUTPUT_MERGED}。全部 {len(videos)} 个视频共用一个新结果目录，创建于：{merged_parent}；数量上限仍按每个视频计算。')
+    elif output_layout == OUTPUT_BY_VIDEO:
+        context.report(f"图片保存方式：{OUTPUT_BY_VIDEO}，共 {len(videos)} 个视频。")
     else:
         context.report(f"图片保存方式：{OUTPUT_BY_SOURCE}。按视频实际所在文件夹分组，共 {len(source_groups)} 组；同一源文件夹中的视频共用一个图片目录，数量上限仍按每个视频计算。")
 
@@ -342,12 +353,14 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
         # the same lock used by source groups so parallel decoders cannot each
         # create a separate output. Independent batches reserve fresh folders.
         group_key = None if merge_all else video.parent
+        if output_layout == OUTPUT_BY_VIDEO:
+            group_key = video
         with output_lock:
             if group_key not in group_outputs:
                 if merge_all:
                     group_prefix = '_'.join(part for part in (project_code, scene_code) if part) or 'all_videos'
                     stem = f'{group_prefix}_frames'
-                elif len(source_groups[video.parent]) == 1:
+                elif output_layout == OUTPUT_BY_VIDEO or len(source_groups[video.parent]) == 1:
                     stem = f"{english_prefix}_{sampling_tag}"
                 else:
                     group_prefix = "_".join(part for part in (project_code, scene_code) if part) or _source_filename_component(video.parent.name)
@@ -408,7 +421,7 @@ def run_video_frames(context: RunContext) -> dict[str, Any]:
             image_count = int(process_result["success_count"])
         elif process_result:
             image_count = sum(1 for path in output_folder.iterdir() if path.is_file() and path.suffix.lower() == ".jpg"
-                              and ((not merge_all and len(source_groups[video.parent]) == 1) or path.name.startswith(english_prefix + "_")))
+                              and (output_layout == OUTPUT_BY_VIDEO or (not merge_all and len(source_groups[video.parent]) == 1) or path.name.startswith(english_prefix + "_")))
         else:
             image_count = 0
         if image_count == 0:

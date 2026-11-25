@@ -1,0 +1,65 @@
+.project-dialog {
+  box-sizing: border-box; width: min(520px, 92vw); max-height: 86vh; padding: 0;
+  border: 1px solid var(--border); border-radius: 12px; margin: auto;
+  background: var(--theme-surface, white); color: var(--text); font: inherit;
+  box-shadow: 0 18px 64px #131e3930; overflow-y: auto;
+}
+.project-dialog::backdrop { background: #15203566; }
+.project-dialog.project-wide { width: min(1120px, 94vw); height: min(800px, 90vh); max-height: 90vh; }
+.project-dialog[open] { display: flex; flex-direction: column; }
+.project-dialog > header, .project-dialog > footer {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 14px 20px; border-bottom: 1px solid var(--border); flex: none;
+}
+.project-dialog > footer { border-top: 1px solid var(--border); border-bottom: 0; }
+.project-dialog h2,.project-dialog h3,.project-dialog h4,.project-dialog p { margin: 0; }
+.project-dialog h2,.project-dialog h3 { font-size: 18px; }
+.project-dialog h4 { font-size: 15px; }
+.project-dialog small,.project-dialog footer span { font-size: 12px; color: var(--muted); }
+.project-dialog button {
+  display: inline-flex; align-items: center; justify-content: center; gap: 5px; cursor: pointer;
+  font: inherit; font-size: 13px; padding: 6px 10px; border: 1px solid var(--border);
+  border-radius: 6px; color: var(--text); background: var(--theme-surface, white);
+}
+.project-dialog button:hover { background: var(--soft); }
+.project-dialog button:disabled { opacity: .5; cursor: default; }
+.project-dialog .project-primary { background: #2459bf; color: white; border-color: #2459bf; }
+.project-dialog .project-primary:hover { background: #184aab; }
+.project-home,.project-form { padding: 20px; display: grid; gap: 14px; overflow: auto; }
+.project-form label { display: grid; gap: 5px; font-size: 13px; font-weight: 600; }
+.project-dialog :is(input:not([type=checkbox]),select,textarea) {
+  font: inherit; color: var(--text); background: var(--theme-surface, white);
+  padding: 8px 10px; border-radius: 5px; border: 1px solid var(--border); min-width: 0;
+}
+.project-dialog textarea { resize: vertical; }
+.project-tools,.project-actions,.project-tabs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.project-tools label { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; }
+.project-list { display: grid; grid-template-columns: repeat(auto-fill,minmax(215px,1fr)); gap: 12px; }
+.project-list button { justify-content: flex-start; padding: 18px 14px; }
+.project-list button svg:last-child { margin-left: auto; }
+.project-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(165px, 22%) 1fr; }
+.project-layout aside { overflow: auto; padding: 14px; border-right: 1px solid var(--border); background: var(--soft); }
+.project-layout main { min-width: 0; overflow: auto; padding: 18px; }
+.project-layout nav ul { list-style: none; padding: 0; margin: 8px 0; }
+.project-layout nav ul ul { padding-left: 13px; margin: 2px 0; }
+.project-layout nav button { text-align: left; width: 100%; justify-content: flex-start; background: transparent; border-color: transparent; }
+.project-layout nav button span { overflow-wrap: anywhere; }
+.project-layout nav button.is-selected,.project-tabs button[aria-pressed=true] {
+  color: var(--theme-accent-text,#235ac1); background: var(--theme-accent-surface,#edf3ff); border-color: var(--theme-accent-line,#b8cbef);
+}
+.project-scope { display: grid; gap: 8px; }
+.project-tabs { margin: 16px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+.project-entries { display: grid; gap: 10px; margin-top: 12px; }
+.project-entries article { padding: 12px 14px; display: grid; gap: 7px; border-radius: 7px; border: 1px solid var(--border); overflow-wrap: anywhere; }
+.project-entries article p { white-space: pre-wrap; font-size: 13px; }
+.project-actions { justify-content: flex-end; }
+.project-dialog .project-error { color: var(--theme-danger-text,#a32236); padding: 10px; }
+@media(max-width:700px) {
+  .project-layout { grid-template-columns: 1fr; grid-template-rows: auto minmax(0,1fr); }
+  .project-layout aside { max-height: 140px; border-bottom: 1px solid var(--border); }
+}
+
+.project-sort {display:flex;align-items:center;gap:8px;margin:8px 12px}
+.project-sort-row {display:flex;align-items:center}
+.project-sort-row .master-item {flex:1;min-width:0}
+.project-grip {cursor:grab;display:inline-flex;padding:4px}

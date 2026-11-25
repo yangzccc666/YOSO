@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .docker_onnx_quant import CUSTOM_EXCLUDE_PRESET, DEFAULT_EXCLUDE_PRESET, EXCLUDE_MODULE_PRESETS
+
 
 VIDEO_FUNCTION = {
     "id": "video_frames",
@@ -18,11 +20,11 @@ VIDEO_FUNCTION = {
     "handlerId": "video.extract_frames",
     "pathFields": [
         {"id": "video_folder", "label": "视频文件夹（每行一个，递归扫描）", "mode": "directory"},
-        {"id": "video_file", "label": "单个视频（可选）", "mode": "file"},
+        {"id": "video_file", "label": "指定 MP4 视频（每行一个，可多选）", "mode": "file"},
         {"id": "output_folder", "label": "输出文件夹（可选）", "mode": "directory"},
     ],
     "parameters": [
-        {"id": "output_layout", "label": "图片保存方式", "type": "select", "default": "按源文件夹分别保存", "options": ["按源文件夹分别保存", "全部视频合并保存"]},
+        {"id": "output_layout", "label": "图片保存方式", "type": "select", "default": "每个视频单独保存", "options": ["每个视频单独保存", "按源文件夹分别保存", "全部视频合并保存"]},
         {"id": "project_code", "label": "项目英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
         {"id": "scene_code", "label": "场景英文标识（留空使用视频文件名）", "type": "text", "default": "", "options": []},
         {"id": "parallel_workers", "label": "同时处理的视频数（0 自动，1 串行，最多 16）", "type": "number", "default": 0, "options": []},
@@ -234,6 +236,7 @@ REMOTE_STAR_INFERENCE_FUNCTION = {
         {"id": "max_det", "label": "每帧最大检测框数", "type": "number", "default": 300, "options": []},
         {"id": "save_path", "label": "远端保存路径（可选）", "type": "text", "default": "", "options": []},
         {"id": "realtime", "label": "保持原视频速度（性能不足时自动跳帧）", "type": "boolean", "default": True, "options": []},
+        {"id": "detection_fps", "label": "目标检测帧率（按源视频每秒取帧，0 表示不限）", "type": "number", "default": 20, "options": []},
         {"id": "preview_fps", "label": "本地预览帧率", "type": "number", "default": 20, "options": []},
         {"id": "stream_width", "label": "本地预览宽度", "type": "number", "default": 960, "options": []},
         {"id": "jpeg_quality", "label": "预览画质（20-100）", "type": "number", "default": 70, "options": []},
@@ -317,7 +320,10 @@ DOCKER_ONNX_QUANT_FUNCTION = {
         {"id": "limit", "label": "量化图片上限 limit", "type": "number", "default": 128, "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
         {"id": "output_filename", "label": "输出文件名（留空自动生成）", "type": "text", "default": "", "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
         {"id": "method", "label": "量化方法", "type": "select", "default": "默认", "options": ["默认", "minmax", "entropy"], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
-        {"id": "nodes_to_exclude", "label": "排除节点（每行一个正则）", "type": "text", "default": "^/model\\.(13|16|17|23)(?:/|$).*", "options": [], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "exclude_modules", "label": "排除模块", "type": "select", "default": DEFAULT_EXCLUDE_PRESET,
+         "options": [*EXCLUDE_MODULE_PRESETS, CUSTOM_EXCLUDE_PRESET], "visibleWhen": {"fieldId": "operation", "equals": "导出量化 ONNX"}},
+        {"id": "nodes_to_exclude", "label": "自定义排除节点（每行一个正则，留空则不排除）", "type": "text", "default": "", "options": [],
+         "visibleWhen": {"fieldId": "exclude_modules", "equals": CUSTOM_EXCLUDE_PRESET}},
     ],
 }
 
@@ -513,7 +519,7 @@ class FunctionCatalog:
                 video_frame_priority_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-priority-v2")
                 video_folder_recursive_marker = self.storage_file.with_name(self.storage_file.name + ".video-folder-recursive-v1")
                 video_multi_folders_marker = self.storage_file.with_name(self.storage_file.name + ".video-multi-folders-v2")
-                video_output_layout_marker = self.storage_file.with_name(self.storage_file.name + ".video-output-layout-v1")
+                video_output_layout_marker = self.storage_file.with_name(self.storage_file.name + ".video-output-layout-v2")
                 video_parallel_marker = self.storage_file.with_name(self.storage_file.name + ".video-frame-parallel-v1")
                 realtime_playback_marker = self.storage_file.with_name(self.storage_file.name + ".realtime-playback-v1")
                 yolo_dataset_timestamp_marker = self.storage_file.with_name(self.storage_file.name + ".yolo-dataset-timestamp-v1")
@@ -556,6 +562,18 @@ class FunctionCatalog:
                     content.append(deepcopy(LOCAL_STAR_PACKAGE_FUNCTION))
                     changed = True
                 for item in content:
+                    if isinstance(item, dict) and item.get("id") == DOCKER_ONNX_QUANT_FUNCTION["id"]:
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(p, dict) and p.get("id") == "exclude_modules" for p in parameters):
+                            preset, custom = deepcopy(DOCKER_ONNX_QUANT_FUNCTION["parameters"][-2:])
+                            for index, field in enumerate(parameters):
+                                if isinstance(field, dict) and field.get("id") == "nodes_to_exclude":
+                                    custom["default"] = field.get("default", "")
+                                    parameters[index:index + 1] = [preset, custom]
+                                    break
+                            else:
+                                parameters.extend([preset, custom])
+                            changed = True
                     if (not process_dedup_marker.exists() and isinstance(item, dict)
                             and item.get('handlerId') == IMAGE_DEDUP_FUNCTION['handlerId']):
                         params = item.setdefault('parameters', [])
@@ -592,7 +610,13 @@ class FunctionCatalog:
                             and item.get('handlerId') == VIDEO_FUNCTION['handlerId']):
                         params = item.setdefault('parameters', [])
                         if not any(isinstance(p, dict) and p.get('id') == 'output_layout' for p in params):
-                            params.insert(0, deepcopy(next(p for p in VIDEO_FUNCTION['parameters'] if p['id'] == 'output_layout')))
+                            params.insert(0, deepcopy(VIDEO_FUNCTION['parameters'][0]))
+                            changed = True
+                        else:
+                            field = next(p for p in params if isinstance(p, dict) and p.get('id') == 'output_layout')
+                            field['options'] = list(VIDEO_FUNCTION['parameters'][0]['options'])
+                            if field.get('default') == '按源文件夹分别保存':
+                                field['default'] = VIDEO_FUNCTION['parameters'][0]['default']
                             changed = True
                     if not precision_options_marker.exists() and isinstance(item, dict):
                         handler = item.get('handlerId')
@@ -652,6 +676,11 @@ class FunctionCatalog:
                             for path in item.get("pathFields", [])
                         ]
                         changed = True
+                    if isinstance(item, dict) and item.get("id") == VIDEO_FUNCTION["id"]:
+                        for field in item.get("pathFields", []):
+                            if isinstance(field, dict) and field.get("id") == "video_file" and field.get("label") == "单个视频（可选）":
+                                field["label"] = VIDEO_FUNCTION["pathFields"][1]["label"]
+                                changed = True
                     if (not video_multi_folders_marker.exists() and isinstance(item, dict)
                             and item.get("id") == VIDEO_FUNCTION["id"]):
                         item["description"] = VIDEO_FUNCTION["description"]
@@ -735,6 +764,13 @@ class FunctionCatalog:
                             if parameter["id"] in {"extraction_mode", "max_images_limit"}:
                                 parameter.update(deepcopy(source_parameter))
                         changed = True
+                    if isinstance(item, dict) and item.get("id") == REMOTE_STAR_INFERENCE_FUNCTION["id"]:
+                        parameters = item.setdefault("parameters", [])
+                        if not any(isinstance(p, dict) and p.get("id") == "detection_fps" for p in parameters):
+                            field = next(p for p in REMOTE_STAR_INFERENCE_FUNCTION["parameters"] if p["id"] == "detection_fps")
+                            index = next((i for i, p in enumerate(parameters) if isinstance(p, dict) and p.get("id") == "preview_fps"), len(parameters))
+                            parameters.insert(index, deepcopy(field))
+                            changed = True
                     if (not realtime_playback_marker.exists() and isinstance(item, dict)
                             and item.get("id") in {REMOTE_STAR_INFERENCE_FUNCTION["id"], LOCAL_PT_INFERENCE_FUNCTION["id"]}):
                         source = REMOTE_STAR_INFERENCE_FUNCTION if item.get("id") == REMOTE_STAR_INFERENCE_FUNCTION["id"] else LOCAL_PT_INFERENCE_FUNCTION

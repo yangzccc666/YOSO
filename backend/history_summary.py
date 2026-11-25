@@ -13,6 +13,7 @@ LABELS = {
     'limit': '数量上限', 'num_samples': '图片数量', 'model_family': '模型版本',
     'imgsz': '尺寸', 'deployment_precision': '部署精度', 'build_mode': '精度',
     'precision': '精度', 'title': '打包名', 'conf': '置信度', 'iou': 'IoU',
+    'detection_fps': '目标检测帧率',
     'input_mode': '输入', 'annotation_mode': '标注', 'run_name': '训练名',
     'epochs': '轮次', 'batch': 'batch', 'device': '设备', 'amp': 'AMP',
 }

@@ -467,7 +467,7 @@ export function RemoteInferencePanel({ itemId, values, onParameterChange, platfo
 
   return (
     <section className="remote-inference-section">
-      <CollapsibleSection className="remote-multi-models" count={starModels.length} heading={<div className="section-title"><icons.Settings size={19} /><h2>同一视频使用多个 STAR 模型</h2><HelpTip label="多模型推理说明">所有 STAR 模型都在这里统一配置。每个模型分别填写文件、类别名和置信度，检测框会叠加在同一视频上。多个模型会降低推理帧率；开启“保持原视频速度”后，平台会自动跳过已经落后的源帧，避免画面变成慢动作。</HelpTip></div>}>
+      <CollapsibleSection fixed className="remote-multi-models" count={starModels.length} heading={<div className="section-title"><icons.Settings size={19} /><h2>同一视频使用多个 STAR 模型</h2><HelpTip label="多模型推理说明">所有 STAR 模型都在这里统一配置。每个模型分别填写文件、类别名和置信度，检测框会叠加在同一视频上。多个模型会降低推理帧率；开启“保持原视频速度”后，平台会自动跳过已经落后的源帧，避免画面变成慢动作。</HelpTip></div>}>
         {starModels.map((model, index) => <div className="remote-model-card" key={index}>
           <div className="remote-model-card-title"><strong>模型 {index + 1}</strong><button type="button" onClick={() => removeStarModel(index)} title={starModels.length === 1 ? '至少需要保留一个模型' : `移除模型 ${index + 1}`}>移除</button></div>
           <label><span>模型文件</span><div className="remote-model-path"><input value={model.path} onChange={(event) => updateStarModel(index, { path: event.target.value })} placeholder="选择本机 .star / .plan / .engine 文件" /><button type="button" onClick={() => void browseStarModel(index)}>浏览</button></div></label>

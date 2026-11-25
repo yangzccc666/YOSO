@@ -98,8 +98,10 @@ class VideoParallelTests(unittest.TestCase):
             result = run_video_frames(self.context(self.root / 'input', folder=True))
         self.assertEqual(result['imageCount'], 4)
         self.assertEqual([item['images'] for item in result['details']], [2, 2])
-        self.assertEqual(len(result['outputFolders']), 1)
-        names = [path.name for path in Path(result['outputFolders'][0]).glob('*.jpg')]
+        self.assertEqual(len(set(result['outputFolders'])), 2)
+        for detail in result['details']:
+            self.assertEqual(len(list(Path(detail['output']).glob('*.jpg'))), 2)
+        names = [path.name for folder in result['outputFolders'] for path in Path(folder).glob('*.jpg')]
         self.assertEqual(len(names), 4)
         self.assertEqual(sum('video01_' in name for name in names), 2)
         self.assertEqual(sum('video02_' in name for name in names), 2)

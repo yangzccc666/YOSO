@@ -104,7 +104,7 @@ export function LocalStarPackagePanel(props: Props) {
   }
 
   return <>
-    <CollapsibleSection className="workspace-section calibration-section star-package-section" heading={<div className="section-title"><icons.Box size={21} /><h2>模型打包</h2></div>} count={4}>
+    <CollapsibleSection fixed className="workspace-section calibration-section star-package-section" heading={<div className="section-title"><icons.Box size={21} /><h2>模型打包</h2></div>} count={4}>
       <div className="calibration-form">
         <label className="wide"><span>TensorRT PLAN 模型 <em>必填</em></span><div className="package-file-picker"><input value={modelFile} onChange={(event) => props.onPathChange('model_file', event.target.value)} placeholder="请选择或粘贴 .plan 文件路径" /><button type="button" onClick={() => props.onBrowse('model_file', 'file')}>浏览</button></div></label>
         <label><span>打包名称 title <em>必填；可手填或用命名助手生成</em></span><input value={title} onChange={(event) => set('title', event.target.value)} placeholder="例如：CT2-2#1.1.0.1117" /></label>

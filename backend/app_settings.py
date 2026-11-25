@@ -84,7 +84,8 @@ class AppSettingsStore:
                     apps.append({"id": app_id, **_app_defaults(app_id),
                                  **{key: str(value) for key, value in values.items()
                                     if key in _ALLOWED_FIELDS | {"name", "description"}}})
-            return {"externalApps": apps, "configFile": str(self.storage_file), "aiPython": self._ai_python()}
+            return {"externalApps": apps, "configFile": str(self.storage_file), "aiPython": self._ai_python(),
+                    "theme": "dark" if self._document().get("theme") == "dark" else "light"}
 
     def _ai_python(self) -> str:
         try:
@@ -148,7 +149,10 @@ class AppSettingsStore:
         ai_python = str(raw.get("aiPython", self._ai_python())).strip()
         if "\x00" in ai_python or "\n" in ai_python or "\r" in ai_python:
             raise ValueError("AI Python 路径包含无效字符。")
-        self._save(normalized, ai_python)
+        theme = raw.get("theme")
+        if theme is not None and theme not in ("light", "dark"):
+            raise ValueError("请选择浅色或深色主题。")
+        self._save(normalized, ai_python, theme)
         return self.payload()
 
     def launch(self, app_id: str) -> dict[str, str]:
@@ -220,13 +224,15 @@ class AppSettingsStore:
         # without modifying the source file or the user's X-AnyLabeling paths.
         return {key: deepcopy(apps.get(key, {})) if isinstance(apps, dict) else {} for key in APP_DEFINITIONS}
 
-    def _save(self, apps: dict[str, dict[str, str]], ai_python: str = "") -> None:
+    def _save(self, apps: dict[str, dict[str, str]], ai_python: str = "", theme: str | None = None) -> None:
         with self._lock:
             document = self._document()
             if document.get('externalAppsVersion') != 2:
                 previous = document.get('externalApps', document)
                 if isinstance(previous, dict) and isinstance(previous.get('antigravity'), dict):
                     document.setdefault('hiddenLegacyExternalApps', {})['antigravity'] = previous['antigravity']
+            if theme is not None:
+                document["theme"] = theme
             document.update({"externalApps": apps, "externalAppsVersion": 2, "aiPython": ai_python})
             self._write_document(document)
 

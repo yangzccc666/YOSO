@@ -453,7 +453,7 @@ class TensorRTBuildQueue:
                     # Keep the previous atomic checkpoint; a disk failure must
                     # not interrupt the remaining application's shutdown.
                     self._reason = f"关闭时队列保存失败，请保留之前的记录或通过远端目录找回：{exc}"
-                    print(f"[YOLO数据处理平台] {self._reason}", flush=True)
+                    print(f"[YOLO项目平台] {self._reason}", flush=True)
             for item in self._items:
                 if item.status == "queued":
                     item.parameters = {key: value for key, value in item.parameters.items() if key in SAFE_PARAMETERS}

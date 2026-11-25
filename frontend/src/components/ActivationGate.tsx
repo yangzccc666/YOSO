@@ -44,7 +44,7 @@ export function ActivationGate({ children }: { children: ReactNode }) {
   if (status?.activated) return <>{children}</>
   return <main className="activation-page"><section className="activation-card">
     <div className="activation-brand">YOLO</div>
-    <h1>YOLO数据处理平台</h1>
+    <h1>YOLO项目平台</h1>
     <h2>{status ? '首次使用 · 密钥激活' : '正在检查激活状态…'}</h2>
     <p>{status?.message || '请稍候。'}</p>
     {status ? <form onSubmit={(event) => { event.preventDefault(); void activate() }}>

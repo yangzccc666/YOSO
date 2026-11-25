@@ -50,6 +50,7 @@ type Props = {
 }
 
 function ParameterValue({ field, value, onChange, sshHistory }: { field: FunctionParameter; value: string | number | boolean; onChange: (value: string | number | boolean) => void; sshHistory?: { onSelect: (profile: SshConnectionProfile) => void } }) {
+  if (field.id === 'nodes_to_exclude') return <textarea rows={3} value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder={String.raw`^/model\.(13|16|17|23)(?:/|$).*`} />
   if (field.id === 'star_labels') return <textarea rows={5} value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder={'MARK\nOKP\nNGO'} />
   if (field.id === 'clip_output_name') return <div className="clip-output-name"><input value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder="例如：TCL_工位1_光线变化_训练素材" /><HelpTip label="裁剪输出命名说明">只填文件名，无需填写路径或扩展名。留空沿用自动命名；批量追加原视频名，训练/测试分别追加 _train / _test，重名加序号，不覆盖文件。</HelpTip></div>
   if (field.id === 'remove_time_ranges') return <textarea className="clip-remove-ranges" rows={5} value={String(value)} onChange={(event) => onChange(event.target.value)} placeholder={'00:10-00:20\n01:30-02:00\n02:50-'} />
@@ -100,6 +101,7 @@ export function FunctionWorkspace(props: Props) {
     (!isAutoAnnotationWorkspace || field.id !== 'annotation_mode') && (!field.visibleWhen
       || (field.visibleWhen.equals !== undefined && props.values.parameters[field.visibleWhen.fieldId] === field.visibleWhen.equals)
       || (field.visibleWhen.notEquals !== undefined && props.values.parameters[field.visibleWhen.fieldId] !== field.visibleWhen.notEquals))
+    && (field.id !== 'nodes_to_exclude' || item.handlerId !== 'docker.quantize_onnx' || props.values.parameters.operation !== '测试 Docker 环境')
     && (!isRemoteStarWorkspace || !['labels', 'conf', 'additional_models', 'star_models'].includes(field.id))
     && (!isImageDedupWorkspace || (field.id !== 'dedup_mode'
       && !['minimum_keep_ratio', 'max_consecutive_skips', 'process_regions'].includes(field.id)
@@ -107,6 +109,18 @@ export function FunctionWorkspace(props: Props) {
       && (field.id !== 'process_strength' || processDedup && !dedupRollback)
       && (!field.id.startsWith('cycle_') || !dedupRollback)))
     && (!isLocalInferenceWorkspace || (field.id !== 'input_mode' && (field.id !== 'recursive_images' || localImageMode) && (!localImageMode || !['realtime', 'replay_grace_seconds'].includes(field.id)))))
+  // Keep task-defining choices and their required inputs visible as modes change.
+  const primaryParameterIds = new Set([
+    'operation', 'extraction_mode', 'priority_time_ranges', 'clip_mode', 'remove_time_ranges',
+    'duration_start_time', 'clip_duration', 'head_skip_time', 'tail_skip_time', 'model_family',
+    'yolov5_repo', 'class_names', 'host', 'username', 'password', 'remote_host',
+    'remote_username', 'remote_password',
+    ...(isVideoClipWorkspace ? ['range_start_time', 'range_end_time'] : []),
+  ])
+  const parameterSections = [
+    { fixed: true, fields: visibleParameters.filter(field => primaryParameterIds.has(field.id)) },
+    { fixed: false, fields: visibleParameters.filter(field => !primaryParameterIds.has(field.id)) },
+  ]
   const visiblePathFields = item.pathFields.filter((field) => (!isRemoteStarWorkspace || field.id !== 'local_model_file')
     && (!clipReplaceSource || field.id !== 'output_folder')
     && (!isImageDedupWorkspace || !field.id.startsWith('cycle_') || (cycleMode && !dedupRollback))
@@ -128,8 +142,8 @@ export function FunctionWorkspace(props: Props) {
       </section> : null}
       <WorkflowTodoPanel items={props.workflowTodos} onApply={props.onApplyWorkflowTodo} onDelete={props.onDeleteWorkflowTodo} />
       {!isYoloTrainingWorkspace && !isCalibrationWorkspace && !isRemoteTrtWorkspace && !isLocalStarPackageWorkspace ? <>
-      <CollapsibleSection key={`${item.id}:paths`} className="workspace-section" count={visiblePathFields.length} heading={
-        <div className="section-title"><icons.Folder size={21} /><h2>数据路径</h2>{isVideoFramesWorkspace ? <HelpTip label="抽帧目录与调度说明">视频文件夹支持每行一个路径，也可连续点击“添加文件夹”追加。递归扫描后可在“图片保存方式”选择按源文件夹分别保存，或全部视频合并保存；图片均保留视频标识与抽帧信息。指定输出位置后，会在其中创建分组结果目录或一个汇总结果目录。“同时处理的视频数”设为 0 自动调度，数量上限仍按每个视频计算。</HelpTip> : null}</div>}>
+      <CollapsibleSection fixed key={`${item.id}:paths`} className="workspace-section" count={visiblePathFields.length} heading={
+        <div className="section-title"><icons.Folder size={21} /><h2>数据路径</h2>{isVideoFramesWorkspace ? <HelpTip label="抽帧目录与调度说明">视频文件夹支持每行一个路径，也可连续点击“添加文件夹”追加。默认每个视频单独保存，也可按源文件夹归组或全部合并；图片均保留视频标识与抽帧信息。指定输出位置后，会在其中创建分组结果目录或一个汇总结果目录。“同时处理的视频数”设为 0 自动调度，数量上限仍按每个视频计算。</HelpTip> : null}</div>}>
         {isAutoAnnotationWorkspace ? <div className="local-inference-source"><label><span>自动标注模式</span><select aria-label="自动标注模式" value={starAnnotation ? '远程 STAR 标注' : '本地 PT 标注'} disabled={props.running || Boolean(currentTask)} onChange={event => props.onParameterChange('annotation_mode', event.target.value)}><option>本地 PT 标注</option><option>远程 STAR 标注</option></select></label></div> : null}
         {isImageDedupWorkspace ? <div className="local-inference-source"><label><span>去重模式</span><select aria-label="图片去重模式" value={dedupMode} disabled={props.running || Boolean(currentTask)} onChange={(event) => props.onParameterChange('dedup_mode', event.target.value)}>
           <option>差异优先去重（自动）</option><option>工位工序去重（忽略背景）</option><option>仅精确重复</option><option>连续相似帧去重</option><option>完整工序循环去重</option>
@@ -144,12 +158,13 @@ export function FunctionWorkspace(props: Props) {
         <div className="path-fields">
           {visiblePathFields.map((field) => {
             const multiFolders = isVideoFramesWorkspace && field.id === 'video_folder'
+            const multiVideos = isVideoFramesWorkspace && field.id === 'video_file'
             const multiModels = isJetsonOnnxExportWorkspace && field.id === 'weights_file'
             const inferenceVideo = isRemoteStarWorkspace && field.id === 'local_video_file' || isLocalInferenceWorkspace && field.id === 'video_file'
-            return <Fragment key={field.id}><label className="path-field"><span>{isAutoAnnotationWorkspace && field.id === 'weights_file' ? starAnnotation ? '本机 STAR 检测模型' : '训练后的 PT 检测模型' : field.label}</span><div>{multiFolders || multiModels
-              ? <textarea rows={multiFolders ? 4 : 6} value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={multiFolders ? '/path/to/视频文件夹1\n/path/to/视频文件夹2' : '/path/to/model_a.pt\n/path/to/model_b.pt'} />
+            return <Fragment key={field.id}><label className="path-field"><span>{isAutoAnnotationWorkspace && field.id === 'weights_file' ? starAnnotation ? '本机 STAR 检测模型' : '训练后的 PT 检测模型' : field.label}</span><div>{multiFolders || multiVideos || multiModels
+              ? <textarea rows={multiFolders ? 4 : 6} value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={multiFolders ? '/path/to/视频文件夹1\n/path/to/视频文件夹2' : multiVideos ? '/path/to/视频1.mp4\n/path/to/视频2.mp4' : '/path/to/model_a.pt\n/path/to/model_b.pt'} />
               : <input value={props.values.paths[field.id] || ''} onChange={(event) => props.onPathChange(field.id, event.target.value)} placeholder={remoteYoloPaths ? '请输入远程服务器上的绝对路径' : `请选择或粘贴${field.mode === 'file' ? '文件' : '文件夹'}路径`} />}
-              <button onClick={() => props.onBrowse(field.id, multiFolders ? 'append-directory' : multiModels ? 'multiple' : field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : multiFolders ? '选择一个文件夹并追加到列表，可重复添加' : undefined}>{remoteYoloPaths ? '远程路径' : multiFolders ? '添加文件夹' : multiModels ? '选择多个 PT' : '浏览'}</button></div></label>
+              <button onClick={() => props.onBrowse(field.id, multiFolders ? 'append-directory' : multiVideos ? 'append-files' : multiModels ? 'multiple' : field.mode)} disabled={remoteYoloPaths} title={remoteYoloPaths ? '远程模式请手动填写服务器路径' : multiFolders ? '选择一个文件夹并追加到列表，可重复添加' : undefined}>{remoteYoloPaths ? '远程路径' : multiFolders ? '添加文件夹' : multiVideos ? '添加视频' : multiModels ? '选择多个 PT' : '浏览'}</button></div></label>
               {inferenceVideo ? <InferenceVideoHistory path={props.values.paths[field.id] || ''} scene={String(props.values.parameters.test_video_scene || '')} station={String(props.values.parameters.test_video_station || '')} onPath={value => props.onPathChange(field.id, value)} onScene={value => props.onParameterChange('test_video_scene', value)} onStation={value => props.onParameterChange('test_video_station', value)} /> : null}</Fragment>
           })}
           {!visiblePathFields.length ? <p className="section-empty">尚未定义数据路径，接入功能时再添加。</p> : null}
@@ -159,19 +174,19 @@ export function FunctionWorkspace(props: Props) {
         {isJetsonOnnxExportWorkspace ? <JetsonModelLabels values={props.values} running={props.running || Boolean(currentTask)} /> : null}
         {isJetsonOnnxExportWorkspace ? <div className="help-heading">ONNX 导出与部署精度<HelpTip label="ONNX 导出精度说明">当前导出统一生成未量化 FP32 ONNX。“后续部署精度”决定下一步：INT8 沿用 Docker 量化待办；FP16/FP32 跳过量化，直接用导出的 ONNX 在盒子构建对应引擎。此选项不把现有量化模型升精度，也不自动上传到远端；请手动复制文件并填写盒子上的路径。</HelpTip></div> : null}
       </CollapsibleSection>
-      <CollapsibleSection key={`${item.id}:parameters`} className="workspace-section parameter-section" count={visibleParameters.length} heading={
-        <div className="section-title"><icons.SlidersHorizontal size={21} /><h2>运行参数</h2>
+      {parameterSections.filter(section => !section.fixed || section.fields.length).map(({ fixed, fields }) => <CollapsibleSection fixed={fixed} key={`${item.id}:parameters:${fixed}`} className="workspace-section parameter-section" count={fields.length} heading={
+        <div className="section-title"><icons.SlidersHorizontal size={21} /><h2>{fixed ? '运行参数' : '可选参数'}</h2>
         {isImageDedupWorkspace ? <HelpTip label="批量去重与回滚说明">开启“包含子文件夹”后，自动扫描任意深度子目录；上层目录自身有图片也会单独处理。每个实际图片目录独立去重，不跨目录比较；空目录、去重备份和符号链接不参与。各目录串行处理并输出独立报告与汇总，失败目录会提示并跳过。完整工序循环模式需关闭此选项，单独指定各工位参考轮。保持同一上层路径和此选项，选择“回滚最近一次”，只恢复最近一次有移出文件的批量任务，不回滚无关的单目录任务。中途停止会保留此前已完成的目录结果，也可回滚。此选项可保存为默认值。</HelpTip> : null}
         {isImageDedupWorkspace && cycleMode && !dedupRollback ? <HelpTip label="循环去重参数说明">最短/最长倍数限制每轮图片张数，不是固定时长。例如参考轮 200 张，默认搜索 80～500 张的循环。力度越强越容易移除，请先从“保守”或“较保守”分析；过于静止、无法区分轮次的参考片段会提示重新选择。</HelpTip> : null}
         {item.handlerId === 'video.clip' && props.values.parameters.clip_mode === '删除多个时间段并拼接剩余' ? <HelpTip label="删除片段与拼接说明">每行填写一个不要的时间段，支持秒数、MM:SS、HH:MM:SS，也可用分号分隔。所有时间均对应原视频；结束时间留空表示删除到结尾。重叠区间自动合并，剩余片段按原顺序拼接。{clipReplaceSource ? '成功验证并备份后替换原视频。' : '另存新视频，原视频不变。'}{clipExactTime || props.values.parameters.encoding_mode === '精确裁剪（重新编码）' ? '精确模式会重新编码视频，并保留首条音轨。' : '当前原画质模式受关键帧限制，删除边界可能有误差；要求严格删除时请开启按帧精确裁剪。'}</HelpTip> : null}</div>}>
-        {visibleParameters.length ? <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{visibleParameters.map((field) => <label className="parameter-row" key={field.id}><span>{field.label}{isVideoFramesWorkspace && field.id === 'output_layout' ? <HelpTip label="抽帧图片保存方式说明">按源文件夹分别保存：同一实际父目录中的视频共用一个结果目录，不同父目录分开。全部视频合并保存：所有输入目录、子目录和单个视频的图片，放入同一个新结果目录。输出位置留空时，分组模式保存在各自源目录；合并模式保存在排序后首个视频的父目录。每次运行新建结果目录，不覆盖旧结果；图片带视频编号和抽帧信息，数量上限仍按每个视频计算。可保存为默认值。</HelpTip> : null}</span><ParameterValue field={field} value={props.values.parameters[field.id] ?? field.default} onChange={(value) => props.onParameterChange(field.id, value)} sshHistory={showGenericSshHistory ? { onSelect: (profile) => {
+        {fields.length ? <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{fields.map((field) => <label className="parameter-row" key={field.id}><span>{field.label}{isVideoFramesWorkspace && field.id === 'output_layout' ? <HelpTip label="抽帧图片保存方式说明">每个视频单独保存：每段视频创建自己的结果目录。按源文件夹分别保存：同一实际父目录中的视频共用一个结果目录，不同父目录分开。全部视频合并保存：所有输入目录、子目录和单个视频的图片，放入同一个新结果目录。输出位置留空时，分组模式保存在各自源目录；合并模式保存在排序后首个视频的父目录。每次运行新建结果目录，不覆盖旧结果；图片带视频编号和抽帧信息，数量上限仍按每个视频计算。可保存为默认值。</HelpTip> : null}</span><ParameterValue field={field} value={props.values.parameters[field.id] ?? field.default} onChange={(value) => props.onParameterChange(field.id, value)} sshHistory={showGenericSshHistory ? { onSelect: (profile) => {
           props.onParameterChange(`${sshPrefix}port`, profile.port)
           props.onParameterChange(`${sshPrefix}username`, profile.username)
           props.onParameterChange('remember_password', true)
           props.onParameterChange(`${sshPrefix}password`, profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : '')
         } } : undefined} /></label>)}</div> : <p className="section-empty parameter-empty">当前没有运行参数。具体功能确定后，可通过“添加参数”配置。</p>}
-        {!isRemoteStarWorkspace ? <button className="text-action" onClick={props.onAddParameter}><icons.Plus size={17} />添加参数</button> : null}
-      </CollapsibleSection>
+        {!fixed && !isRemoteStarWorkspace ? <button className="text-action" onClick={props.onAddParameter}><icons.Plus size={17} />添加参数</button> : null}
+      </CollapsibleSection>)}
       </> : null}
         {item.handlerId === 'remote.star_inference' ? <RemoteInferencePanel itemId={item.id} values={props.values} onParameterChange={props.onParameterChange} platformTask={currentTask || null} onCompleted={() => props.onWorkflowComplete('remote.star_inference')} />
         : isAutoAnnotationWorkspace ? <AutoAnnotationPanel key={`annotation:${item.id}`} values={props.values} output={props.output} running={props.running || Boolean(currentTask)} onParameterChange={props.onParameterChange} onRun={props.onRun} />

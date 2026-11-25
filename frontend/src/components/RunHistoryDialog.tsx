@@ -42,7 +42,7 @@ export function RunHistoryDialog({ onClose }: { onClose: () => void }) {
   useEffect(() => {
     void refresh()
     const timer = window.setInterval(() => void refresh(), 3000)
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose() }
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape' && !event.repeat && !event.isComposing && !event.defaultPrevented) onClose() }
     window.addEventListener('keydown', onKeyDown)
     return () => {
       window.clearInterval(timer)

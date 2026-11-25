@@ -63,6 +63,16 @@ class VideoMultiFolderTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 normalize_video_folder_paths(invalid)
 
+    def test_explicit_file_list_extracts_only_selected_videos(self):
+        first = self.video("A/工位 1.MP4")
+        second = self.video("B/two.mp4")
+        self.video("A/unselected.mp4")
+        context, _ = self.context([])
+        context.parameters["_video_file_paths"] = f'"{first}"\n{second}\n{first}'
+        self.assertEqual(set(_resolve_videos(context, bundled_video_frames)), {first, second})
+        result = run_video_frames(context)
+        self.assertEqual((result["videoCount"], result["imageCount"]), (2, 4))
+
     def test_scan_parent_child_same_folder_and_single_video_once(self):
         first = self.video("A/one.MP4")
         second = self.video("A/nested/deep/two.mp4")
@@ -97,6 +107,7 @@ class VideoMultiFolderTests(unittest.TestCase):
         self.video("input/leaf/first.mp4")
         self.video("input/leaf/second.MP4", frame_count=20)
         context, _ = self.context([self.root / "input"])
+        context.parameters['output_layout'] = '按源文件夹分别保存'
         result = run_video_frames(context)
         self.assertEqual(result["imageCount"], 6)
         self.assertEqual([detail["images"] for detail in result["details"]], [2, 4])
@@ -114,6 +125,7 @@ class VideoMultiFolderTests(unittest.TestCase):
         self.video("other/clips/second.mp4")
         self.video("input/root.mp4")
         context, _ = self.context([self.root / "input", self.root / "other"])
+        context.parameters['output_layout'] = '按源文件夹分别保存'
         result = run_video_frames(context)
         self.assertEqual(result["sourceFolderCount"], 3)
         self.assertEqual(len(result["outputFolders"]), 3)
@@ -128,6 +140,7 @@ class VideoMultiFolderTests(unittest.TestCase):
         self.video("input/deep/one.mp4")
         self.video("input/deep/two.mp4")
         context, _ = self.context([self.root / "input"], output=False)
+        context.parameters['output_layout'] = '按源文件夹分别保存'
         first = run_video_frames(context)
         output = Path(first["outputFolders"][0])
         self.assertEqual(output.parent, self.root / "input/deep")
@@ -142,6 +155,7 @@ class VideoMultiFolderTests(unittest.TestCase):
         self.video("input/a_good.mp4")
         self.video("input/z_empty.mp4")
         context, _ = self.context([self.root / "input"])
+        context.parameters['output_layout'] = '按源文件夹分别保存'
         context.parameters['parallel_workers'] = 1
         original = bundled_video_frames.vedio2img
         def decode(**arguments):
@@ -159,6 +173,7 @@ class VideoMultiFolderTests(unittest.TestCase):
         self.video("input/one.mp4")
         self.video("input/two.mp4")
         context, _ = self.context([self.root / "input"])
+        context.parameters['output_layout'] = '按源文件夹分别保存'
         context.parameters['max_images_limit'] = 1
         result = run_video_frames(context)
         self.assertEqual(result['imageCount'], 2)
@@ -255,8 +270,8 @@ class VideoMultiFolderTests(unittest.TestCase):
             migrated = FunctionCatalog(storage).get('video_frames')
             fields = {p['id']: p for p in migrated['parameters']}
             self.assertEqual(fields['target_fps']['default'], 20)
-            self.assertEqual(fields['output_layout']['default'], '按源文件夹分别保存')
-            self.assertEqual(fields['output_layout']['options'], ['按源文件夹分别保存', '全部视频合并保存'])
+            self.assertEqual(fields['output_layout']['default'], '每个视频单独保存')
+            self.assertEqual(fields['output_layout']['options'], ['每个视频单独保存', '按源文件夹分别保存', '全部视频合并保存'])
             self.assertEqual(len(fields), len(migrated['parameters']))
 
     def test_invalid_folder_is_reported_but_valid_folders_continue(self):

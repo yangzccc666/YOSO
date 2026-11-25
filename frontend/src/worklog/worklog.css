@@ -1,0 +1,30 @@
+.worklog-body { overflow-y:auto; display:grid; align-content:start; gap:16px; padding:16px 22px 22px; min-height:0; }
+.worklog-toolbar,.worklog-buttons,.worklog-previous,.worklog-filters { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.worklog-toolbar,.worklog-previous { justify-content:space-between; }
+.worklog-toolbar .project-tabs { margin:0; border:0; padding:0; }
+.worklog-total,.worklog-metrics>div { padding:14px 18px; background:var(--theme-accent-surface,#edf4ff); border-radius:7px; display:flex; gap:14px; align-items:baseline; }
+.worklog-total strong,.worklog-metrics strong { font-size:20px; }
+.worklog-total.overtime,.worklog-calendar button.missing { color:var(--theme-warning-text,#965010); background:var(--theme-warning-surface,#fff3df); }
+.worklog-previous,.worklog-buttons span,.worklog-breakdown p { color:var(--muted); font-size:13px; }
+.worklog-rows { border:0; display:grid; gap:12px; margin:0; padding:0; min-width:0; }
+.worklog-rows:empty { display:none; }
+.worklog-entry { margin:0; padding:12px; min-width:0; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)) minmax(0,1.1fr) minmax(90px,.55fr); gap:10px; border:1px solid var(--border); border-radius:8px; }
+.worklog-entry legend { font-weight:600; padding:0 5px; }
+.worklog-entry label,.worklog-filters label { display:grid; gap:5px; font-size:13px; min-width:0; }
+.worklog-content { grid-column:span 2; }
+.worklog-entry>button { align-self:end; justify-self:end; }
+.worklog-metrics,.worklog-groups { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+.worklog-metrics>div { display:grid; gap:3px; font-size:13px; }
+.worklog-groups { grid-template-columns:repeat(2,minmax(0,1fr)); }
+.worklog-calendar { display:grid; gap:6px; grid-template-columns:repeat(7,minmax(0,1fr)); }
+.worklog-calendar button { flex-direction:column; }
+.worklog-breakdown,.worklog-export { min-width:0; padding:12px; border:1px solid var(--border); border-radius:8px; }
+.worklog-breakdown>div { display:grid; grid-template-columns:1fr auto; align-items:baseline; gap:4px 8px; margin-top:12px; font-size:13px; overflow-wrap:anywhere; }
+.worklog-breakdown progress { width:100%; grid-column:span 2; height:6px; accent-color:var(--blue); }
+.worklog-export summary { cursor:pointer; }
+.worklog-filters { align-items:end; margin-top:12px; }
+@media(max-width:760px) {
+  .worklog-entry,.worklog-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .worklog-groups { grid-template-columns:1fr; }
+  .worklog-calendar { grid-template-columns:repeat(4,minmax(0,1fr)); }
+}

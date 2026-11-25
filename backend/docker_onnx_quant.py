@@ -25,7 +25,16 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_CONTAINER = "onnx2quant"
 DEFAULT_ENVIRONMENT = "onnxquant"
 DEFAULT_CONDA = "/root/anaconda3/bin/conda"
-DEFAULT_EXCLUDE = r"^/model\.(13|16|17|23)(?:/|$).*"
+EXCLUDE_MODULE_PRESETS = (
+    "13,16,17,23",
+    "4,13,16,17,23",
+    "4,6,13,16,17,23",
+    "4,6,10,13,16,17,23",
+    "4,5,6,10,13,16,17,23",
+    "4,5,6,9,10,13,16,17,23",
+)
+DEFAULT_EXCLUDE_PRESET = EXCLUDE_MODULE_PRESETS[4]
+CUSTOM_EXCLUDE_PRESET = "自定义正则"
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -171,8 +180,22 @@ def _validate_export(context: RunContext, mounts: list[DockerMount], container: 
     method = "" if method_raw in {"", "默认"} else method_raw
     if method not in {"", "minmax", "entropy"}:
         raise ValueError("量化方法只能选择默认、minmax 或 entropy。")
-    raw_excluded = str(context.parameters.get("nodes_to_exclude", DEFAULT_EXCLUDE)).strip()
+    preset = str(context.parameters.get("exclude_modules", "")).strip()
+    raw_excluded = str(context.parameters.get("nodes_to_exclude") or "")
+    if preset != CUSTOM_EXCLUDE_PRESET and (
+        "exclude_modules" in context.parameters or "nodes_to_exclude" not in context.parameters
+    ):
+        preset = preset or DEFAULT_EXCLUDE_PRESET
+        if preset not in EXCLUDE_MODULE_PRESETS:
+            raise ValueError("请选择有效的排除模块组合。")
+        modules = preset.replace(",", "|")
+        raw_excluded = rf"^/model\.({modules})(?:/|$).*"
     excluded = [line.strip() for line in raw_excluded.splitlines() if line.strip()]
+    for pattern in excluded:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"排除节点正则无效：{pattern}（{exc}）") from exc
     return {
         "container": container,
         "environment": environment,
@@ -277,6 +300,7 @@ def run_docker_onnx_quant(context: RunContext) -> dict[str, Any]:
         f"输出模型：{config['output_model']} → {config['container_output']}"
     )
     context.report(f"开始量化：type={config['model_type']}，method={config['method'] or '工具默认值'}")
+    context.report("排除节点：" + ("；".join(config["nodes_to_exclude"]) or "无"))
     try:
         _run_export(config, context)
     except Exception:

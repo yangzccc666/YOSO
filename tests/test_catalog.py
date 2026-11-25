@@ -53,7 +53,7 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(parameters["priority_max_images"]["default"], 500)
         self.assertEqual(item["handlerId"], "video.extract_frames")
         self.assertEqual(item["parameters"][0]["id"], "output_layout")
-        self.assertEqual(parameters['output_layout']['default'], '按源文件夹分别保存')
+        self.assertEqual(parameters['output_layout']['default'], '每个视频单独保存')
         self.assertEqual(item["parameters"][1]["id"], "project_code")
         self.assertEqual(item["parameters"][2]["id"], "scene_code")
         max_images = next(parameter for parameter in item["parameters"] if parameter["id"] == "max_images_limit")
@@ -168,6 +168,7 @@ class CatalogTests(unittest.TestCase):
         self.assertIn("'/tmp/yolo job/input video.mp4'", command)
         self.assertIn(" -B ", command)
         self.assertIn("--realtime", command)
+        self.assertIn("--detection-fps 20.0", command)
 
     def test_remote_connection_can_be_checked_before_selecting_files(self) -> None:
         config = validate_connection_payload({

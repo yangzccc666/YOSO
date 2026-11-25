@@ -215,6 +215,7 @@ export type ExternalAppSettings = {
 }
 
 export type PlatformSettings = {
+  theme?: 'light' | 'dark'
   externalApps: ExternalAppSettings[]
   configFile: string
   aiPython?: string

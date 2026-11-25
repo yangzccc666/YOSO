@@ -1,4 +1,4 @@
-"""YOLO数据处理平台本地启动器。"""
+"""YOLO项目平台本地启动器。"""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def run_web() -> None:
 
     port = int(os.environ.get("PROCESSING_VIEW_PORT", "8765"))
     threading.Thread(target=open_browser, args=(port,), daemon=True).start()
-    print(f"YOLO数据处理平台已启动：http://127.0.0.1:{port}")
+    print(f"YOLO项目平台已启动：http://127.0.0.1:{port}")
     print("按 Ctrl+C 可停止服务。")
     serve(port=port, static_dir=DIST)
 
@@ -86,7 +86,7 @@ def main() -> None:
                     importlib.import_module(name)
                 except Exception as exc:
                     raise RuntimeError(f"AI 集成检查未通过，{name} 无法加载：{exc}") from exc
-        print(f"YOLO数据处理平台安装包检查通过：{len(functions)} 个功能。")
+        print(f"YOLO项目平台安装包检查通过：{len(functions)} 个功能。")
         return
     if "--dependencies" in sys.argv[1:]:
         import json
@@ -100,7 +100,7 @@ def main() -> None:
     from desktop import run_desktop
 
     port = int(os.environ.get("PROCESSING_VIEW_DESKTOP_PORT", "0"))
-    print("正在打开YOLO数据处理平台……")
+    print("正在打开YOLO项目平台……")
     run_desktop(static_dir=DIST, port=port)
 
 

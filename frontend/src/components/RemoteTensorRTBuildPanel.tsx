@@ -215,7 +215,7 @@ export function RemoteTensorRTBuildPanel(props: Props) {
   }
 
   return <>
-    <CollapsibleSection className="workspace-section calibration-section" count={7} heading={<div className="section-title"><icons.Folder size={21} /><h2>模型与输出</h2></div>}>
+    <CollapsibleSection fixed className="workspace-section calibration-section" count={7} heading={<div className="section-title"><icons.Folder size={21} /><h2>模型与输出</h2></div>}>
       <div className="calibration-form remote-onnx-form">
         <label className="wide"><span>远端 ONNX 路径 <em>必填 · 每行一个 · 当前 {onnxFiles.length} 个</em><HelpTip label="远端 ONNX 路径说明">路径必须是当前 SSH 设备上的绝对路径，从上到下顺序执行。每个结果会在 ONNX 同级目录生成同名的 .plan 和 .trtexec.log。FP16/FP32 请使用未量化的 FP32 ONNX，不要选择之前的 _quant.onnx。更换精度时使用不同源文件名或目录，避免覆盖已有对照引擎。</HelpTip></span><textarea rows={6} value={onnxText} onChange={(event) => changeOnnxPaths(event.target.value)} placeholder={'/srv/models/model_a_cut.onnx\n/srv/models/model_b_cut.onnx'} /></label>
       </div>
@@ -230,7 +230,7 @@ export function RemoteTensorRTBuildPanel(props: Props) {
         <label><input type="checkbox" checked={Boolean(parameter('overwrite_output'))} onChange={(event) => set('overwrite_output', event.target.checked)} />允许覆盖远端同名结果</label>
       </div>
     </CollapsibleSection>
-    <CollapsibleSection className="workspace-section calibration-section" count={5} heading={<div className="section-title"><icons.Settings size={21} /><h2>AI 推理盒子 SSH</h2></div>}>
+    <CollapsibleSection fixed className="workspace-section calibration-section" count={5} heading={<div className="section-title"><icons.Settings size={21} /><h2>AI 推理盒子 SSH</h2></div>}>
       <div className="calibration-form">
         <label><span>设备 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={checking || submitting} onHostChange={(value) => set('host', value)} onSelect={(profile) => {
           set('port', profile.port); set('username', profile.username); set('remember_password', true); set('password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setNotice(profile.passwordRemembered ? '已选择历史设备，并填充保存的 SSH 密码。' : '已选择历史设备，请输入 SSH 密码。')

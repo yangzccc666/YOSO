@@ -157,5 +157,5 @@ jobs:
             notes_args=(--generate-notes)
           fi
           gh release create "${GITHUB_REF_NAME}" release-assets/* \
-            --repo "${GITHUB_REPOSITORY}" --title "YOLO数据处理平台 ${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --title "YOLO项目平台 ${GITHUB_REF_NAME}" \
             "${notes_args[@]}" --verify-tag

@@ -16,6 +16,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
+from .worklog import WorkLog
+from .worklog_export import export_report
+from .project_workspace import ProjectConflict, ProjectWorkspace
 from .catalog import FunctionCatalog
 from .countdowns import Countdown, CountdownStore
 from .licensing import license_store
@@ -67,6 +70,8 @@ from . import negative_samples as _negative_samples  # noqa: F401
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = platform_data_dir()
+project_workspace = ProjectWorkspace(DATA_DIR / "projects.sqlite3")
+worklog = WorkLog(project_workspace)
 overtime_store = OvertimeStore(DATA_DIR / 'overtime.json', lambda: settings_store.work_clock_payload()['settings'])
 countdown_store = CountdownStore(platform_config_dir() / "countdowns.sqlite3")
 catalog = FunctionCatalog(DATA_DIR / "functions.json")
@@ -86,7 +91,7 @@ def remember_inference_video(payload, snapshot, *, remote=False):
     except Exception as exc:
         # A preference-library failure must never kill an accepted inference session.
         snapshot['videoHistoryWarning'] = f'推理已启动，但测试视频记录保存失败：{exc}'
-        print(f"[YOLO数据处理平台] {snapshot['videoHistoryWarning']}", file=sys.stderr)
+        print(f"[YOLO项目平台] {snapshot['videoHistoryWarning']}", file=sys.stderr)
 
 
 def set_system_notifier(notifier: Callable[[str, str], None] | None) -> None:
@@ -102,7 +107,7 @@ def notify_system(title: str, message: str) -> None:
         _system_notifier(str(title), str(message))
     except Exception as exc:
         # Notification failures must never change processing results.
-        print(f"[YOLO数据处理平台] 系统通知显示失败：{exc}", file=sys.stderr)
+        print(f"[YOLO项目平台] 系统通知显示失败：{exc}", file=sys.stderr)
 
 
 def set_countdown_notifier(notifier: Callable[[list[Countdown]], None] | None) -> None:
@@ -129,7 +134,7 @@ def record_finished_run(
         history_saved = True
     except Exception as exc:
         # A history disk error must not turn a successful data-processing run into a failure.
-        print(f"[YOLO数据处理平台] 无法保存运行历史：{exc}", file=sys.stderr)
+        print(f"[YOLO项目平台] 无法保存运行历史：{exc}", file=sys.stderr)
     # A process may report success at the same moment the user requests a
     # stop.  In that race the user's intent wins: keep the history result, but
     # do not show a misleading completion notification.
@@ -281,9 +286,21 @@ def set_path_chooser(chooser: Callable[[str], list[str]] | None) -> None:
     _path_chooser = chooser
 
 
+_tk_picker_lock = threading.Lock()
+
+
 def choose_path(mode: str) -> list[str]:
     if _path_chooser is not None:
         return _path_chooser(mode)
+    if not _tk_picker_lock.acquire(blocking=False):
+        return []
+    try:
+        return _choose_tk_path(mode)
+    finally:
+        _tk_picker_lock.release()
+
+
+def _choose_tk_path(mode: str) -> list[str]:
     try:
         import tkinter as tk
         from tkinter import filedialog
@@ -344,7 +361,7 @@ class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         if self.path.startswith("/api/tasks/active"):
             return
-        print(f"[YOLO数据处理平台] {self.address_string()} - {format % args}")
+        print(f"[YOLO项目平台] {self.address_string()} - {format % args}")
 
     def send_json(self, data: Any, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -362,13 +379,59 @@ class AppHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         return json.loads(body.decode("utf-8")) if body else {}
 
+    def serve_worklog(self, parsed) -> None:
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        try:
+            if parsed.path == "/api/worklog/dates":
+                self.send_json(worklog.dates(query.get("month")))
+            elif parsed.path == "/api/worklog/options":
+                self.send_json(worklog.options())
+            elif parsed.path == "/api/worklog/day":
+                self.send_json(worklog.day(query.get("date")))
+            elif parsed.path in ("/api/worklog/report", "/api/worklog/export"):
+                report = worklog.report(query.get("start"), query.get("end"), query.get("owner", ""))
+                if parsed.path.endswith("/report"):
+                    self.send_json(report)
+                    return
+                fmt = query.get("format", "xlsx")
+                body, mime = export_report(report, fmt)
+                filename = f"worklog-{report['start']}-{report['end']}.{fmt}"
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_json({"error": "工时接口不存在。"}, 404)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, 400)
+        except ImportError:
+            self.send_json({"error": "Excel 导出需要 openpyxl，请安装 requirements.txt 中的依赖，或选择 CSV。"}, 500)
+        except (sqlite3.Error, OSError) as exc:
+            self.send_json({"error": f"工时台账读取失败：{exc}"}, 500)
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/license/status":
             self.send_json(license_store.status())
             return
         if parsed.path == "/api/health":
-            self.send_json({"ok": True, "name": "YOLO数据处理平台"})
+            self.send_json({"ok": True, "name": "YOLO项目平台"})
+            return
+        if parsed.path.startswith("/api/worklog/"):
+            self.serve_worklog(parsed)
+            return
+        if parsed.path == "/api/projects" or parsed.path.startswith("/api/projects/"):
+            try:
+                result = (project_workspace.catalog() if parsed.path == "/api/projects"
+                          else project_workspace.detail(parsed.path.split("/")[-1]))
+                self.send_json(result)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, 404)
+            except sqlite3.Error as exc:
+                self.send_json({"error": f"项目数据库无法读取：{exc}"}, 500)
             return
         if parsed.path == "/api/dependencies":
             self.send_json(dependency_report())
@@ -502,6 +565,21 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         try:
             payload = self.read_json()
+            if self.path == "/api/worklog/dates":
+                self.send_json(worklog.create_date(payload.get("work_date")), 201)
+                return
+            if self.path == "/api/worklog/day":
+                try:
+                    self.send_json(worklog.save(payload))
+                except ProjectConflict as exc:
+                    self.send_json({"error": str(exc)}, 409)
+                return
+            if self.path == "/api/projects/manage":
+                try:
+                    self.send_json(project_workspace.change(payload))
+                except ProjectConflict as exc:
+                    self.send_json({"error": str(exc)}, 409)
+                return
             if self.path == "/api/license/activate":
                 self.send_json(license_store.activate(str(payload.get("key", ""))))
                 return
@@ -714,7 +792,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     except Exception as history_error:
                         # Disk/history failures must not terminate an accepted inference task.
                         snapshot["modelHistoryWarning"] = f"推理已启动，但历史模型保存失败：{history_error}"
-                        print(f"[YOLO数据处理平台] {snapshot['modelHistoryWarning']}", file=sys.stderr)
+                        print(f"[YOLO项目平台] {snapshot['modelHistoryWarning']}", file=sys.stderr)
                     remember_inference_video(payload, snapshot, remote=True)
                     session_id = str(snapshot["id"])
                     platform_task_manager.set_stop_callback(
@@ -816,7 +894,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 path_values = {
                     key: PurePosixPath(value.strip()) if is_remote_yolo else Path(value).expanduser()
                     for key, value in payload.get("paths", {}).items()
-                    if str(value).strip() and not (is_video_frames and key == "video_folder")
+                    if str(value).strip() and not (is_video_frames and key in {"video_folder", "video_file"})
                 }
                 messages: list[str] = []
                 run_parameters = {
@@ -827,12 +905,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 if is_video_frames:
                     folders = _video_frames.normalize_video_folder_paths(payload.get("paths", {}).get("video_folder", ""))
                     run_parameters["_video_folder_paths"] = [str(folder) for folder in folders]
+                    files = _video_frames.normalize_video_paths(payload.get("paths", {}).get("video_file", ""))
+                    run_parameters["_video_file_paths"] = [str(video) for video in files]
+                    if files:
+                        path_values["video_file"] = files[0]
                     if folders:
                         path_values["video_folder"] = folders[0]
                     source = path_values.get("video_file") or path_values.get("video_folder")
                     source_name = source.name if source else "未选择视频"
-                    if len(folders) > 1 or (folders and path_values.get("video_file")):
-                        source_name = f"{len(folders)} 个文件夹" + (" + 单个视频" if path_values.get("video_file") else "")
+                    if len(folders) + len(files) > 1:
+                        source_name = " + ".join(label for count, label in (
+                            (len(folders), f"{len(folders)} 个文件夹"), (len(files), f"{len(files)} 个视频")
+                        ) if count)
                     task_name += f" · {source_name} · {run_parameters.get('scene_code') or '按视频名命名'}"
                 task = platform_task_manager.start(
                     item_id, task_name,
@@ -967,9 +1051,21 @@ class AppHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_json({"error": f"服务异常：{exc}"}, 500)
 
+    def modify_work_date(self, parsed, revision, target=None) -> None:
+        try:
+            self.send_json(worklog.change_date(parsed.path.rsplit("/", 1)[-1], revision, target=target))
+        except ProjectConflict as exc:
+            self.send_json({"error": str(exc)}, 409)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, 400)
+
     def do_PUT(self) -> None:
         try:
             payload = self.read_json()
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/worklog/dates/"):
+                self.modify_work_date(parsed, payload.get("revision"), payload.get("target") or "")
+                return
             if self.path == "/api/work-clock":
                 try:
                     self.send_json(settings_store.update_work_clock(payload))
@@ -1015,6 +1111,10 @@ class AppHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         try:
             parsed = urllib.parse.urlparse(self.path)
+            if parsed.path.startswith("/api/worklog/dates/"):
+                revision = dict(urllib.parse.parse_qsl(parsed.query)).get("revision", "")
+                self.modify_work_date(parsed, int(revision) if revision.isascii() and revision.isdigit() else None)
+                return
             if parsed.path.startswith("/api/countdowns/"):
                 countdown_store.remove(parsed.path.rsplit("/", 1)[-1])
                 self.send_json(countdown_payload())
@@ -1134,7 +1234,7 @@ class AppServer(ThreadingHTTPServer):
             try:
                 notifier(overdue)
             except RuntimeError as exc:
-                print(f"[YOLO数据处理平台] 倒计时提醒显示失败：{exc}", file=sys.stderr)
+                print(f"[YOLO项目平台] 倒计时提醒显示失败：{exc}", file=sys.stderr)
                 self._next_countdown_check = now + 2
                 return
             self._last_overdue = snapshot

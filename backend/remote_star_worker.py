@@ -13,6 +13,7 @@ import contextlib
 import ctypes
 import importlib.util
 import json
+import math
 import os
 import queue
 import struct
@@ -63,6 +64,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save", default="")
     parser.add_argument("--realtime", action="store_true")
     parser.add_argument("--preview-fps", type=float, default=20.0)
+    parser.add_argument("--detection-fps", type=float, default=20.0)
     parser.add_argument("--stream-width", type=int, default=960)
     parser.add_argument("--jpeg-quality", type=int, default=70)
     parser.add_argument("--replay-grace-seconds", type=int, default=120)
@@ -293,6 +295,8 @@ def main() -> int:
         raise ValueError("--conf and --iou must be between 0 and 1")
     if args.max_det <= 0 or args.preview_fps < 0:
         raise ValueError("--max-det must be positive and --preview-fps cannot be negative")
+    if not 0 <= args.detection_fps <= 60:
+        raise ValueError("--detection-fps must be between 0 and 60")
     if not 0 <= args.replay_grace_seconds <= 3600:
         raise ValueError("--replay-grace-seconds must be between 0 and 3600")
 
@@ -337,6 +341,9 @@ def main() -> int:
     last_preview_at = 0.0
     source_fps = capture.get(cv2.CAP_PROP_FPS)
     frame_period = 1.0 / source_fps if np.isfinite(source_fps) and source_fps > 0 else 0.0
+    sampling_ratio = args.detection_fps / source_fps if frame_period and 0 < args.detection_fps < source_fps else None
+    last_detection_slot = None
+    sampled_out_frames = 0
     preview_period = 1.0 / args.preview_fps if args.preview_fps > 0 else 0.0
     source_frames = capture.get(cv2.CAP_PROP_FRAME_COUNT)
     duration = source_frames / source_fps if np.isfinite(source_frames) and source_frames > 0 and frame_period > 0 else 0.0
@@ -356,6 +363,10 @@ def main() -> int:
 
     if args.realtime and frame_period > 0:
         print("Real-time playback enabled: slow inference will skip late source frames to preserve video speed.", file=sys.stderr, flush=True)
+    detection_rate = f"{args.detection_fps:g} FPS" if args.detection_fps else "unlimited"
+    print(f"Target detection rate: {detection_rate}", file=sys.stderr, flush=True)
+    if args.detection_fps and not frame_period:
+        print("Source FPS unavailable; target-rate sampling is disabled.", file=sys.stderr, flush=True)
 
     try:
         while True:
@@ -395,9 +406,22 @@ def main() -> int:
                     capture, source_fps, source_frames,
                     playback_anchor_source, playback_anchor_wall,
                 )
+            if sampling_ratio is not None and seek_target is None:
+                # Sample on the video timeline, independently of the preview and playback clocks.
+                next_index = capture_frame_index(capture)
+                next_slot = math.floor(next_index * sampling_ratio + 1e-9)
+                if next_slot == last_detection_slot and capture.grab():
+                    sampled_out_frames += 1
+                    continue
             ok, frame = capture.read()
             if not ok:
                 if writer is not None:
+                    if sampling_ratio is not None and previous_saved_frame is not None and previous_saved_index is not None:
+                        # The last sampling interval can contain frames after the final detection.
+                        tail_frames = max(0, capture_frame_index(capture) - previous_saved_index - 1)
+                        for _ in range(tail_frames):
+                            writer.write(previous_saved_frame)
+                        saved_frame_count += tail_frames
                     writer.release()
                     writer = None
                     save_segment += 1
@@ -413,6 +437,8 @@ def main() -> int:
                     break
                 continue
             source_index = capture_frame_index(capture, after_read=True)
+            if sampling_ratio is not None:
+                last_detection_slot = math.floor(source_index * sampling_ratio + 1e-9)
             source_position = video_position_seconds(capture, source_fps, source_index)
             started = time.perf_counter()
             total_detections = infer_and_draw_models(user_script, loaded_models, frame, args.iou, args.max_det)
@@ -469,6 +495,8 @@ def main() -> int:
             runner.close()
 
     print(f"Processed {frame_index} frames; skipped {skipped_frames} late source frames", file=sys.stderr, flush=True)
+    if sampled_out_frames:
+        print(f"Skipped {sampled_out_frames} source frames by target-rate sampling", file=sys.stderr, flush=True)
     if saved_frame_count:
         print(f"Saved timeline frames: {saved_frame_count}", file=sys.stderr, flush=True)
     for saved_video_path in saved_video_paths:

@@ -48,11 +48,10 @@ type ConnectionCheck = {
   error?: string
 }
 
-const fieldGroups: Array<{ title: string; description: string; defaultOpen?: boolean; fields: TrainingField[] }> = [
+const fieldGroups: Array<{ title: string; description: string; fields: TrainingField[] }> = [
   {
     title: '常用训练配置',
     description: '填写远端 data.yaml，并配置轮次、批量大小、尺寸、GPU 和输出位置；默认使用服务器已安装的 Ultralytics。',
-    defaultOpen: true,
     fields: [
       { id: 'data', label: 'data.yaml 路径', browse: 'file', help: '数据集配置文件，定义 train/val/test 路径、类别数量和类别名称。' },
       { id: 'model', label: '预训练模型 model', help: '默认 yolo26n.pt，也可填写服务器上的模型绝对路径；离线服务器请提供已有权重文件。' },
@@ -404,12 +403,14 @@ export function YoloTrainingPanel({ values, defaultsVersion, onParameterChange, 
   return (
     <div className="yolo-training-workspace">
       {notice ? <div className="credential-notice training-parameter-notice" role="status"><icons.Check size={18} /><span>{notice}</span></div> : null}
-      {fieldGroups.map((group) => <details className="training-parameter-group" open={group.defaultOpen} key={group.title}>
-        <summary><span className="help-heading"><strong>{group.title}</strong><HelpTip label={`${group.title}说明`}>{group.description}</HelpTip></span><icons.ChevronRight size={18} /></summary>
-        <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{group.fields.map((field) => <div className="parameter-row" key={field.id}><span className="parameter-label"><span>{field.label}</span><HelpTip label={`${field.label}说明`}>{field.help}{field.range ? `\n范围：${field.range}` : ''}</HelpTip></span>{renderTrainingField(field)}</div>)}</div>
-      </details>)}
+      {fieldGroups.flatMap(group => [true, false].map(fixed => {
+        const fields = group.fields.filter(field => ['data', 'device', 'project'].includes(field.id) === fixed)
+        return <CollapsibleSection key={group.title + fixed} fixed={fixed} className="workspace-section" heading={<div className="section-title"><h2>{fixed ? group.title : '可选训练参数'}</h2><HelpTip label="训练配置说明">{group.description}</HelpTip></div>}>
+        <div className="parameter-table"><div className="parameter-head"><span>参数名称</span><span>参数值</span></div>{fields.map((field) => <div className="parameter-row" key={field.id}><span className="parameter-label"><span>{field.label}</span><HelpTip label={`${field.label}说明`}>{field.help}{field.range ? `\n范围：${field.range}` : ''}</HelpTip></span>{renderTrainingField(field)}</div>)}</div>
+        </CollapsibleSection>
+      }))}
 
-      <CollapsibleSection className="workspace-section training-connection-section" heading={<div className="section-title"><icons.Code2 size={21} /><h2>训练位置与 SSH</h2><HelpTip label="训练位置与 SSH 说明">训练在你指定的服务器执行，不依赖平台开发者的服务器或源码目录。源码目录留空时使用服务器已安装的 Ultralytics；开始前需要测试 SSH 连接。</HelpTip></div>}>
+      <CollapsibleSection fixed className="workspace-section training-connection-section" heading={<div className="section-title"><icons.Code2 size={21} /><h2>训练位置与 SSH</h2><HelpTip label="训练位置与 SSH 说明">训练在你指定的服务器执行，不依赖平台开发者的服务器或源码目录。源码目录留空时使用服务器已安装的 Ultralytics；开始前需要测试 SSH 连接。</HelpTip></div>}>
         <div className="training-connection-grid">
           <label><span>服务器 IP / 主机名</span><SshConnectionHistoryInput host={host} disabled={testingConnection || submitting} placeholder="填写你自己的训练服务器" onHostChange={(value) => onParameterChange('remote_host', value)} onSelect={(profile) => {
             onParameterChange('remote_port', profile.port); onParameterChange('remote_username', profile.username); onParameterChange('remember_password', true); onParameterChange('remote_password', profile.passwordRemembered ? REMEMBERED_PASSWORD_VALUE : ''); setConnectionCheck(null); setCredentialNotice(profile.passwordRemembered ? '已选择历史服务器，并填充保存的 SSH 密码。' : '已选择历史服务器，请输入 SSH 密码。')

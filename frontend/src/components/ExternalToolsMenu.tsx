@@ -3,7 +3,7 @@ import { icons } from '../icons'
 
 type Tool = { id: string; name: string; description: string; busy?: boolean; onLaunch: () => void }
 
-export function ExternalToolsMenu({ tools, onSettings }: { tools: Tool[]; onSettings: () => void }) {
+export function ExternalToolsMenu({ tools }: { tools: Tool[] }) {
   const [open, setOpen] = useState(false)
   const container = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
@@ -33,7 +33,6 @@ export function ExternalToolsMenu({ tools, onSettings }: { tools: Tool[]; onSett
         <icons.Play size={17} /><span><strong>{tool.busy ? '正在启动…' : tool.name}</strong><small>{tool.description}</small></span>
       </button>)}
       {!tools.length ? <p className="external-tools-empty">暂无工具，请在设置中添加。</p> : null}
-      <button className="external-tools-manage" onClick={() => { setOpen(false); onSettings() }}><icons.Settings size={17} /><span><strong>管理外部工具</strong><small>添加或修改本机工具</small></span></button>
     </div> : null}
   </div>
 }

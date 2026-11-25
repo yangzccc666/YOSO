@@ -65,7 +65,7 @@ export function PlatformSettingsDialog({ open, focusSection, onClose: close, onS
     try {
       const saved = await savePlatformSettings(settings)
       setSettings(saved)
-      onSaved('本机设置已保存，外部工具菜单已更新。', saved)
+      onSaved('本机设置已保存。', saved)
       close()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '设置保存失败')
@@ -78,6 +78,11 @@ export function PlatformSettingsDialog({ open, focusSection, onClose: close, onS
     <form className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="platform-settings-title" onSubmit={submit}>
       <header><div><h2 id="platform-settings-title">本机设置</h2><p>这些路径只保存在当前电脑，换电脑后可单独配置，不会写入项目代码。</p></div><button type="button" className="icon-button" onClick={onClose} aria-label="关闭"><icons.X size={18} /></button></header>
       <div className="settings-content" ref={content}>
+        {settings && <section className="external-app-settings appearance-settings">
+          <label>界面主题<select value={settings.theme || 'light'} onChange={event => setSettings({ ...settings, theme: event.target.value === 'dark' ? 'dark' : 'light' })}>
+            <option value="light">浅色</option><option value="dark">深色</option>
+          </select></label>
+        </section>}
         <section className="external-app-settings" data-settings-section="dependencies" tabIndex={-1}>
           <div className="settings-section-title"><icons.Info size={19} /><span><strong>分发依赖检查</strong><small>{dependencies ? `${dependencies.system} · 构建类型：${dependencies.profile}` : '正在检查本机依赖，不连接 SSH 或 Docker…'}</small></span></div>
           {dependencies?.checks.map(check => <div className="dependency-check" key={check.name}><strong>{check.name}<em>{({ ready: '已内置／可用', detected: '已发现，待验证', missing: '尚未集成／缺失', external: '需外部环境', remote: '需目标设备环境', optional: '可选外部工具' } as Record<string, string>)[check.status] || check.status}</em></strong><p>{check.detail}</p></div>)}

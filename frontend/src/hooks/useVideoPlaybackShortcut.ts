@@ -11,6 +11,7 @@ export function useVideoPlaybackShortcut(
   useEffect(() => { current.current = { enabled, busy, toggle, stepEnabled, step } }, [enabled, busy, toggle, stepEnabled, step])
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (previewRef.current?.closest('[hidden]')) return
       const action = getVideoPlaybackAction(event, previewRef.current)
       if (!action || (action === 'toggle' ? !current.current.enabled : !current.current.stepEnabled)) return
       // Consume repeats and pending requests too, so holding Space cannot scroll

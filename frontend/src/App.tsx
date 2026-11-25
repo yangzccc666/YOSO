@@ -1,3 +1,5 @@
+import { WorkLog, type WorkLogHandle } from './worklog/WorkLog'
+import { ProjectWorkspace } from './projects/ProjectWorkspace'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { confirmClose, confirmStop } from './confirmActions'
 import { CLIP_REPLACE_SOURCE, videoReplacementConfirmation } from './videoClipOptions'
@@ -182,7 +184,15 @@ function defaultsFor(item: FunctionDefinition): WorkingValues {
   catch { return defaultValuesFor(item) }
 }
 
+type Section = 'functions' | 'projects' | 'worklog'
 export default function App() {
+  const [section,setSection] = useState<Section>('functions')
+  const worklogRef = useRef<WorkLogHandle>(null)
+  function navigate(next:Section, after?:()=>void) {
+    const switchTo = ()=>{setSection(next);after?.()}
+    if (section==='worklog' && next!==section && worklogRef.current) worklogRef.current.leave(switchTo)
+    else switchTo()
+  }
   const [functions, setFunctions] = useState<FunctionDefinition[]>([])
   const [groups, setGroups] = useState<GroupDefinition[]>([])
   const [selectedId, setSelectedId] = useState('')
@@ -214,7 +224,10 @@ export default function App() {
   const [launchingApps, setLaunchingApps] = useState<string[]>([])
   useEffect(() => {
     let cancelled = false
-    getPlatformSettings().then(settings => { if (!cancelled) setExternalApps(settings.externalApps) })
+    getPlatformSettings().then(settings => { if (!cancelled) {
+        document.documentElement.dataset.theme = settings.theme || 'light'
+        setExternalApps(settings.externalApps)
+      } })
       .catch(reason => { if (!cancelled) setNotice(`外部工具加载失败，请打开本机设置重试：${String(reason)}`) })
     return () => { cancelled = true }
   }, [])
@@ -419,8 +432,8 @@ export default function App() {
 
   const browse = async (fieldId: string, mode: string) => {
     try {
-      const paths = await choosePaths(mode === 'append-directory' ? 'directory' : mode)
-      if (paths[0]) updatePathValue(fieldId, mode === 'append-directory' ? (previous) => appendFolderPaths(previous, paths) : mode === 'multiple' ? paths.join('\n') : paths[0])
+      const paths = await choosePaths(mode === 'append-directory' ? 'directory' : mode === 'append-files' ? 'multiple' : mode)
+      if (paths[0]) updatePathValue(fieldId, mode === 'append-directory' || mode === 'append-files' ? (previous) => appendFolderPaths(previous, paths) : mode === 'multiple' ? paths.join('\n') : paths[0])
     } catch (error) { setNotice(error instanceof Error ? error.message : '无法打开选择窗口') }
   }
 
@@ -530,9 +543,11 @@ export default function App() {
 
   const applyWorkflowTodoFromDialog = (todo: WorkflowTodo) => {
     const target = functions.find((item) => item.handlerId === todo.targetHandlerId)
-    if (target) setSelectedId(target.id)
-    applyWorkflowTodo(todo)
     setWorkflowOpen(false)
+    navigate('functions',()=>{
+      if (target) setSelectedId(target.id)
+      applyWorkflowTodo(todo)
+    })
   }
 
   const run = async (parameterOverrides: Record<string, string | number | boolean> = {}) => {
@@ -650,7 +665,7 @@ export default function App() {
       setNotice(`未找到任务“${task.name}”对应的功能，可能已被删除。`)
       return
     }
-    setSelectedId(target.id)
+    navigate('functions',()=>setSelectedId(target.id))
     menu?.removeAttribute('open')
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
@@ -666,8 +681,10 @@ export default function App() {
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <header className="topbar">
-        <div className="top-left"><div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO数据处理平台</strong></div>
-          <ExternalToolsMenu tools={externalApps.map(app => ({ ...app, busy: launchingApps.includes(app.id), onLaunch: () => void openExternalApp(app) }))} onSettings={() => setSettingsOpen(true)} />
+        <div className="top-left"><div className="brand"><span className="brand-mark"><icons.Code2 size={20} /></span><strong>YOLO项目平台</strong></div>
+          {(['functions','projects','worklog'] as const).map((id,i)=><button key={id} className="external-tools-trigger workspace-tab"
+            aria-pressed={section===id} onClick={()=>navigate(id)}>{['功能分组','项目管理','工时记录'][i]}</button>)}
+          <ExternalToolsMenu tools={externalApps.map(app => ({ ...app, busy: launchingApps.includes(app.id), onLaunch: () => void openExternalApp(app) }))} />
         </div>
         <div className="top-actions">
           <button className="history-trigger workflow-trigger" onClick={() => setWorkflowOpen(true)} aria-label={`工作流待办 ${workflowTodos.length} 条`}><icons.FolderInput size={17} /><span>待办 {workflowTodos.length}</span></button>
@@ -677,6 +694,9 @@ export default function App() {
           <span className="local-status"><i />本地运行</span><button onClick={() => setSettingsOpen(true)} aria-label="本机设置" title="本机设置"><icons.Settings size={18} /></button><WorkClockPopover />
         </div>
       </header>
+      {section==='projects' && <ProjectWorkspace/>}
+      {section==='worklog' && <WorkLog ref={worklogRef}/>}
+      <div hidden={section!=='functions'}>
       <FunctionSidebar
         functions={functions}
         groups={groups}
@@ -718,11 +738,12 @@ export default function App() {
         onDeleteWorkflowTodo={deleteWorkflowTodo}
         onWorkflowComplete={completeWorkflowTarget}
       />
+      </div>
       <FunctionEditor item={editing} onClose={() => { if (confirmClose('编辑功能', '未保存的修改将不会保留。')) setEditing(null) }} onSave={save} onDelete={remove} />
       <GroupDialog group={groupDraft} onClose={() => { if (confirmClose('分组设置', '未保存的分组名称将不会保留。')) setGroupDraft(undefined) }} onSave={saveGroup} />
       {historyOpen ? <RunHistoryDialog onClose={closeHistory} /> : null}
       {workflowOpen ? <WorkflowTodoDialog items={workflowTodos} onApply={applyWorkflowTodoFromDialog} onDelete={deleteWorkflowTodo} onClose={() => { if (confirmClose('工作流待办', '待办会保留，正在运行的任务不受影响。')) setWorkflowOpen(false) }} /> : null}
-      <PlatformSettingsDialog open={settingsOpen} focusSection={settingsSection} onClose={() => { setSettingsOpen(false); setSettingsSection(undefined) }} onSaved={(message, settings) => { setNotice(message); setExternalApps(settings.externalApps) }} />
+      <PlatformSettingsDialog open={settingsOpen} focusSection={settingsSection} onClose={() => { setSettingsOpen(false); setSettingsSection(undefined) }} onSaved={(message, settings) => { document.documentElement.dataset.theme = settings.theme || 'light'; setNotice(message); setExternalApps(settings.externalApps) }} />
       <SetupGuidanceDialog guide={settingsOpen ? undefined : setupGuides[0]} onClose={() => setSetupGuides(current => current.slice(1))}
         onSettings={section => { setSetupGuides(current => current.slice(1)); setSettingsSection(section); setSettingsOpen(true) }} />
       {notice && !settingsOpen ? <div className="toast" role="alert"><icons.CircleAlert size={18} /><span>{notice}</span><button onClick={() => { if (confirmClose('提示', '仅关闭这条提示。')) setNotice('') }} aria-label="关闭提示">×</button></div> : null}

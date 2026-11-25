@@ -164,9 +164,20 @@ export async function stopActiveTask(taskId: string): Promise<PlatformTaskStatus
   return data.active
 }
 
+let choosingPath = false
+
 export async function choosePaths(mode: string): Promise<string[]> {
-  const data = await request<{ paths: string[] }>('/api/dialog', { method: 'POST', body: JSON.stringify({ mode }) })
-  return data.paths
+  if (choosingPath) return []
+  choosingPath = true
+  const trigger = document.activeElement
+  if (trigger instanceof HTMLButtonElement) trigger.setAttribute('aria-busy', 'true')
+  try {
+    const data = await request<{ paths: string[] }>('/api/dialog', { method: 'POST', body: JSON.stringify({ mode }) })
+    return data.paths
+  } finally {
+    choosingPath = false
+    if (trigger instanceof HTMLButtonElement) trigger.removeAttribute('aria-busy')
+  }
 }
 
 export async function detectLocalStarLabels(modelFile: string): Promise<StarLabelDetectionResult> {

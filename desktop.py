@@ -7,12 +7,11 @@ import os
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 
-APP_DISPLAY_NAME = "YOLO数据处理平台"
+APP_DISPLAY_NAME = "YOLO项目平台"
 APP_PROCESS_NAME = "yolo-data-platform"
 
 
@@ -84,13 +83,6 @@ def configure_linux_input_method() -> str | None:
     return report.module or None
 
 
-@dataclass
-class DialogRequest:
-    finished: threading.Event = field(default_factory=threading.Event)
-    paths: list[str] = field(default_factory=list)
-    error: Exception | None = None
-
-
 def confirm_desktop_close(parent=None) -> bool:
     """Require explicit consent; Enter/Escape default to keeping the app open."""
     from PySide6.QtWidgets import QMessageBox
@@ -98,7 +90,7 @@ def confirm_desktop_close(parent=None) -> bool:
     dialog = QMessageBox(parent)
     dialog.setWindowTitle("确认关闭平台")
     dialog.setIcon(QMessageBox.Icon.Question)
-    dialog.setText("确定关闭 YOLO 数据处理平台吗？")
+    dialog.setText("确定关闭 YOLO项目平台吗？")
     dialog.setInformativeText(
         "本地运行任务和实时推理可能被中断；构建等待队列会保存，重开后默认自动执行（手动暂停或异常除外）。\n"
         "已在远端独立后台启动的训练和 TensorRT 构建会继续运行，重开后可以重新连接。\n\n"
@@ -158,6 +150,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
         # Set the API as well as the environment, before the first Quick window.
         QQuickWindow.setSceneGraphBackend("software")
     try:
+        from PySide6.QtWebEngineCore import QWebEnginePage
         from PySide6.QtWebEngineWidgets import QWebEngineView
     except ImportError as exc:
         raise RuntimeError(
@@ -166,7 +159,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
     server_module = importlib.import_module("backend.server")
 
     app.setApplicationName(APP_PROCESS_NAME)
-    app.setApplicationDisplayName(APP_DISPLAY_NAME)
+    app.setApplicationDisplayName("")  # Qt otherwise appends this name to the native window caption.
     app.setDesktopFileName(APP_PROCESS_NAME)
     app.setOrganizationName("YOLO")
 
@@ -177,7 +170,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
             self._confirming_close = False
 
         def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
-            if self._confirming_close:
+            if self._confirming_close or native_dialog_busy():
                 event.ignore()
                 return
             self._confirming_close = True
@@ -210,6 +203,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
         if hot_reloader is not None:
             hot_reloader.stop()  # type: ignore[attr-defined]
             hot_reloader = None
+        chooser.stop()
         server_module.set_path_chooser(None)
         server_module.set_system_notifier(None)
         server_module.set_countdown_notifier(None)
@@ -219,44 +213,13 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
         server_thread.join(timeout=3)
 
     window = DesktopWindow(stop_server)
-    window.setWindowTitle(APP_DISPLAY_NAME)
+    window.setWindowTitle(" ")  # Keep the native title bar blank, including on window managers with a fallback title.
     window.resize(1360, 860)
     window.setMinimumSize(960, 640)
 
-    class QtPathChooser(QObject):
-        requested = Signal(str, object)
+    from desktop_dialogs import DesktopPathChooser
 
-        def __init__(self) -> None:
-            super().__init__()
-            self.requested.connect(self._show_dialog, Qt.ConnectionType.QueuedConnection)
-
-        def choose(self, mode: str) -> list[str]:
-            request = DialogRequest()
-            self.requested.emit(mode, request)
-            if not request.finished.wait(timeout=300):
-                raise RuntimeError("文件选择窗口等待超时，请重新选择。")
-            if request.error:
-                raise request.error
-            return request.paths
-
-        @Slot(str, object)
-        def _show_dialog(self, mode: str, request: DialogRequest) -> None:
-            try:
-                if mode in {"directory", "save_directory"}:
-                    value = QFileDialog.getExistingDirectory(window, "选择文件夹")
-                    request.paths = [value] if value else []
-                elif mode == "file":
-                    value, _selected_filter = QFileDialog.getOpenFileName(window, "选择文件")
-                    request.paths = [value] if value else []
-                else:
-                    values, _selected_filter = QFileDialog.getOpenFileNames(window, "选择一个或多个文件")
-                    request.paths = values
-            except Exception as exc:  # pragma: no cover - native dialog failures vary by OS
-                request.error = exc
-            finally:
-                request.finished.set()
-
-    chooser = QtPathChooser()
+    chooser = DesktopPathChooser(window)
     server_module.set_path_chooser(chooser.choose)
 
     class QtSystemNotifier(QObject):
@@ -331,6 +294,41 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
     server_module.set_countdown_notifier(countdown_popup.reminders_changed.emit)
 
     web_view = QWebEngineView(window)
+    export_dialog_open = False
+
+    def native_dialog_busy() -> bool:
+        return bool(chooser.busy or export_dialog_open or app.activeModalWidget() or app.modalWindow())
+
+    class DesktopPage(QWebEnginePage):
+        def javaScriptConfirm(self, origin, message):  # noqa: N802 - Qt API
+            if native_dialog_busy():
+                return False
+            return super().javaScriptConfirm(origin, message)
+
+    web_view.setPage(DesktopPage(web_view))
+
+    def save_worklog_download(request):
+        nonlocal export_dialog_open
+        if native_dialog_busy():
+            return
+        filename = request.suggestedFileName()
+        if not request.url().toString().startswith("blob:" + server_url):
+            return
+        if not filename.startswith("worklog-") or Path(filename).suffix not in {".csv", ".xlsx"}:
+            return
+        export_dialog_open = True
+        try:
+            path, _ = QFileDialog.getSaveFileName(window, "保存工时报表", str(Path.home() / Path(filename).name),
+                                                   f"工时报表 (*{Path(filename).suffix})")
+        finally:
+            export_dialog_open = False
+        if path:
+            target = Path(path)
+            request.setDownloadDirectory(str(target.parent))
+            request.setDownloadFileName(target.name)
+            request.accept()
+
+    web_view.page().profile().downloadRequested.connect(save_worklog_download)
     window.setCentralWidget(web_view)
     web_view.load(QUrl(server_url))
 
@@ -444,7 +442,7 @@ def run_desktop(static_dir: Path, port: int = 0) -> int:
 
         @Slot()
         def _poll(self) -> None:
-            if stopped:
+            if stopped or native_dialog_busy():
                 return
 
             backend_snapshot = backend_files()

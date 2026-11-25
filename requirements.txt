@@ -7,3 +7,4 @@ paramiko>=3.4,<5
 Pillow>=9,<13
 cryptography>=41,<47
 psutil>=5.9,<8
+openpyxl>=3.1,<4
